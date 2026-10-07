@@ -19,7 +19,7 @@ abre no navegador e guarda tudo **criptografado**. Nada é salvo sem você revis
   **Não existe "esqueci o PIN"**: sem ele ninguém abre os dados, nem você.
 - Para fechar: **Ajustes → Sair** (salva, bloqueia e encerra). No terminal, Ctrl+C.
 
-Precisa do Python 3.14 com a biblioteca `cryptography` (`rapidfuzz` é opcional).
+Precisa do Python 3.14 com a biblioteca `cryptography` (o `rapidfuzz` não é mais usado).
 
 **Se nada acontecer** ao abrir o `.bat`:
 - Ele mesmo explica o que falta numa janela preta (e espera uma tecla): um arquivo do programa
@@ -41,6 +41,7 @@ Em `%LOCALAPPDATA%\EntreNos` (nunca na pasta do código):
 | `backups\` | cópias automáticas das versões anteriores (até 5, uma por dia), também criptografadas, e a cópia do diário que estava aqui antes de cada restauração (`entrenos-antes-da-restauracao-…`) |
 | `backups\entrenos-anterior-…` | cópias de um diário anterior: o `entrenos.cofre` sumiu (antivírus, apagado) e outro diário começou aqui, ou a cópia é de outro PIN. Nunca são apagadas sozinhas; abrem com o PIN daquele diário. Apague quando não precisar mais |
 | `backups\entrenos-danificado-…` | o arquivo do diário que estava danificado e foi trocado por um backup (nada é apagado) |
+| `pin_espera.json` | só aparece depois de um PIN errado: quantas tentativas erradas seguidas e até quando esperar (nada do PIN). Sai quando você acerta o PIN |
 | `erros.log` | só aparece se der erro; guarda o tipo do erro e o ponto do código, nunca o que você escreveu |
 
 ## Privacidade
@@ -51,7 +52,9 @@ Em `%LOCALAPPDATA%\EntreNos` (nunca na pasta do código):
 - A página só conversa com o próprio Entre Nós (proteções contra outras páginas abertas no
   navegador) e cada sessão tem uma chave própria.
 - Bloqueia sozinho depois de 10 minutos sem uso (dá para mudar em Ajustes). Ao bloquear, a
-  chave sai da memória. PIN errado faz esperar cada vez mais (1 s, 2 s, 4 s... até 30 s).
+  chave sai da memória. Depois de um PIN errado, o próximo só é conferido depois de uma espera
+  cada vez maior (1 s, 2 s, 4 s... até 30 s); o botão mostra quanto falta. Fechar e abrir o
+  Entre Nós não zera essa espera.
   Restos do que foi digitado podem ficar na memória do computador até o programa fechar:
   quando terminar, use **Ajustes → Sair**.
 - Apagar um registro apaga do banco, da busca, do arquivo e das cópias automáticas
@@ -165,7 +168,7 @@ outro.
 ### Sem instalador: rodar pelo código
 
 Descompacte o `EntreNos-codigo-<versão>.zip`, instale o Python 3.14 e
-`python -m pip install cryptography rapidfuzz`, e abra pelo `Abrir Entre Nos.bat`.
+`python -m pip install cryptography`, e abra pelo `Abrir Entre Nos.bat`.
 
 Num computador da empresa, qualquer um dos caminhos pode esbarrar no antivírus: veja a seção
 abaixo antes.

@@ -987,6 +987,18 @@ class Banco:
         self._trava = threading.RLock()
         self.ao_salvar = ao_salvar
         self._compactar_busca = False   # houve remoção no FTS desde o último para_bytes
+        # Algo mudou e ainda não foi entregue a um `ao_salvar` que deu certo (ou a migração de um
+        # diário antigo). Quem bloqueia só regrava o arquivo se estiver sujo (seção 19.7).
+        self._sujo = False
+
+    @property
+    def sujo(self) -> bool:
+        """Há mudança que ainda não foi salva (ver `marcar_salvo`)."""
+        return self._sujo
+
+    def marcar_salvo(self) -> None:
+        """Quem gravou `para_bytes()` por fora do `ao_salvar` (criar o cofre, restaurar) avisa aqui."""
+        self._sujo = False
 
     # ------------------------------------------------------------ ciclo de vida
 
@@ -1045,6 +1057,7 @@ class Banco:
             if versao == 0 and con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 raise ValueError("Os dados não são um banco do Entre Nós.")
             for v in range(versao, ESQUEMA_VERSAO):
+                self._sujo = True
                 passo = _MIGRACOES[v]
                 try:
                     if callable(passo):
@@ -1071,8 +1084,14 @@ class Banco:
                 if self._con.in_transaction:
                     self._con.execute("ROLLBACK")
                 raise
-            if self.ao_salvar is not None:
-                self.ao_salvar(self.para_bytes())
+            self._salvar_mudanca()
+
+    def _salvar_mudanca(self) -> None:
+        """Depois de um COMMIT: entrega os bytes a `ao_salvar`; só deu certo, deixa de estar sujo."""
+        self._sujo = True
+        if self.ao_salvar is not None:
+            self.ao_salvar(self.para_bytes())
+            self._sujo = False
 
     def _historico_add(self, acao: str, tabela: str, linha_id: int | None, resumo: str) -> None:
         """Só metadados: nunca texto, nome ou trecho do usuário."""
@@ -1894,8 +1913,7 @@ class Banco:
                 if self._con.in_transaction:
                     self._con.execute("ROLLBACK")
                 raise
-            if self.ao_salvar is not None:
-                self.ao_salvar(self.para_bytes())
+            self._salvar_mudanca()
         return {**resumo, "importados": resumo["registros_novos"]}
 
     def _juntar(self, exp: _Exportacao) -> dict:

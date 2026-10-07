@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from entrenos import cofre, config, servidor
+from entrenos import cofre, config, nucleo, servidor
 
 REF = date(2026, 9, 30)
 PIN = "pizza de sexta"
@@ -70,12 +70,33 @@ class Resposta:
     bruto: bytes
 
 
+class Relogio:
+    """Relógio de mentira para o núcleo (`relogio=`, segundos monotônicos): só anda quando o
+    teste manda. Assim o bloqueio do PIN (seção 19) é testado sem esperar de verdade."""
+
+    def __init__(self, inicio: float = 1000.0):
+        self._agora = inicio
+        self._trava = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._trava:
+            return self._agora
+
+    def avancar(self, segundos: float) -> None:
+        with self._trava:
+            self._agora += segundos
+
+
 class ServidorDeTeste:
-    """Servidor real numa thread, com cliente HTTP simples (http.client)."""
+    """Servidor real numa thread, com cliente HTTP simples (http.client).
+
+    PIN errado não bloqueia nada por padrão (`atraso_pin=0`): os testes do bloqueio passam o
+    atraso que querem e um `Relogio` de mentira.
+    """
 
     def __init__(self, pasta: str | None = None, **opcoes):
         self.pasta = pasta or tempfile.mkdtemp(prefix="entrenos-teste-")
-        parametros = {"atraso_pin": 0.01, "hoje": lambda: REF}
+        parametros = {"atraso_pin": 0, "hoje": lambda: REF}
         parametros.update(opcoes)
         self.servidor = servidor.criar_servidor(self.pasta, 0, **parametros)
         self.app = self.servidor.app
@@ -163,6 +184,9 @@ class TestFuncoes(unittest.TestCase):
         self.assertEqual([servidor.atraso_do_pin(n) for n in range(0, 8)], [0, 1, 2, 4, 8, 16, 30, 30])
         self.assertEqual(servidor.atraso_do_pin(10 ** 6), 30)
         self.assertAlmostEqual(servidor.atraso_do_pin(3, 0.05, 0.1), 0.1)
+        # Para a tela e o Retry-After: segundos inteiros, para cima, no mínimo 1.
+        self.assertEqual([nucleo.segundos_de_espera(x) for x in (0.01, 0.2, 1.0, 1.0000001, 2.5, 30)],
+                         [1, 1, 1, 1, 3, 30])
 
     def test_so_escuta_em_127_0_0_1(self):
         self.assertEqual(servidor.ENDERECO, "127.0.0.1")
@@ -228,7 +252,7 @@ class TestFuncoes(unittest.TestCase):
         for erro in (ValueError("invalid literal for int() with base 10: 'x'"),
                      ValueError("Invalid isoformat string: 'amanhã'"), ValueError("'x' is not a valid TipoItem")):
             self.assertEqual(servidor.traduzir_erro(erro).mensagem, servidor.DADO_INVALIDO)
-        with mock.patch.object(servidor, "registrar_erro"):
+        with mock.patch.object(nucleo, "registrar_erro"):
             falha = servidor.traduzir_erro(RuntimeError("Mariana"))
         self.assertEqual((falha.status, falha.mensagem), (500, servidor.FALHA_INTERNA))
 
@@ -750,59 +774,101 @@ class TestFluxo(unittest.TestCase):
 # ---------------------------------------------------------------- PIN
 
 class TestPin(unittest.TestCase):
-    def test_pin_errado_espera_cada_vez_mais(self):
-        s = ServidorDeTeste(atraso_pin=0.2, atraso_pin_maximo=0.4)
-        self.addCleanup(s.fechar)
-        s.configurar()
-        s.pedir("POST", "/api/bloquear")
-        tempos = []
-        for _ in range(3):
-            inicio = time.monotonic()
-            r = s.desbloquear("pin errado demais")
-            tempos.append(time.monotonic() - inicio)
-            self.assertEqual(r.status, 401)
-            self.assertEqual(r.dados["erro"], "PIN incorreto.")
-        self.assertGreaterEqual(tempos[0], 0.19)
-        self.assertGreaterEqual(tempos[1], 0.39)
-        self.assertGreaterEqual(tempos[2], 0.39)
-        self.assertLess(tempos[2], 0.75)              # sem o teto seriam 0,8 s
-        self.assertEqual(s.desbloquear().status, 200)
-        self.assertEqual(s.app._falhas_pin, 0)
-        inicio = time.monotonic()
-        self.assertEqual(s.desbloquear("pin errado demais").status, 401)
-        self.assertLess(time.monotonic() - inicio, 0.36)   # voltou para o primeiro degrau
+    """PIN errado bloqueia por 1 s, 2 s, 4 s... até 30 s (aqui 0,2 s e 0,4 s), sem esperar dentro
+    do pedido: quem tenta antes da hora recebe 429 e nenhum PIN é testado (seção 19)."""
 
-    def test_tentativas_em_paralelo_nao_encurtam_a_espera(self):
-        s = ServidorDeTeste(atraso_pin=0.3, atraso_pin_maximo=5)
+    def novo(self, **opcoes) -> tuple[ServidorDeTeste, Relogio]:
+        relogio = Relogio()
+        s = ServidorDeTeste(relogio=relogio, **opcoes)
         self.addCleanup(s.fechar)
         s.configurar()
+        return s, relogio
+
+    def assert_espere(self, r: Resposta, segundos: int) -> None:
+        self.assertEqual(r.status, 429, r.dados)
+        self.assertEqual(r.dados["espere_segundos"], segundos)
+        self.assertEqual(r.cabecalhos["Retry-After"], str(segundos))
+        self.assertEqual(r.dados["erro"], f"Espere {segundos} s antes de tentar o PIN de novo.")
+
+    def test_pin_errado_bloqueia_cada_vez_mais(self):
+        s, relogio = self.novo(atraso_pin=0.2, atraso_pin_maximo=0.4)
         s.pedir("POST", "/api/bloquear")
-        status = []
-        threads = [threading.Thread(target=lambda: status.append(s.desbloquear("errado errado").status))
-                   for _ in range(2)]
+        r = s.desbloquear("pin errado demais")
+        self.assertEqual((r.status, r.dados["erro"], r.dados["espere_segundos"]), (401, "PIN incorreto.", 1))
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.2)
+        # Dentro do bloqueio nem o PIN certo é testado.
+        self.assert_espere(s.desbloquear(), 1)
+        self.assertFalse(s.app.desbloqueado)
+        relogio.avancar(0.19)
+        self.assert_espere(s.desbloquear("pin errado demais"), 1)
+        self.assertEqual(s.app._falhas_pin, 1)                # tentativa no bloqueio não conta
+        relogio.avancar(0.02)
+        self.assertEqual(s.desbloquear("pin errado demais").status, 401)
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.4)    # dobra
+        relogio.avancar(0.41)
+        self.assertEqual(s.desbloquear("pin errado demais").status, 401)
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.4)    # sem o teto seriam 0,8 s
+        self.assertEqual(s.app._falhas_pin, 3)
+        relogio.avancar(0.41)
+        self.assertEqual(s.desbloquear().status, 200)
+        self.assertEqual((s.app._falhas_pin, s.app.espera_do_pin()), (0, 0))
+        self.assertEqual(s.desbloquear("pin errado demais").status, 401)
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.2)    # voltou para o primeiro degrau
+
+    def test_nao_espera_dentro_do_pedido(self):
+        # Antes o pedido dormia o atraso (inviável no navegador); agora responde na hora e diz
+        # quanto falta, em segundos inteiros, no JSON e no Retry-After.
+        s, relogio = self.novo(atraso_pin=30, atraso_pin_maximo=30)
+        s.pedir("POST", "/api/bloquear")
         inicio = time.monotonic()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(10)
-        self.assertEqual(status, [401, 401])
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.85)   # 0,3 + 0,6, uma depois da outra
+        r = s.desbloquear("pin errado demais")
+        self.assertEqual((r.status, r.dados["espere_segundos"]), (401, 30))
+        self.assert_espere(s.desbloquear(), 30)
+        relogio.avancar(29.5)
+        self.assert_espere(s.desbloquear(), 1)                # arredonda para cima
+        self.assertLess(time.monotonic() - inicio, 5)
+        relogio.avancar(0.5)
+        self.assertEqual(s.desbloquear().status, 200)
+
+    def test_tentativas_em_paralelo_testam_um_pin_so(self):
+        # A conferência do bloqueio e o teste do PIN acontecem juntos, com a trava do PIN:
+        # quatro tentativas ao mesmo tempo testam um PIN só, e as outras três recebem 429.
+        s, _ = self.novo(atraso_pin=5, atraso_pin_maximo=5)
+        s.pedir("POST", "/api/bloquear")
+        testados: list[str] = []
+        abrir = s.app.cofre.abrir
+
+        def abrir_devagar(pin):
+            testados.append(pin)
+            time.sleep(0.05)                                  # alarga a janela das outras
+            return abrir(pin)
+
+        status: list[int] = []
+        with mock.patch.object(s.app.cofre, "abrir", side_effect=abrir_devagar):
+            threads = [threading.Thread(target=lambda: status.append(s.desbloquear("errado errado").status))
+                       for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(sorted(status), [401, 429, 429, 429])
+        self.assertEqual(len(testados), 1)
+        self.assertEqual(s.app._falhas_pin, 1)
 
     def test_trocar_pin(self):
-        s = ServidorDeTeste(atraso_pin=0.2)
-        self.addCleanup(s.fechar)
-        s.configurar()
+        s, relogio = self.novo(atraso_pin=0.2)
         s.registrar()
-        inicio = time.monotonic()
         r = s.pedir("POST", "/api/pin", {"atual": "nao e esse", "novo": "frase nova e secreta"})
-        self.assertEqual(r.status, 401)
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.19)
+        self.assertEqual((r.status, r.dados["erro"], r.dados["espere_segundos"]), (401, "O PIN atual não confere.", 1))
         self.assertTrue(s.pedir("GET", "/api/estado", token=None).dados["desbloqueado"])
         self.assertEqual(s.pedir("POST", "/api/pin", {"atual": PIN, "novo": "curto"}).status, 400)
+        self.assert_espere(s.pedir("POST", "/api/pin", {"atual": PIN, "novo": "frase nova e secreta"}), 1)
+        relogio.avancar(0.21)
         self.assertEqual(s.pedir("POST", "/api/pin", {"atual": PIN, "novo": "frase nova e secreta"}).status, 200)
         self.assertEqual(s.pedir("GET", "/api/registros").status, 200)      # sessão continua
         s.pedir("POST", "/api/bloquear")
         self.assertEqual(s.desbloquear(PIN).status, 401)
+        relogio.avancar(0.21)
         self.assertEqual(s.desbloquear("frase nova e secreta").status, 200)
         self.assertEqual(len(s.pedir("GET", "/api/registros").dados), 1)
 
@@ -886,14 +952,14 @@ class TestModulosFaltando(unittest.TestCase):
         self.s = ServidorDeTeste()
         self.addCleanup(self.s.fechar)
         self.s.configurar()
-        self.real = servidor._importar
+        self.real = nucleo._importar
 
     def _sem(self, *nomes):
         def importar(nome):
             if nome in nomes:
                 raise ImportError(f"sem {nome}")
             return self.real(nome)
-        return mock.patch.object(servidor, "_importar", importar)
+        return mock.patch.object(nucleo, "_importar", importar)
 
     def test_rota_do_modulo_que_falta_responde_503(self):
         with self._sem("alertas", "perfil", "busca"):

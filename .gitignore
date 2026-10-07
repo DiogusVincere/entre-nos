@@ -12,6 +12,7 @@ entrenos-export*.json
 entre-nos-exportacao*.json
 *exportacao*.json
 erros.log
+pin_espera.json
 *.log
 *.log.*
 

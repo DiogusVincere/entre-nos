@@ -6,7 +6,7 @@ rem cryptography). Faltando algo, explica o que fazer e espera uma tecla.
 rem Nunca tenta contornar o antivirus: nada de rodar o programa por outro caminho.
 setlocal
 cd /d "%~dp0"
-for %%F in ("iniciar.py" "entrenos\servidor.py" "entrenos\cofre.py" "entrenos\banco.py" "web\index.html" "web\app.js" "web\estilo.css") do (
+for %%F in ("iniciar.py" "entrenos\servidor.py" "entrenos\nucleo.py" "entrenos\cofre.py" "entrenos\banco.py" "web\index.html" "web\app.js" "web\estilo.css") do (
     if not exist "%~dp0%%~F" (
         set "FALTA=%%~F"
         goto falta_arquivo

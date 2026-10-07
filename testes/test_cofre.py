@@ -318,10 +318,19 @@ class TestGravacaoAtomica(BaseCofre):
                 raise PermissionError("arquivo em uso")
             return replace_real(origem, alvo)
 
+        # A espera entre as tentativas é ligada por quem roda no computador (servidor.py liga
+        # time.sleep); o cofre sozinho não dorme, porque também roda no navegador (seção 19).
         with mock.patch("entrenos.cofre.os.replace", side_effect=replace_ocupado), \
-                mock.patch("entrenos.cofre.time.sleep"):
+                mock.patch("entrenos.cofre.esperar_entre_tentativas") as esperar:
             cofre.salvar(b"segunda tentativa")
+        esperar.assert_called_once_with(0.05)
         self.assertEqual(self.novo_cofre().abrir(PIN), b"segunda tentativa")
+        tentativas.clear()
+        with mock.patch("entrenos.cofre.os.replace", side_effect=replace_ocupado), \
+                mock.patch("entrenos.cofre.esperar_entre_tentativas", None):
+            cofre.salvar(b"sem esperar")          # como no navegador: tenta de novo direto
+        self.assertEqual(len(tentativas), 2)
+        self.assertEqual(self.novo_cofre().abrir(PIN), b"sem esperar")
 
 
 class TestBackups(BaseCofre):

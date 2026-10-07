@@ -46,8 +46,8 @@ function Texto-Antivirus([string]$Arquivo) {
 # Arquivos sem os quais não há programa nem instalador. O ícone é gerado se faltar.
 $obrigatorios = @(
     'iniciar.py',
-    'entrenos\__init__.py', 'entrenos\config.py', 'entrenos\servidor.py', 'entrenos\cofre.py',
-    'entrenos\banco.py', 'entrenos\motor.py',
+    'entrenos\__init__.py', 'entrenos\config.py', 'entrenos\servidor.py', 'entrenos\nucleo.py',
+    'entrenos\cofre.py', 'entrenos\banco.py', 'entrenos\motor.py',
     'web\index.html', 'web\app.js', 'web\estilo.css',
     'instalador\entrenos.spec', 'instalador\EntreNos.iss', 'instalador\gerar_icone.py'
 )

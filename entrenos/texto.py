@@ -77,14 +77,66 @@ def _acrescentar(texto: str, ini: int, fim: int, saida: list[tuple[int, int, str
 
 
 def semelhanca(a: str, b: str) -> float:
-    """0-100. Usa rapidfuzz se houver; senão difflib. Compara textos normalizados."""
-    a, b = normalizar(a), normalizar(b)
-    try:
-        from rapidfuzz import fuzz
-        return float(fuzz.token_set_ratio(a, b))
-    except ImportError:  # rapidfuzz é opcional
-        from difflib import SequenceMatcher
-        return 100.0 * SequenceMatcher(None, a, b).ratio()
+    """0-100: quanto dois textos curtos (nomes, alvos de gosto) se parecem, sem acento nem caixa.
+
+    É o `token_set_ratio` (o do rapidfuzz/fuzzywuzzy) escrito em Python puro, para dar o mesmo
+    número no computador e no celular (o Pyodide não tem rapidfuzz; antes o celular caía no
+    difflib, que mede outra coisa: "Ana" x "Ana Paula" dava 100 aqui e 50 lá). Um texto contido
+    no outro, palavra por palavra, vale 100.
+    """
+    return token_set_ratio(normalizar(a), normalizar(b))
+
+
+def token_set_ratio(a: str, b: str) -> float:
+    """O `fuzz.token_set_ratio` do rapidfuzz 3 (sem pré-processamento), em Python puro.
+
+    Compara os conjuntos de palavras: o que os dois têm em comum (ordenado) mais o que sobra de
+    cada lado, pela distância Indel (só inserir e apagar). Nenhuma palavra = 0.
+    """
+    palavras_a, palavras_b = set(a.split()), set(b.split())
+    if not palavras_a or not palavras_b:
+        return 0.0
+    comuns = palavras_a & palavras_b
+    so_a, so_b = palavras_a - palavras_b, palavras_b - palavras_a
+    if comuns and (not so_a or not so_b):
+        return 100.0                  # um texto está contido no outro
+    resto_a, resto_b = " ".join(sorted(so_a)), " ".join(sorted(so_b))
+    tamanho_comum = len(" ".join(sorted(comuns)))
+    separador = 1 if tamanho_comum else 0
+    com_a = tamanho_comum + separador + len(resto_a)
+    com_b = tamanho_comum + separador + len(resto_b)
+    # "comuns + resto_a" x "comuns + resto_b": a parte comum é igual, só os restos diferem.
+    resultado = _nota(_distancia_indel(resto_a, resto_b), com_a + com_b)
+    if not tamanho_comum:
+        return resultado
+    # "comuns" x "comuns + resto": a distância é só o que sobra (com o espaço).
+    return max(resultado,
+               _nota(separador + len(resto_a), tamanho_comum + com_a),
+               _nota(separador + len(resto_b), tamanho_comum + com_b))
+
+
+def _nota(distancia: int, soma_dos_tamanhos: int) -> float:
+    return 100.0 - 100.0 * distancia / soma_dos_tamanhos if soma_dos_tamanhos else 100.0
+
+
+def _distancia_indel(a: str, b: str) -> int:
+    """Quantas letras inserir e apagar para ir de `a` a `b`: len(a) + len(b) - 2 × maior
+    subsequência comum. A subsequência sai pelo método de bits de Hyyrö (um inteiro do Python
+    faz o papel do vetor de bits), rápido mesmo em Python puro."""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    mascaras: dict[str, int] = {}
+    for posicao, letra in enumerate(b):
+        mascaras[letra] = mascaras.get(letra, 0) | (1 << posicao)
+    todos = (1 << len(b)) - 1
+    v = todos
+    for letra in a:
+        u = v & mascaras.get(letra, 0)
+        v = ((v + u) | (v - u)) & todos
+    comum = len(b) - bin(v).count("1")
+    return len(a) + len(b) - 2 * comum
 
 
 def data_br(d) -> str:

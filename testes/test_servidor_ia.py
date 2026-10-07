@@ -22,8 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from entrenos import cofre, config, servidor
-from testes.test_servidor import PIN, TEXTO, ServidorDeTeste, _esperar
+from entrenos import cofre, config, nucleo, servidor
+from testes.test_servidor import PIN, TEXTO, Relogio, ServidorDeTeste, _esperar
 
 PIN_IA = "cafe com canela e mel"
 PIN_IA_NOVO = "chuva fina na varanda"
@@ -302,60 +302,83 @@ class TestPinDaIA(BaseIA):
         self.assertEqual((estado["pin_definido"], estado["liberada"]), (True, False))
         self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": PIN_IA_NOVO}).status, 200)
 
-    def test_pin_da_ia_errado_espera_cada_vez_mais(self):
-        s = self.novo_servidor(atraso_pin=0.2, atraso_pin_maximo=0.4)
+    def test_pin_da_ia_errado_bloqueia_cada_vez_mais(self):
+        # Como o PIN principal (seção 19): 401 e bloqueio de 0,2 s, 0,4 s (teto); dentro dele,
+        # 429 sem testar PIN nenhum. Relógio de mentira: nada de esperar de verdade.
+        relogio = Relogio()
+        s = self.novo_servidor(atraso_pin=0.2, atraso_pin_maximo=0.4, relogio=relogio)
         self.criar_pin_ia(s)
         self.ia(s, "POST", "sair")
-        tempos = []
-        for _ in range(3):
-            inicio = time.monotonic()
-            self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": "pin errado demais"}).status, 401)
-            tempos.append(time.monotonic() - inicio)
-        self.assertGreaterEqual(tempos[0], 0.19)
-        self.assertGreaterEqual(tempos[1], 0.39)
-        self.assertGreaterEqual(tempos[2], 0.39)
-        self.assertLess(tempos[2], 0.75)                  # sem o teto seriam 0,8 s
+        r = self.ia(s, "POST", "entrar", {"pin_ia": "pin errado demais"})
+        self.assertEqual((r.status, r.dados["erro"], r.dados["espere_segundos"]), (401, "PIN da IA incorreto.", 1))
+        self.assertAlmostEqual(s.app.espera_do_pin_ia(), 0.2)
+        r = self.ia(s, "POST", "entrar", {"pin_ia": PIN_IA})          # nem o certo, dentro do bloqueio
+        self.assertEqual((r.status, r.dados["espere_segundos"], r.cabecalhos["Retry-After"]), (429, 1, "1"))
+        self.assertFalse(self.estado_ia(s)["liberada"])
+        relogio.avancar(0.21)
+        self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": "pin errado demais"}).status, 401)
+        self.assertAlmostEqual(s.app.espera_do_pin_ia(), 0.4)
+        relogio.avancar(0.41)
+        self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": "pin errado demais"}).status, 401)
+        self.assertAlmostEqual(s.app.espera_do_pin_ia(), 0.4)         # sem o teto seriam 0,8 s
         self.assertEqual((s.app._falhas_pin_ia, s.app._falhas_pin), (3, 0))
+        self.assertEqual(s.app.espera_do_pin(), 0)                     # o PIN principal segue livre
         # Errar o PIN principal não mexe no contador da IA (e vice-versa).
         s.pedir("POST", "/api/bloquear")
         self.assertEqual(s.desbloquear("pin errado demais").status, 401)
         self.assertEqual((s.app._falhas_pin_ia, s.app._falhas_pin), (3, 1))
+        relogio.avancar(0.41)
         self.assertEqual(s.desbloquear().status, 200)
         self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": PIN_IA}).status, 200)
         self.assertEqual(s.app._falhas_pin_ia, 0)
-        inicio = time.monotonic()
         self.assertEqual(self.ia(s, "POST", "entrar", {"pin_ia": "pin errado demais"}).status, 401)
-        self.assertLess(time.monotonic() - inicio, 0.36)  # voltou para o primeiro degrau
+        self.assertAlmostEqual(s.app.espera_do_pin_ia(), 0.2)         # voltou para o primeiro degrau
 
-    def test_tentativas_em_paralelo_nao_encurtam_a_espera(self):
-        s = self.novo_servidor(atraso_pin=0.3, atraso_pin_maximo=5)
+    def test_tentativas_em_paralelo_testam_um_pin_so(self):
+        s = self.novo_servidor(atraso_pin=5, atraso_pin_maximo=5, relogio=Relogio())
         self.criar_pin_ia(s)
         self.ia(s, "POST", "sair")
-        status: list[int] = []
-        threads = [threading.Thread(target=lambda: status.append(
-            self.ia(s, "POST", "entrar", {"pin_ia": "errado errado"}).status)) for _ in range(2)]
-        inicio = time.monotonic()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(10)
-        self.assertEqual(status, [401, 401])
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.85)     # 0,3 + 0,6, uma depois da outra
+        testados: list[str] = []
+        conferir = nucleo.conferir_verificador
 
-    def test_comparar_com_o_pin_principal_tambem_espera(self):
-        # Quem achar o app aberto não descobre o PIN principal tentando "PIN da IA = palpite".
-        s = self.novo_servidor(atraso_pin=0.25, atraso_pin_maximo=0.5)
-        tempos = []
-        for _ in range(servidor.COMPARACOES_SEM_ESPERA + 1):
-            inicio = time.monotonic()
+        def conferir_devagar(pin, verificador):
+            testados.append(pin)
+            time.sleep(0.05)                                           # alarga a janela das outras
+            return conferir(pin, verificador)
+
+        status: list[int] = []
+        with mock.patch.object(nucleo, "conferir_verificador", side_effect=conferir_devagar):
+            threads = [threading.Thread(target=lambda: status.append(
+                self.ia(s, "POST", "entrar", {"pin_ia": "errado errado"}).status)) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertEqual(sorted(status), [401, 429, 429, 429])
+        self.assertEqual(len(testados), 1)
+        self.assertEqual(s.app._falhas_pin_ia, 1)
+
+    def test_comparar_com_o_pin_principal_tambem_bloqueia(self):
+        # Quem achar o app aberto não descobre o PIN principal tentando "PIN da IA = palpite":
+        # depois de COMPARACOES_SEM_ESPERA comparações, cada uma bloqueia como um PIN errado, e
+        # o bloqueio é o do PIN principal.
+        relogio = Relogio()
+        s = self.novo_servidor(atraso_pin=0.25, atraso_pin_maximo=0.5, relogio=relogio)
+        for n in range(1, servidor.COMPARACOES_SEM_ESPERA + 1):
             self.assertEqual(self.ia(s, "POST", "pin", {"novo": PIN}).status, 400)
-            tempos.append(time.monotonic() - inicio)
-        self.assertTrue(all(t < 0.2 for t in tempos[:-1]), tempos)
-        self.assertGreaterEqual(tempos[-1], 0.24)
-        self.assertEqual(s.desbloquear().status, 200)          # acertar o PIN principal zera a conta
-        inicio = time.monotonic()
+            if n < servidor.COMPARACOES_SEM_ESPERA:
+                self.assertEqual(s.app.espera_do_pin(), 0)
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.25)
+        r = self.ia(s, "POST", "pin", {"novo": PIN})
+        self.assertEqual((r.status, r.dados["espere_segundos"]), (429, 1))
+        self.assertEqual(s.desbloquear().status, 429)                  # o mesmo bloqueio do PIN principal
+        relogio.avancar(0.26)
         self.assertEqual(self.ia(s, "POST", "pin", {"novo": PIN}).status, 400)
-        self.assertLess(time.monotonic() - inicio, 0.2)
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.5)             # dobra, como PIN errado
+        relogio.avancar(0.51)
+        self.assertEqual(s.desbloquear().status, 200)                  # acertar o PIN principal zera a conta
+        self.assertEqual(self.ia(s, "POST", "pin", {"novo": PIN}).status, 400)
+        self.assertEqual(s.app.espera_do_pin(), 0)
 
     def test_area_fecha_sozinha(self):
         s = self.novo_servidor(minutos_area_ia=0.01)                  # 0,6 s
@@ -1078,9 +1101,10 @@ class TestCorrecaoFinal(BaseIA):
 
     def test_tempo_esgotado_ao_buscar_modelos_e_504(self):
         from entrenos.motor import ErroIA
-        erro = servidor._erro_da_ia(ErroIA("A IA demorou mais que o tempo limite (15 s).", "tempo", "TimeoutError"))
+        erro = nucleo._erro_da_ia(ErroIA("A IA demorou mais que o tempo limite (15 s).", "tempo", "TimeoutError"))
         self.assertEqual((erro.status, erro.mensagem), (504, "A IA demorou mais que o tempo limite (15 s)."))
-        self.assertEqual(servidor._erro_da_ia(ErroIA("A chave foi recusada.", "chave")).status, 502)
+        self.assertEqual(nucleo._erro_da_ia(ErroIA("A chave foi recusada.", "chave")).status, 502)
+        self.assertEqual(nucleo._erro_da_ia(TimeoutError()).status, 504)       # socket.timeout é TimeoutError
 
 
 class TestContextoDaSugestao(BaseIA):

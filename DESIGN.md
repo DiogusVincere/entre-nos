@@ -5,7 +5,8 @@ Diário inteligente do relacionamento. Roda **só neste computador**, abre no na
 regras). Uma IA pode ser ligada depois sem mudar o resto (motor plugável).
 
 Este documento é o contrato entre os módulos. `entrenos/modelos.py`, `entrenos/texto.py` e
-`entrenos/config.py` já estão prontos e **não devem ser alterados** sem atualizar este arquivo.
+`entrenos/config.py` já estão prontos e **não devem ser alterados** sem atualizar este arquivo
+(`texto.semelhanca` mudou em 07/10/2026: seção 19.7).
 
 ## 1. Princípios (valem para todo o código)
 
@@ -29,7 +30,11 @@ Este documento é o contrato entre os módulos. `entrenos/modelos.py`, `entrenos
    código, nunca textos do usuário, PIN ou corpo de requisição.
 
 Estilo: Python 3.14, nomes e comentários em **português**, só biblioteca padrão +
-`cryptography` (já instalada) + `rapidfuzz` (opcional, já instalada). Nada de pip novo.
+`cryptography` (já instalada). Nada de pip novo. O `rapidfuzz` saiu do app em 07/10/2026:
+`texto.semelhanca` é o mesmo `token_set_ratio` em Python puro, igual no computador e no celular
+(seção 19.7). Todo `entrenos/*.py` precisa abrir também no Python **3.12** (margem: o Pyodide 314
+roda o 3.14, seção 19): sintaxe 3.12 e `from __future__ import annotations` onde houver anotação;
+o núcleo não inicia thread nem dorme.
 Testes com `unittest` em `testes/` e rodam com:
 
 ```
@@ -61,7 +66,9 @@ EntreNos/
     perfil.py                         "Conhecendo Ela", mapa de preferências, "Como ela está"
     cofre.py                          PIN, chave, criptografia do arquivo
     banco.py                          SQLite em memória, esquema, CRUD, histórico, FTS5
-    servidor.py                       HTTP local + API JSON + segurança
+    nucleo.py                         o app sem transporte: sessão, PIN, rotas da API (seção 19)
+    servidor.py                       transporte do computador: HTTP local + segurança do pedido + página
+    ponte.py                          transporte do navegador: o Pyodide chama (seção 19)
   web/index.html app.js estilo.css    interface (SPA sem framework)
   testes/test_*.py
   construir_instalador.ps1            testes + PyInstaller + Inno Setup → dist\ (seção 18.3/18.4)
@@ -420,7 +427,15 @@ def problema_do_pin(pin) -> str | None                     # mensagem para a tel
   Nonce novo a cada `salvar`.
 - Gravação atômica: arquivo temporário na mesma pasta + `os.replace`. Antes de substituir,
   guarda a versão anterior em `backups/` (máximo `BACKUPS_AUTOMATICOS`, uma por dia).
+  `PermissionError` no `os.replace` (antivírus segurando o arquivo) tenta de novo até 5 vezes; a
+  espera entre as tentativas é `cofre.esperar_entre_tentativas`, que o `servidor.py` liga em
+  `time.sleep` (no navegador fica `None`: o cofre não dorme sozinho, seção 19.2).
 - A chave fica só em memória; `fechar` apaga a referência.
+- Desde 07/10/2026 (seção 19.7): `CofreMudou` (o arquivo não é mais o que este cofre leu ou gravou:
+  outra aba gravou; `salvar`, `trocar_pin` com o cofre aberto e `conteudo` recusam), `conteudo()`
+  (os bytes cifrados, para baixar), `backups_automaticos` (padrão `config.BACKUPS_AUTOMATICOS`; 2
+  no navegador) e `copias_extras_maximas` (None = as cópias fora do rodízio nunca saem; no
+  navegador, 2 de cada tipo).
 
 ## 14. `banco.py`
 
@@ -429,7 +444,9 @@ SQLite **em memória** (`sqlite3.connect(":memory:")`, `check_same_thread=False`
 `serialize`. Após cada escrita chama `ao_salvar(self.para_bytes())` (o servidor liga isso ao
 `Cofre.salvar`). `para_bytes` faz `VACUUM` antes (apagado some de verdade). A conexão usa
 `PRAGMA temp_store = MEMORY`: sem isso o VACUUM de um banco maior que o cache monta a cópia em
-`%TEMP%\etilqs_*`, sem criptografia.
+`%TEMP%\etilqs_*`, sem criptografia. `Banco.sujo` diz se há mudança que ainda não chegou a um
+`ao_salvar` que deu certo (ou a migração de um diário antigo); `marcar_salvo()` é para quem gravou
+`para_bytes()` por fora (criar, restaurar). O núcleo só regrava ao bloquear se estiver sujo (19.7).
 
 Tabelas: `config(chave PK, valor JSON)`, `registros(id, criado_em, data_registro, texto,
 contexto, humor)`, `itens(id, registro_id, tipo, resumo, trecho, certeza, categorias JSON,
@@ -505,6 +522,12 @@ class Banco:
 
 ## 15. `servidor.py`
 
+> **Atualizado pela seção 19 (núcleo e transporte, 07/10/2026).** A API, a sessão, o PIN e o
+> bloqueio por inatividade agora moram em `nucleo.py`; aqui ficou o transporte HTTP. O "atraso
+> crescente" do PIN errado virou bloqueio temporário com 429 (19.3), e a inatividade é conferida
+> a cada pedido, com a thread vigia só no servidor (19.4). Quando esta seção e a 19 discordarem,
+> vale a 19.
+
 `ThreadingHTTPServer` em **127.0.0.1** (nunca 0.0.0.0), porta 8787 (se ocupada por outro
 programa, tenta 8788-8799; se ocupada pelo próprio Entre Nós — `GET /api/ping` responde
 `{"app": "entre-nos"}` — só abre o navegador). `iniciar.py [--sem-navegador] [--porta N]
@@ -520,20 +543,23 @@ Segurança:
 - Cabeçalhos: `Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src
   'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'`, `X-Frame-Options:
   DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` na API.
-- PIN errado: atraso crescente (1 s, 2 s, 4 s... até 30 s). PIN fácil de adivinhar é recusado
-  em `/configurar` e `/pin` (`cofre.problema_do_pin`).
+- PIN errado: bloqueio temporário crescente (1 s, 2 s, 4 s... até 30 s): dentro dele, 429 com
+  `espere_segundos` e `Retry-After`, sem testar o PIN (seção 19.3). PIN fácil de adivinhar é
+  recusado em `/configurar` e `/pin` (`cofre.problema_do_pin`).
 - Apagar registro, item ou pessoa repete a remoção nas cópias automáticas de `backups/`
   (`Cofre.reescrever_backups`). Cópias feitas pelo usuário em outra pasta não mudam.
 - Bloqueio automático após `minutos_bloqueio` sem requisição: salva, `cofre.fechar()`, descarta
-  o `Banco` e o token. Uma thread verifica a cada 30 s.
+  o `Banco` e o token. O núcleo confere no começo de cada pedido; no computador, uma thread
+  verifica também a cada 30 s (seção 19.4).
 - Arquivos estáticos só de `web/` (sem `..`), com tipo MIME correto.
 
-API (JSON; datas ISO `AAAA-MM-DD`; erros `{"erro": "mensagem em português"}` com 400/401/403/404/409/423):
+API (JSON; datas ISO `AAAA-MM-DD`; erros `{"erro": "mensagem em português"}` com 400/401/403/404/409/423,
+e 429 `{"erro", "espere_segundos"}` no bloqueio do PIN, seção 19.3):
 
 | Método e rota | Corpo / parâmetros | Resposta |
 |---|---|---|
 | GET /api/ping | | `{"app": "entre-nos", "versao"}` |
-| GET /api/estado | | `{configurado, desbloqueado, versao, motor: {nome, envia_para_fora, url}}` |
+| GET /api/estado | | `{configurado, desbloqueado, versao, motor: {nome, envia_para_fora, url}}` (19.7: e `plataforma`, `backup_em_pasta`, `limite_arquivo`) |
 | POST /api/configurar | `{pin, nome_dela?, inicio_namoro?, aniversario_dela?}` | `{token}` (só se ainda não existe cofre) |
 | POST /api/desbloquear | `{pin}` | `{token}` / 401 |
 | POST /api/bloquear | | `{}` |
@@ -553,7 +579,8 @@ API (JSON; datas ISO `AAAA-MM-DD`; erros `{"erro": "mensagem em português"}` co
 | POST /api/relacoes/{id} | `{acao: "confirmar"|"descartar"|"atualizar_preferencia"}` | `{}` (atualizar: item antigo → status "mudou"; se o novo não é preferência — "ela pediu sushi" — vira/ganha a PREFERENCIA oposta, observado) |
 | GET /api/config · PATCH /api/config | | |
 | POST /api/pin | `{atual, novo}` | `{}` |
-| POST /api/backup | `{pasta}` | `{arquivo}` |
+| POST /api/backup | `{pasta}` | `{arquivo}` (no navegador: 409 `{baixar: true}`, 19.7) |
+| POST /api/backup/baixar | | `{nome, tamanho, arquivo_b64}`: o `.cofre` de agora, para baixar (19.7) |
 | GET /api/exportar | | JSON completo (a tela avisa que sai sem criptografia) |
 | GET /api/historico | | |
 | POST /api/sair | | encerra o servidor depois de salvar |
@@ -757,7 +784,7 @@ após 10 min, no bloqueio do app e em `POST /api/ia/sair`.
 |---|---|---|
 | GET /api/ia/estado | | `{pin_definido, liberada, configurada, utilizavel, reserva_configurada, sai_do_computador, espera_maxima, segundos_restantes}` (sem nome, URL nem modelo; 17.9) |
 | POST /api/ia/pin | `{novo}` | cria o PIN da IA (só se não existe) e libera; mesmas regras de força do PIN principal e **diferente do PIN principal** |
-| POST /api/ia/entrar | `{pin_ia}` | libera; PIN errado: 401 com atraso crescente (contador próprio) |
+| POST /api/ia/entrar | `{pin_ia}` | libera; PIN errado: 401 e bloqueio temporário crescente (contador próprio; 429 dentro dele, seção 19.3) |
 | POST /api/ia/sair | | fecha a área |
 | POST /api/ia/pin/trocar **(PIN IA)** | `{atual, novo}` | |
 | POST /api/ia/redefinir | `{pin}` (PIN **principal**) | "esqueci o PIN da IA": apaga `ia_pin`, `ia_principal` e `ia_reserva`; o diário fica |
@@ -841,8 +868,9 @@ Detalhes decididos ao construir; valem junto com 17.1 a 17.7.
   chave salva do mesmo serviço. `PUT` também recusa serviço que precisa de chave sem chave, chave
   por http para host público, `sk-ant-` e campos desconhecidos.
 - "PIN da IA igual ao principal?" ganha o atraso do PIN principal depois de
-  `COMPARACOES_SEM_ESPERA` (3) comparações; `/api/pin` não compara o PIN principal novo com o
-  PIN da IA (seria um oráculo sem atraso).
+  `COMPARACOES_SEM_ESPERA` (3) comparações (desde a seção 19.3, o bloqueio temporário do PIN
+  principal); `/api/pin` não compara o PIN principal novo com o PIN da IA (seria um oráculo sem
+  atraso).
 - A área da IA fica aberta por `minutos_area_ia` (10) contados de quando abriu; não renova com o uso.
   `GET /api/ia/estado` diz quanto falta (`segundos_restantes`) e a tela conta a partir dali.
 - `configurada` = principal **ou** reserva configurada.
@@ -963,8 +991,8 @@ continuam com 1 MB).
 
 | Método e rota | Quando | Corpo | Resposta |
 |---|---|---|---|
-| POST /api/restaurar | primeiro uso (sem cofre; pública como `configurar`) | `{arquivo_b64, pin}` | `{token, resumo}`; PIN errado 401 com o atraso do PIN; arquivo que não é cofre do Entre Nós 400 |
-| POST /api/restaurar | com o app desbloqueado (token) | `{arquivo_b64, pin, pin_atual}` | confere `pin_atual` (o PIN principal de agora; errado → 401 com atraso), guarda o diário atual em `backups/entrenos-antes-da-restauracao-AAAA-MM-DD-HHMMSS.cofre`, troca, abre sessão nova e devolve `{token, resumo}` |
+| POST /api/restaurar | primeiro uso (sem cofre; pública como `configurar`) | `{arquivo_b64, pin}` | `{token, resumo}`; PIN errado 401 com o bloqueio do PIN (19.3); arquivo que não é cofre do Entre Nós 400 |
+| POST /api/restaurar | com o app desbloqueado (token) | `{arquivo_b64, pin, pin_atual}` | confere `pin_atual` (o PIN principal de agora; errado → 401 com bloqueio, 19.3), guarda o diário atual em `backups/entrenos-antes-da-restauracao-AAAA-MM-DD-HHMMSS.cofre`, troca, abre sessão nova e devolve `{token, resumo}` |
 | POST /api/importar/previa | desbloqueado | `{json}` (texto do arquivo) | `{registros_novos, registros_repetidos, pessoas_novas, pessoas_existentes, itens, avisos}`; nada é gravado |
 | POST /api/importar | desbloqueado | `{json, confirmar: true}` | mesmo resumo + `{importados}` |
 
@@ -1316,3 +1344,317 @@ só os que guardam o que já valia (texto inválido recusado, importar 20 mil re
 dois. Nada rodou o `.exe`, o PyInstaller, o ISCC nem o `construir_instalador.ps1`; o `.bat` foi
 rodado só numa cópia em pasta temporária sem o `iniciar.py` (mostra o aviso e sai com 1, sem abrir
 Python).
+
+## 19. Núcleo e transporte: o mesmo app no computador e no navegador (07/10/2026)
+
+Decisão do usuário: levar o Entre Nós para iPhone e Android como **PWA**, rodando o **mesmo código
+Python** no navegador pelo Pyodide (Python em WebAssembly), dentro de um Web Worker. O diário fica
+no armazenamento do navegador (sistema de arquivos IDBFS do Emscripten montado numa pasta), no
+**mesmo formato `.cofre`**; a sincronização virá depois, pelo Google Drive. O computador continua
+com o servidor HTTP em 127.0.0.1. No navegador não existem threads (`Thread.start` falha),
+`time.sleep` confiável, servidor HTTP, sockets nem ctypes/Windows: por isso o app foi separado em
+um **núcleo** sem transporte e dois transportes.
+
+Esta seção vale junto com as anteriores; onde discordarem (o atraso do PIN nas seções 15, 17 e
+18, a thread vigia na 15), vale esta.
+
+### 19.1 Quem faz o quê
+
+```
+entrenos/
+  nucleo.py     o app: sessão e token, PIN e bloqueio temporário, inatividade, área da IA,
+                rotas da API, restaurar/importar, IA. Não sabe nada de HTTP.
+  servidor.py   transporte do computador: HTTP em 127.0.0.1, Host/Origin/Sec-Fetch, Content-Type,
+                leitura do corpo com o limite da rota, CSP e cabeçalhos, página (web/), um corpo
+                grande por vez, thread vigia, mutex do Windows, main()/argumentos, navegador
+  ponte.py      transporte do navegador: o que o Pyodide chama (texto entra, texto sai)
+```
+
+- `servidor.EntreNos` é uma subclasse de `nucleo.Nucleo` com o que só o computador tem: `porta`,
+  `servidor`, `pasta_web`, `vez_do_arquivo` (o semáforo de 18.6), a vigia (`iniciar_vigia`,
+  `intervalo_verificacao`), `host_permitido` e `origem_permitida`; `encerrar` também para a vigia.
+- Foram para `nucleo.py` (o que as seções 15 a 18 chamam de `servidor.X` ou `EntreNos.X`):
+  `ErroHttp`, `traduzir_erro`, `registrar_erro`, `configurar_log`, `Rota`, `ROTAS`, `achar_rota`,
+  `Pedido`, os acessos (`PUBLICA`, `SESSAO`, `LIVRE`, `PRIMEIRO_USO`), `contexto_sugestao`,
+  `so_o_escrito`, `_erro_da_ia`, `_importar`, `LIMITE_CORPO`, `LIMITE_CORPO_ARQUIVO`,
+  `atraso_do_pin` e as mensagens. `servidor.py` reexporta os nomes que os testes e o `iniciar.py`
+  usam. Ficaram no servidor: `ENDERECO`, `CSP`, `CABECALHOS_SEGURANCA`, `TIPOS_MIME`,
+  `arquivo_estatico`, `ARQUIVO_OCUPADO`, `PAGINA_SEM_ARQUIVOS`, `faltam_arquivos_da_pagina`,
+  `MUTEX_ABERTO`, `criar_servidor`, `e_entre_nos`, `main`.
+- O log de erros sai como `entrenos.nucleo` (era `entrenos.servidor`); o conteúdo continua só tipo
+  e ponto do código.
+- O `Abrir Entre Nos.bat` também confere `entrenos\nucleo.py` (seção 18.6).
+
+### 19.2 O contrato do núcleo
+
+```python
+class Nucleo:
+    def __init__(self, pasta, *, atraso_pin=1.0, atraso_pin_maximo=30.0, minutos_bloqueio=None,
+                 hoje=None, relogio=None, relogio_parede=None, minutos_area_ia=10,
+                 plataforma="computador")
+        # hoje: () -> date (padrão date.today). relogio: () -> float, segundos monotônicos
+        # (padrão time.monotonic): o bloqueio do PIN conta nele. relogio_parede: () -> float
+        # (padrão time.time): inatividade e área da IA contam pelo que andar mais dos dois (19.4).
+        # plataforma: "computador" ou "navegador" (19.7); dela saem os atributos backup_em_pasta,
+        # ia_disponivel, limite_corpo_arquivo e as cópias do cofre.
+    def tratar(self, metodo: str, caminho: str, *, corpo: bytes | None = None,
+               token: str | None = None, consulta: Mapping[str, str | list[str]] | None = None) -> RespostaApi
+    def restaurar_arquivo(self, arquivo: bytes, *, corpo: bytes | None = None,
+                          token: str | None = None) -> RespostaApi   # /api/restaurar sem base64 (19.7)
+    def limite_do_corpo(self, rota) -> int         # 1 MB, ou limite_corpo_arquivo (64 MB; 16 MB no navegador)
+    def copia_do_diario(self, banco) -> tuple[str, bytes]   # (nome, .cofre de agora), salvo antes
+    def verificar_inatividade(self) -> bool        # True = bloqueou agora
+    def conferir_antes_do_corpo(self, rota, token) -> None   # rotas de 64 MB (18.5)
+    def bloquear(self) -> None
+    def encerrar(self) -> None      # salva e bloqueia de vez: configurar/desbloquear/restaurar → 503
+    def espera_do_pin(self) -> float      # segundos até o próximo PIN principal ser conferido
+    def espera_do_pin_ia(self) -> float
+    desbloqueado: bool
+
+@dataclass
+class RespostaApi:
+    status: int
+    dados: Any                    # JSON simples (para_json já aplicado)
+    cabecalhos: dict[str, str]    # os que importam a quem chamou: Allow (405), Retry-After (429)
+    corpo: bytes                  # `dados` em JSON UTF-8, compacto, acentos sem escape
+    encerrar: bool = False        # /api/sair: o transporte desliga (ou para) depois de responder
+
+def achar_rota(metodo, caminho) -> tuple[Rota, tuple[str, ...]]   # 404; 405 com Allow
+def resposta_de_erro(erro) -> RespostaApi                           # {"erro", ...extras}
+```
+
+`tratar` **nunca levanta**; na ordem:
+1. confere a inatividade (preguiçoso: passou do tempo, salva e bloqueia antes de tudo);
+2. acha a rota: 404, ou 405 com `Allow`;
+3. corpo maior que `limite_do_corpo(rota)` (1 MB; 64 MB em restaurar e importar, 16 MB no
+   navegador): 413, com o limite na mensagem;
+4. consulta `{nome: texto}`; valor em lista vale o último (como o `parse_qs`); valor que não é
+   texto, ou mais de 50 parâmetros: 400;
+5. acesso da rota como nas seções 15 e 18 (pública, sessão com a trava do app, livre, primeiro
+   uso), com o token conferido antes de ler o JSON;
+6. JSON: objeto, sem NaN, UTF-8 válido (campos grandes como em 18.6);
+7. erro → `traduzir_erro` → `{"erro": "...", ...extras}`; sucesso → `para_json`, 200.
+
+O corpo vai direto na chamada (`corpo=self._ler_corpo(...)`), sem outra referência no transporte:
+o pedido solta os bytes assim que lê o JSON, e um arquivo de 64 MB não fica duas vezes na memória
+(18.6).
+
+**O que o núcleo não pode usar.** `nucleo.py`, `ponte.py` e tudo o que eles importam (inclusive na
+hora do uso, pelo `_importar`: regras, motor, banco, cofre, busca, alertas, perfil, contexto,
+provedores, modelos, texto, config) não iniciam thread (só `threading.RLock`/`Lock`), não usam
+`time.sleep`, `http.server`, `socketserver`, `socket`, `ctypes`, `webbrowser`, `subprocess` nem
+`multiprocessing`. Para isso:
+- `cofre._substituir` (troca do arquivo com novas tentativas quando o antivírus o segura) espera
+  por `cofre.esperar_entre_tentativas`, que o `servidor.py` liga em `time.sleep` ao ser importado;
+  no navegador fica `None` e o cofre tenta de novo direto;
+- `motor` deixou de importar `socket`: a falha de DNS é reconhecida pelo `socket.gaierror` que
+  estiver em `sys.modules` (se houve um, o urllib já carregou o módulo);
+- `_erro_da_ia` olha só `TimeoutError` (o `socket.timeout` é o mesmo desde o Python 3.10).
+
+`testes/test_compat_navegador.py` guarda isso: abre todo `entrenos/*.py` com a gramática do Python
+3.12 (`ast.parse(feature_version=(3, 12))`; o Pyodide 314 roda o 3.14.2, o 3.12 é margem para
+versões anteriores), exige `from __future__ import annotations` onde há anotação (no 3.12 e no
+3.13 elas rodam ao importar), varre com `ast` os imports e os usos proibidos (inclusive
+com apelido e o `_importar("motor")`, ignorando `if TYPE_CHECKING:`), testa o próprio varredor, roda
+o núcleo sem transporte e a ponte, e roda um diário inteiro pela ponte num **Python separado** em
+que `Thread.start` e `time.sleep` dão erro e `ctypes`, `webbrowser`, `http.server`, `socketserver`
+e `entrenos.servidor` não existem (configurar, analisar, gravar, busca, telas, PIN errado, 429,
+inatividade, sair; no fim, uma thread só).
+
+### 19.3 PIN errado: bloqueio temporário com 429
+
+Substitui o "atraso crescente" das seções 15, 17.6, 17.8 e 18.2, em que o pedido **dormia** antes
+de responder (inviável no navegador).
+
+- Depois da n-ésima tentativa errada seguida, nenhum PIN é conferido por `atraso_do_pin(n)`: a
+  mesma progressão de antes, 1, 2, 4, 8, 16, 30, 30... s (`atraso_pin` e `atraso_pin_maximo` mudam
+  a base e o teto). O 401 sai **na hora** e já diz quanto esperar: `{"erro", "espere_segundos"}`.
+- Tentativa antes da hora: **429** `{"erro": "Espere N s antes de tentar o PIN de novo.",
+  "espere_segundos": N}` e cabeçalho `Retry-After: N` (N inteiro, para cima, no mínimo 1), **sem
+  testar o PIN** (nem scrypt), sem contar falha, e mesmo que o PIN esteja certo.
+- A conferência do bloqueio e o teste do PIN acontecem juntos, sob a trava do PIN (`RLock`):
+  tentativas em paralelo testam **um PIN só**; as outras recebem 429.
+- Contadores como antes: o do PIN principal é um só para desbloquear, restaurar (o PIN do backup e
+  o PIN de agora), trocar o PIN e "Esqueci o PIN da IA"; o PIN da IA (entrar, trocar) tem trava,
+  contador e bloqueio próprios. Acertar zera o contador.
+- "PIN da IA igual ao principal?" (17.8, 17.9): as `COMPARACOES_SEM_ESPERA` (3) primeiras
+  comparações não bloqueiam; depois cada uma bloqueia como um PIN errado (1×, 2×, 4×... a base),
+  **no bloqueio do PIN principal**: é um oráculo dele. (Antes cada comparação dormia segurando a
+  trava do PIN, o que também segurava o desbloqueio.) Acertar o PIN principal zera a conta.
+- Configurar um diário novo zera o contador e o bloqueio do PIN principal; criar o PIN da IA,
+  "Esqueci o PIN da IA" e restaurar um backup zeram os do PIN da IA.
+- Tela (`web/app.js`): `segundosDeEspera(erro)` lê `espere_segundos` do 401 e do 429. A mensagem
+  fica parada no campo de erro (um alerta só, por causa do leitor de tela) e o botão vira
+  **"Espere N s"**, contando de segundo em segundo; no fim ele volta, e **tocar de novo reenvia**
+  (antes disso o envio é ignorado). Vale no desbloqueio, nas duas restaurações (primeiro uso e
+  Ajustes), em trocar o PIN, criar, abrir e trocar o PIN da IA e "Esqueci o PIN da IA".
+  `MENSAGENS_HTTP[429]` para quando o servidor não manda mensagem.
+- Os testes usam um relógio de mentira (`testes.test_servidor.Relogio`) e nada de esperar de
+  verdade; o `ServidorDeTeste` não bloqueia por padrão (`atraso_pin=0`).
+- **O bloqueio sobrevive a fechar e abrir (19.7).** Cada PIN errado (e cada comparação que bloqueia)
+  grava `pin_espera.json` na pasta de dados **antes** de responder: `{"principal": {falhas,
+  livre_em}, "ia": {...}, "visto"}`, com os horários no relógio de parede; só contadores, nada do
+  PIN. Acertar, configurar e zerar o PIN da IA regravam (sem nada a guardar, o arquivo sai). Ao
+  criar o `Nucleo`: o `livre_em` gravado continua valendo; mesmo já passado, quem abre espera de novo
+  `atraso_do_pin(falhas)` (adiantar a hora não pula a espera, e cada reabertura custa um degrau
+  inteiro); relógio de parede antes do `visto` (hora atrasada à mão) = o teto. Arquivo estranho é
+  ignorado (quem o apaga também pode copiar o `.cofre` e testar PINs fora do app). Nunca recria a
+  pasta de dados apagada (18.6); falhar ao gravar não atrapalha o PIN (fica no `erros.log`).
+
+### 19.4 Bloqueio por inatividade
+
+- **Dois relógios (19.7).** O `time.monotonic` do Pyodide é o `performance.now()`, que não anda
+  enquanto o celular dorme (só no Windows conta o sono): com a tela travada por horas, o diário
+  continuava aberto. A inatividade e a área da IA contam pelo que andar mais: `relogio`
+  (monotônico) ou `relogio_parede` (time.time). Hora adiantada só bloqueia antes; hora atrasada à
+  mão faz a parede andar para trás, e aí vale o monotônico. O bloqueio do PIN, ao contrário, conta
+  só no monotônico enquanto o núcleo vive (ninguém o encurta mudando a hora; o sono só o alonga).
+- A página também (`web/app.js`): `visibilitychange`, `pageshow` e `focus` conferem na hora (o
+  `setInterval` quase não roda com a aba escondida), e um toque depois do tempo sem uso bloqueia
+  em vez de contar como uso (`passouDoTempoSemUso`).
+- O núcleo confere no começo de cada `tratar` (e, como antes, em `_exigir_sessao` e em
+  `/api/estado`) e expõe `verificar_inatividade()`.
+- No computador, a thread vigia do `servidor.EntreNos` chama `verificar_inatividade()` a cada
+  `intervalo_verificacao` (30 s): bloqueia mesmo sem pedido nenhum.
+- No navegador, o Worker chama `ponte.verificar_inatividade()` de tempos em tempos (`setInterval`).
+
+### 19.5 A ponte do navegador (`entrenos/ponte.py`)
+
+```python
+def iniciar_no_navegador(pasta_dados: str, **opcoes) -> Nucleo
+    # cria a pasta, liga o erros.log nela e cria o Nucleo (sem thread) com plataforma="navegador".
+    # Chamar de novo bloqueia (e salva) o anterior e troca; o erros.log não duplica.
+def tratar_json(metodo, caminho, corpo_texto=None, token=None, consulta_json=None) -> str
+    # {"status", "cabecalhos" (só Allow e Retry-After), "gravou", "dados"[, "encerrado": true]}
+def restaurar_arquivo(arquivo, corpo_texto=None, token=None) -> str
+    # /api/restaurar com o .cofre em bytes (o JsProxy do Uint8Array, com to_bytes()), sem base64
+def verificar_inatividade() -> str     # {"bloqueou", "gravou"}
+def autoteste() -> str                 # {"ok", "falhas", "python", "sqlite"}: antes de abrir o diário
+```
+
+- Texto entra, texto sai: nenhum objeto Python atravessa para o JavaScript. Os `dados` entram na
+  saída já serializados (`RespostaApi.corpo`), sem converter uma exportação grande duas vezes.
+- `caminho` pode trazer a consulta (`"/api/busca?q=tulipas"`, como no `fetch`); `consulta_json`
+  (objeto de textos) vale por cima. Método em minúsculas vale.
+- `corpo_texto` vira UTF-8 com `surrogatepass`: metade de um par de surrogates (o JavaScript
+  deixa) chega ao núcleo e é recusada com 400, como no computador.
+- `gravou`: algum arquivo da pasta de dados mudou durante a chamada (nome, inode, tamanho, data);
+  aí o Worker chama `FS.syncfs(false, ...)` para o IDBFS ir para o armazenamento do navegador.
+  Pode acontecer até num GET (o bloqueio por inatividade salva).
+- Antes de `iniciar_no_navegador`: 503 com `NAO_INICIADO`.
+- **Nunca levanta** (19.7): consulta ou corpo muito aninhados dão 400, e qualquer erro inesperado
+  vira `{status: 500, erro}` (no `erros.log`, só o tipo), em vez de um PythonError no JavaScript.
+- Não importa o `servidor.py`. No navegador, `/api/backup` (pasta) responde 409 `{baixar: true}`
+  e o backup é `POST /api/backup/baixar`; não há arquivos da página (a PWA serve os seus) nem
+  mutex. `/api/sair` encerra o núcleo (`"encerrado": true`); para voltar, a página chama
+  `iniciar_no_navegador` de novo.
+- Ordem no Worker: Pyodide + `cryptography`, `autoteste()` (com `ok` falso, a página explica que
+  este navegador não roda o Entre Nós), montar o IDBFS, `FS.syncfs(true)`, `iniciar_no_navegador`.
+
+### 19.6 O que fica para a fase do PWA
+
+- **Pacotes (corrigido em 19.7).** No Pyodide 314 (Python 3.14.2) o `sqlite3` vem na biblioteca
+  padrão e o `ssl` é uma casca; nenhum dos dois está no `pyodide-lock.json`, e
+  `loadPackage(["sqlite3", ...])` falha inteiro ("No known package with name 'sqlite3'"), sem
+  carregar o `cryptography`. O certo é `loadPyodide({..., packages: ["cryptography"]})` (ou
+  `loadPackage(["cryptography"])`). O `motor` importa `ssl` dentro de `try` (sem ele, a IA não
+  funciona, e no navegador ela já está desligada).
+- O `ponte.autoteste()` confere o resto no aparelho, antes de abrir o diário: FTS5 com
+  `remove_diacritics 2`, `bm25`, `optimize`, `json_each`, `serialize`/`deserialize`, o esquema do
+  diário indo e voltando (com `conferir_integridade` e a busca), scrypt (RFC 7914) e AES-256-GCM
+  com valores conhecidos, o formato `.cofre` e os módulos de uso na hora. O SQLite 3.39 do Pyodide
+  atende o esquema de hoje; recurso do SQLite mais novo que a 3.39 fica proibido no esquema.
+- `rapidfuzz`: resolvido (19.7), a semelhança é Python puro.
+- IA no navegador: o `urllib` não alcança a rede no Pyodide (o TLS do `ssl` de casca levanta
+  NotImplementedError). Desligada por enquanto (`ia_disponivel`, 19.7); depois, um transporte por
+  `fetch` do Worker injetado no motor, sem mexer no núcleo.
+- Cópia para o Google Drive: o `.cofre` já é o formato de troca (restaurar, 18.2).
+
+**Testado (07/10/2026, 915 testes OK):** a suíte inteira no CPython 3.14 deste computador, com os testes de
+bloqueio do PIN reescritos para a semântica nova (um PIN só testado em paralelo, 429 com
+`Retry-After`, teto, volta ao primeiro degrau, comparação com o PIN principal no mesmo bloqueio) e
+`test_compat_navegador.py`. O núcleo **ainda não rodou num Pyodide de verdade**; nada abriu
+navegador, `.exe`, PyInstaller ou ISCC.
+
+### 19.7 Revisão do núcleo para o celular (07/10/2026)
+
+Achados de duas revisões (paridade de segurança e navegador) sobre a separação núcleo/transporte.
+Vale junto com 19.1 a 19.6; onde discordarem, vale esta. Testes novos em
+`testes/test_compat_navegador.py` (classes da seção "revisão de 07/10/2026"); cada um falha com a
+correção desfeita (conferido desfazendo uma por vez).
+
+**Plataforma.** `Nucleo(..., plataforma="computador"|"navegador")`; a ponte cria com "navegador".
+Dela saem atributos que os testes podem trocar depois:
+
+| | computador | navegador |
+|---|---|---|
+| `backup_em_pasta` | sim | não: `POST /api/backup` → 409 `{erro: BACKUP_SO_BAIXANDO, baixar: true}` |
+| `ia_disponivel` | sim | não: ✨, "Buscar modelos" e "Testar" → 503 `{erro: IA_SO_NO_COMPUTADOR, ia_indisponivel: true}`; `ia.utilizavel` falso e `ia.motivo` em `/api/estado` e `/api/ia/estado` (os ajustes da IA continuam guardados) |
+| `limite_corpo_arquivo` | 64 MB | 16 MB (restaurar e importar; o pico de memória da leitura passa de 4x o arquivo, e o wasm não devolve memória) |
+| `cofre.backups_automaticos` | 5 | 2 |
+| `cofre.copias_extras_maximas` | None (nunca saem) | 2 de cada tipo (antes da restauração, anterior, danificado) |
+| textos | antivírus, pasta, `E:\` | "o navegador pode ter apagado os dados", sem caminho; `copias_anteriores.pasta` e `copia` da restauração só com o nome |
+
+`/api/estado` ganha `plataforma`, `backup_em_pasta` e `limite_arquivo` (para a página do celular se
+ajustar; a do computador não muda). O `ia.motivo` só aparece no navegador, com IA configurada.
+
+**Backup no celular.** `POST /api/backup/baixar` (sessão) devolve `{nome, tamanho, arquivo_b64}`: o
+`.cofre` de agora, cifrado, depois de salvar o que faltava (`copia_do_diario`). Vale nos dois
+lugares; é o arquivo que `/api/restaurar` aceita. A página baixa ou compartilha (`navigator.share`).
+
+**Restaurar sem base64.** `Nucleo.restaurar_arquivo(arquivo, corpo=..., token=...)` e
+`ponte.restaurar_arquivo(arquivo, corpo_texto, token)`: o arquivo vem em bytes (o JsProxy do
+Uint8Array, convertido com `to_bytes()`; também `bytes`, `bytearray`, `memoryview`), e o corpo só
+traz `{pin[, pin_atual, substituir_danificado]}`. Mesmas regras e respostas da rota.
+
+**PIN errado entre aberturas** (19.3): `pin_espera.json`. Antes, recarregar a página zerava o
+bloqueio: 20 reaberturas no mesmo instante testavam 20 PINs.
+
+**Dois relógios** (19.4): o diário bloqueia depois do celular dormir com o app aberto.
+
+**Duas abas no mesmo diário.** Cada aba (ou a aba e o app instalado) é um núcleo com a sua cópia do
+IDBFS; o `syncfs` de uma sobrescreve a outra. Defesa do núcleo: o cofre guarda (inode, tamanho,
+data) do arquivo que leu ou gravou e, antes de salvar, confere; mudou: `CofreMudou`, o núcleo
+bloqueia **sem salvar** e responde 409 `DIARIO_MUDOU` ("feche as outras abas, recarregue"). Também
+em trocar o PIN e baixar a cópia, e `bloquear` não grava por cima. Arquivo que sumiu (pasta
+existindo) continua sendo regravado (18.6). A defesa principal fica no Worker (pendente): Web
+Locks (`navigator.locks.request("entrenos-cofre", {ifAvailable: true})`), uma aba dona só, e
+`FS.syncfs(true)` antes de cada pedido se houver mais de uma.
+
+**Bloquear sem regravar.** `bloquear` só salva se o banco está sujo (19.7 em 14): antes, cada
+bloqueio recifrava e regravava o arquivo inteiro (no celular, mais um `syncfs`; com o Drive, uma
+versão nova por bloqueio).
+
+**Semelhança igual em todo lugar.** `texto.semelhanca` = `token_set_ratio` (o do rapidfuzz 3) em
+Python puro, com a subsequência comum pelo método de bits de Hyyrö: o mesmo número, bit a bit, que
+o rapidfuzz (conferido em 50 mil pares sorteados), ~20 µs por par. Antes o celular caía no
+`difflib`: "Ana" x "Ana Paula" dava 50 (não casava a pessoa), "chocolate" x "chocolate amargo" 72
+(não achava a contradição). O `instalador/entrenos.spec`, o workflow e o `.bat` ainda citam o
+rapidfuzz: inofensivo (o app não o importa mais); sai quando o instalador for refeito.
+
+**A ponte nunca levanta**, **autoteste** e o `loadPackage` certo: 19.5 e 19.6.
+
+**`construir_instalador.ps1`** confere também `entrenos\nucleo.py` (como o `.bat`, 19.1); o teste
+confere que tudo o que o `.bat` confere está na lista do script.
+
+**Teste do "Python de navegador"** (`ROTEIRO`): além do que já bloqueava, `rapidfuzz`, `_hashlib`
+(o OpenSSL do hashlib), `ssl`, `_ssl`, `zoneinfo`, `tzdata`, `subprocess` e `multiprocessing` não
+existem, e `_thread.start_new_thread`/`start_joinable_thread` (por onde o `threading` do 3.13+
+inicia threads) dão erro. Ganhou o autoteste, a semelhança sem rapidfuzz, backup (409 e baixar),
+IA (503) e reabrir com o PIN bloqueado (429).
+
+**Não feito (fica para a fase do PWA):**
+- scrypt no Worker de uma linha só: criar o PIN da IA roda até 4 scrypt de 2^16 (as variações do
+  PIN principal) e mais 1 de 2^15; no PC são ~0,25 s cada, no wasm deve ser várias vezes mais. Medir
+  no aparelho e mostrar progresso antes de mexer nas variações (menos variações = PIN da IA igual
+  ao principal em maiúsculas passaria);
+- listar, apagar e restaurar as cópias internas de `backups/` pela tela (no celular não há
+  gerenciador de arquivos);
+- Web Locks e `syncfs` no Worker; a página do celular usar `plataforma`, `limite_arquivo` e
+  `backup_em_pasta` (o botão "Baixar uma cópia" e o aviso de tamanho antes de mandar);
+- medir memória e tempo no aparelho com um diário grande (5 a 10 anos).
+
+**Testado (07/10/2026):** a suíte inteira no CPython 3.14 deste computador. O núcleo continua sem
+ter rodado num Pyodide de verdade; nada abriu navegador, `.exe`, PyInstaller ou ISCC, e o `app.js`
+(eventos de visibilidade) foi conferido só por leitura e por uma conferência de parênteses,
+chaves, textos e templates.

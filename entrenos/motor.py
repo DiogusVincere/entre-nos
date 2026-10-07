@@ -24,8 +24,7 @@ import ipaddress
 import json
 import math
 import re
-import socket
-import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -34,6 +33,11 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any, Callable, Protocol, runtime_checkable
+
+try:
+    import ssl
+except ImportError:          # navegador sem o módulo ssl (seção 19): a IA ali não funciona mesmo
+    ssl = None  # type: ignore[assignment]
 
 from . import config, provedores
 from .modelos import (CATEGORIAS, Certeza, DataEncontrada, Item, PessoaEncontrada, Precisao,
@@ -794,6 +798,14 @@ def _erro_http(status: int) -> ErroIA:
     return ErroIA(_MSG["http"].format(status=status), "http", "HTTPError")
 
 
+def _falha_de_nome(motivo: Any) -> bool:
+    """O endereço não existe (socket.gaierror, falha de DNS)? Sem importar `socket`: o motor
+    também roda no navegador (seção 19). Se um gaierror aconteceu, quem o levantou (o urllib)
+    já carregou o módulo `socket`."""
+    gaierror = getattr(sys.modules.get("socket"), "gaierror", None)
+    return isinstance(gaierror, type) and isinstance(motivo, gaierror)
+
+
 def _erro_ia(erro: BaseException, tempo: float) -> ErroIA:
     """Qualquer falha de rede/HTTP/formato -> ErroIA com mensagem para a tela."""
     if isinstance(erro, ErroIA):
@@ -804,9 +816,9 @@ def _erro_ia(erro: BaseException, tempo: float) -> ErroIA:
     motivo = erro.reason if isinstance(erro, urllib.error.URLError) else erro
     if isinstance(motivo, TimeoutError):
         return ErroIA(_MSG["tempo"].format(segundos=_segundos(tempo)), "tempo", "TimeoutError")
-    if isinstance(motivo, ssl.SSLError):
+    if ssl is not None and isinstance(motivo, ssl.SSLError):
         return ErroIA(_MSG["seguranca"], "seguranca", causa)
-    if isinstance(motivo, socket.gaierror):
+    if _falha_de_nome(motivo):
         return ErroIA(_MSG["dns"], "conexao", causa)
     if isinstance(erro, (urllib.error.URLError, OSError, http.client.HTTPException)):
         return ErroIA(_MSG["conexao"], "conexao", causa)

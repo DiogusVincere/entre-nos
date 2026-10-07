@@ -139,6 +139,7 @@
     409: 'Isso entra em conflito com o que já existe.',
     413: 'O texto ficou grande demais.',
     423: 'O Entre Nós está bloqueado.',
+    429: 'Espere um pouco antes de tentar o PIN de novo.',
     500: 'O Entre Nós teve um problema. Tente de novo.',
     502: 'A IA não respondeu direito. Tente de novo em instantes.',
     503: 'Essa parte do Entre Nós não está disponível agora.',
@@ -466,6 +467,44 @@
   // 403 {"pin_ia": true}: a área Ajustes → IA está fechada (pede o PIN da IA).
   function pedePinIA(e) {
     return Boolean(e && e.status === 403 && e.dados && e.dados.pin_ia === true);
+  }
+
+  // PIN errado (seção 19): depois de cada erro o Entre Nós não confere outro PIN por 1 s, 2 s,
+  // 4 s... até 30 s. A resposta vem na hora: o 401 já traz `espere_segundos`, e quem tenta antes
+  // da hora recebe 429 com quanto falta. Quanto esperar (0 = não precisa).
+  function segundosDeEspera(e) {
+    const s = e && e.dados ? Number(e.dados.espere_segundos) : NaN;
+    return Number.isFinite(s) && s > 0 ? Math.ceil(s) : 0;
+  }
+
+  const contagensPin = new WeakMap();      // botão -> {id do intervalo, texto original}
+
+  function esperandoPin(botao) {
+    return contagensPin.has(botao);
+  }
+
+  // O botão vira "Espere N s", contando, e volta sozinho no fim: tocar de novo reenvia. A
+  // mensagem do erro fica parada no campo de aviso (um alerta por segundo cansaria quem usa
+  // leitor de tela).
+  function contarEsperaPin(botao, segundos) {
+    const anterior = contagensPin.get(botao);
+    const texto = anterior ? anterior.texto : botao.textContent;
+    if (anterior) clearInterval(anterior.id);
+    let restante = Math.max(1, Math.ceil(segundos));
+    botao.disabled = true;
+    botao.textContent = `Espere ${restante} s`;
+    const id = setInterval(() => {
+      restante -= 1;
+      if (restante > 0 && botao.isConnected) {
+        botao.textContent = `Espere ${restante} s`;
+        return;
+      }
+      clearInterval(id);
+      contagensPin.delete(botao);
+      botao.disabled = false;
+      botao.textContent = texto;
+    }, 1000);
+    contagensPin.set(botao, { id, texto });
   }
 
   const METODOS_COM_CORPO = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
@@ -1448,7 +1487,7 @@
     };
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      if (ocupado) return;
+      if (ocupado || esperandoPin(botao)) return;
       erro.textContent = '';
       const escolhido = arquivo.files && arquivo.files[0];
       const problema = problemaDoArquivo(escolhido, 'cofre', true);
@@ -1466,6 +1505,7 @@
       if (danificado) pins.substituir_danificado = true;
       travar(true);
       let foco = null;
+      let espera = 0;
       try {
         esquecerToken();        // primeiro uso: sem sessão (um token velho desta aba não vale aqui)
         const r = await restaurarBackup(escolhido, pins, progresso);
@@ -1489,6 +1529,7 @@
           telaBloqueio('Este computador já tem um Entre Nós configurado. Use o seu PIN.');
           return;
         }
+        espera = segundosDeEspera(erroApi);
         if (erroApi.status === 401) {
           erro.textContent = 'Esse PIN não abre este backup. Use o PIN que valia quando ele foi feito.';
           foco = pin;
@@ -1499,13 +1540,15 @@
           erro.textContent = erroApi.doServidor ? erroApi.message : MENSAGEM_NAO_E_COFRE;
           foco = arquivo;
         } else {
-          erro.textContent = erroApi.message;
+          erro.textContent = erroApi.message;          // 429: "Espere N s antes de tentar o PIN de novo."
+          if (erroApi.status === 429) foco = pin;
         }
       } finally {
         pins.pin = null;
         pin.value = '';
         if (form.isConnected) travar(false);
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
       if (foco) foco.focus();
     });
     return form;
@@ -1593,6 +1636,7 @@
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botao)) return;
       erro.textContent = '';
       if (!pin.value) {
         erro.textContent = 'Digite o seu PIN.';
@@ -1601,6 +1645,7 @@
       }
       botao.disabled = true;
       botao.textContent = 'Conferindo…';
+      let espera = 0;
       try {
         const r = await api('POST', '/desbloquear', { pin: pin.value }, { semBloqueio: true });
         pin.value = '';
@@ -1614,6 +1659,8 @@
           await carregarEstado();                // nenhum PIN abre (nem foi testado): vai para a restauração
           return;
         }
+        // PIN errado (401) ou tentativa antes da hora (429): o botão conta a espera.
+        espera = segundosDeEspera(erroApi);
         if (erroApi.status === 401 && !erroApi.doServidor) erro.textContent = 'PIN incorreto. Respire e tente de novo.';
         else erro.textContent = erroApi.message;
         opcoes.hidden = !(erroApi.status === 409 && dados.sem_diario);
@@ -1622,6 +1669,7 @@
         botao.disabled = false;
         botao.textContent = 'Abrir';
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
     });
 
     const minutos = (estado.config && estado.config.minutos_bloqueio) || estado.minutosBloqueio;
@@ -1668,12 +1716,20 @@
 
   // Bloqueio por inatividade na própria página, e "sinal de vida" enquanto a pessoa usa
   // a tela sem fazer pedidos (escrevendo um texto longo, por exemplo).
+  function limiteSemUso() {
+    const minutos = Number(estado.config && estado.config.minutos_bloqueio) || 10;
+    return minutos * 60000;
+  }
+
+  function passouDoTempoSemUso() {
+    return estado.modo === 'app' && Date.now() - estado.ultimaAtividade >= limiteSemUso();
+  }
+
   function verificarInatividade() {
     if (estado.modo !== 'app') return;
-    const minutos = Number(estado.config && estado.config.minutos_bloqueio) || 10;
-    const limite = minutos * 60000;
+    const limite = limiteSemUso();
     const agora = Date.now();
-    if (agora - estado.ultimaAtividade >= limite) {
+    if (passouDoTempoSemUso()) {
       bloquearAgora(true);
       return;
     }
@@ -3555,6 +3611,7 @@
       h('div', { class: 'acoes' }, botaoPin));
     formPin.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botaoPin)) return;
       erro.textContent = '';
       if (!atualPin.value) {
         erro.textContent = 'Digite o PIN atual.';
@@ -3573,6 +3630,7 @@
         return;
       }
       botaoPin.disabled = true;
+      let espera = 0;
       try {
         await api('POST', '/pin', { atual: atualPin.value, novo: novoPin.value }, { semBloqueio: true });
         formPin.reset();
@@ -3589,11 +3647,13 @@
         } else {
           erro.textContent = erroApi.message;
         }
+        espera = segundosDeEspera(erroApi);
         atualPin.value = '';
         atualPin.focus();
       } finally {
         botaoPin.disabled = false;
       }
+      if (espera && formPin.isConnected) contarEsperaPin(botaoPin, espera);
     });
 
     return h('section', { class: 'cartao', 'aria-labelledby': 'aj-seguranca' },
@@ -3703,7 +3763,7 @@
     };
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      if (ocupado) return;
+      if (ocupado || esperandoPin(botao)) return;
       erro.textContent = '';
       const escolhido = arquivo.files && arquivo.files[0];
       const problema = problemaDoArquivo(escolhido, 'cofre');
@@ -3732,6 +3792,7 @@
       const pins = { pin: pinBackup.value, pin_atual: pinAtual.value };
       travar(true);
       let foco = null;
+      let espera = 0;
       try {
         const r = await restaurarBackup(escolhido, pins, progresso);
         arquivo.value = '';
@@ -3758,8 +3819,9 @@
           erro.textContent = erroApi.doServidor ? erroApi.message : MENSAGEM_NAO_E_COFRE;
           foco = arquivo;
         } else if (!erroApi.bloqueio) {
-          erro.textContent = erroApi.message;
+          erro.textContent = erroApi.message;          // 429: "Espere N s antes de tentar o PIN de novo."
         }
+        espera = segundosDeEspera(erroApi);
       } finally {
         pins.pin = null;
         pins.pin_atual = null;
@@ -3767,6 +3829,7 @@
         pinAtual.value = '';
         if (form.isConnected) travar(false);
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
       if (foco && form.isConnected) foco.focus();
     });
 
@@ -4267,6 +4330,7 @@
       h('div', { class: 'acoes' }, botao));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botao)) return;
       erro.textContent = '';
       const problema = problemaDoPin(novo.value);
       if (problema) {
@@ -4281,6 +4345,7 @@
       }
       botao.disabled = true;
       botao.textContent = 'Criando…';
+      let espera = 0;
       try {
         await api('POST', '/ia/pin', { novo: novo.value });
         form.reset();
@@ -4294,12 +4359,15 @@
           painel.desenhar({ mensagem: erroApi.message, focar: true });
           return;
         }
+        // 429: comparar o PIN da IA com o principal muitas vezes seguidas também faz esperar.
+        espera = segundosDeEspera(erroApi);
         erro.textContent = erroApi.message;
         novo.focus();
       } finally {
         botao.disabled = false;
         botao.textContent = 'Criar PIN da IA';
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
     });
     limpar(corpo);
     inserir(corpo, mensagemIA(opcoes.mensagem), situacaoIA(est),
@@ -4330,6 +4398,7 @@
     const form = h('form', { novalidate: true, class: 'form-ia' }, campo('PIN da IA', pin), erro, h('div', { class: 'acoes' }, botao));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botao)) return;
       erro.textContent = '';
       if (!pin.value) {
         erro.textContent = 'Digite o PIN da IA.';
@@ -4338,6 +4407,7 @@
       }
       botao.disabled = true;
       botao.textContent = 'Conferindo…';
+      let espera = 0;
       try {
         await api('POST', '/ia/entrar', { pin_ia: pin.value }, { semBloqueio: true });
         pin.value = '';
@@ -4354,11 +4424,13 @@
         } else {
           erro.textContent = erroApi.message;
         }
+        espera = segundosDeEspera(erroApi);
         pin.focus();
       } finally {
         botao.disabled = false;
         botao.textContent = 'Abrir a área da IA';
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
     });
 
     // "Esqueci o PIN da IA": com o PIN principal, apaga o PIN da IA e a configuração da IA.
@@ -4370,6 +4442,7 @@
       campo('PIN principal', principal), erroRedef, h('div', { class: 'acoes' }, botaoRedef));
     formRedef.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botaoRedef)) return;
       erroRedef.textContent = '';
       if (!principal.value) {
         erroRedef.textContent = 'Digite o PIN principal.';
@@ -4384,6 +4457,7 @@
       });
       if (!ok) return;
       botaoRedef.disabled = true;
+      let espera = 0;
       try {
         await api('POST', '/ia/redefinir', { pin: principal.value }, { semBloqueio: true });
         principal.value = '';
@@ -4398,10 +4472,12 @@
         } else {
           erroRedef.textContent = erroApi.message;
         }
+        espera = segundosDeEspera(erroApi);
         principal.focus();
       } finally {
         botaoRedef.disabled = false;
       }
+      if (espera && formRedef.isConnected) contarEsperaPin(botaoRedef, espera);
     });
 
     limpar(corpo);
@@ -5002,6 +5078,7 @@
       h('div', { class: 'acoes' }, botao));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (esperandoPin(botao)) return;
       erro.textContent = '';
       if (!atual.value) {
         erro.textContent = 'Digite o PIN da IA atual.';
@@ -5020,6 +5097,7 @@
         return;
       }
       botao.disabled = true;
+      let espera = 0;
       try {
         await api('POST', '/ia/pin/trocar', { atual: atual.value, novo: novo.value }, { semBloqueio: true });
         form.reset();
@@ -5032,11 +5110,13 @@
           atual.value = '';
           atual.focus();
         } else {
-          erro.textContent = erroApi.message;
+          erro.textContent = erroApi.message;          // 429: "Espere N s antes de tentar o PIN de novo."
         }
+        espera = segundosDeEspera(erroApi);
       } finally {
         botao.disabled = false;
       }
+      if (espera && form.isConnected) contarEsperaPin(botao, espera);
     });
     return h('details', { class: 'detalhes-ia detalhes-pin-ia' },
       h('summary', null, h('span', { 'aria-hidden': 'true' }, '🔑 '), 'Trocar o PIN da IA'), form);
@@ -5121,11 +5201,26 @@
       }
     });
 
-    const marcarAtividade = () => { estado.ultimaAtividade = Date.now(); };
+    // Um toque logo depois de o aparelho acordar não pode contar como "estava em uso": se o tempo
+    // sem uso já passou do limite, bloqueia antes de marcar (seção 19.7).
+    const marcarAtividade = () => {
+      if (passouDoTempoSemUso()) {
+        bloquearAgora(true);
+        return;
+      }
+      estado.ultimaAtividade = Date.now();
+    };
     for (const evento of ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart', 'scroll']) {
       document.addEventListener(evento, marcarAtividade, { passive: true, capture: true });
     }
     setInterval(verificarInatividade, 15000);
+    // Com a aba escondida ou o celular dormindo, o setInterval quase não roda: ao voltar, confere
+    // na hora (pelo relógio de parede, Date.now), antes de a pessoa ver ou tocar em alguma coisa.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') verificarInatividade();
+    });
+    window.addEventListener('pageshow', () => verificarInatividade());
+    window.addEventListener('focus', () => verificarInatividade());
   }
 
   function iniciar() {

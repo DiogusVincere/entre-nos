@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -31,7 +32,7 @@ from pathlib import Path
 from unittest import mock
 
 from entrenos import banco as banco_mod
-from entrenos import cofre, config, servidor
+from entrenos import cofre, config, nucleo, servidor
 from entrenos.banco import Banco
 from testes.test_restaurar_importar import PIN_BACKUP, Base, cifrar, decifrar, diario_de_origem
 from testes.test_servidor import PIN, REF, ServidorDeTeste, _esperar
@@ -473,7 +474,7 @@ class TestImportarForaDaTrava(Base):
         texto = json.dumps(origem.exportar(), ensure_ascii=False, default=str)
         origem.fechar()
         livre = []
-        original = servidor.validar_exportacao
+        original = nucleo.validar_exportacao
 
         def conferir(dados):
             def tentar():
@@ -487,7 +488,7 @@ class TestImportarForaDaTrava(Base):
             outra.join(3)
             return original(dados)
 
-        with mock.patch.object(servidor, "validar_exportacao", side_effect=conferir):
+        with mock.patch.object(nucleo, "validar_exportacao", side_effect=conferir):
             r = s.pedir("POST", "/api/importar/previa", {"json": texto})
         self.assertEqual(r.status, 200, r.dados)
         self.assertEqual(livre, [True])
@@ -591,7 +592,8 @@ class TestArquivosParaAPessoa(unittest.TestCase):
         bruto.decode("ascii")                                              # cmd.exe: sem acentos
         self.assertNotIn(b"\n", bruto.replace(b"\r\n", b""))                # CRLF
         bat = bruto.decode("ascii")
-        for arquivo in ("iniciar.py", "entrenos\\servidor.py", "entrenos\\cofre.py", "web\\index.html", "web\\app.js"):
+        for arquivo in ("iniciar.py", "entrenos\\servidor.py", "entrenos\\nucleo.py", "entrenos\\cofre.py",
+                        "web\\index.html", "web\\app.js"):
             self.assertIn(f'"{arquivo}"', bat)
         self.assertIn("import cryptography, entrenos.servidor", bat)
         self.assertIn("%LOCALAPPDATA%\\Python\\pythoncore-3.14-64\\pythonw.exe", bat)
@@ -628,6 +630,21 @@ class TestArquivosParaAPessoa(unittest.TestCase):
             self.assertIn(trecho, script)
         # Conferir de novo depois da espera, antes de dizer "Pronto".
         self.assertLess(script.index("Start-Sleep"), script.index("'Pronto.'"))
+
+    def test_script_de_construcao_confere_o_que_o_bat_confere(self):
+        # Achado de 07/10/2026: o .bat passou a conferir o entrenos\nucleo.py (metade do app mora
+        # nele desde a seção 19) e o construir_instalador.ps1 não. Sem ele, a conferência passava
+        # calada e o EntreNos.exe quebrava ao abrir, em vez de o build falar da quarentena.
+        script = _ler(RAIZ / "construir_instalador.ps1")
+        bloco = re.search(r"\$obrigatorios = @\((.*?)\n\)", script, re.S)
+        self.assertIsNotNone(bloco)
+        obrigatorios = set(re.findall(r"'([^']+)'", bloco.group(1)))
+        bat = self.BAT.read_bytes().decode("ascii")
+        do_bat = set(re.findall(r'"((?:entrenos|web)\\[^"]+|iniciar\.py)"', bat))
+        self.assertIn("entrenos\\nucleo.py", do_bat)
+        self.assertLessEqual(do_bat, obrigatorios, sorted(do_bat - obrigatorios))
+        self.assertLessEqual({"entrenos\\servidor.py", "entrenos\\nucleo.py", "entrenos\\cofre.py",
+                              "entrenos\\banco.py"}, obrigatorios)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,6 @@ import re
 import secrets
 import struct
 import threading
-import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -71,6 +70,7 @@ PREFIXO_DIARIO_ANTERIOR = "entrenos-anterior-"
 # Arquivo do diário que estava danificado e foi trocado por um backup (seção 18.6).
 PREFIXO_DANIFICADO = "entrenos-danificado-"
 _RE_DATA_NO_NOME = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_RE_NUMEROS = re.compile(r"\d+")
 # Um diário salvo é um banco SQLite serializado: tamanho múltiplo da página (512 bytes ou mais).
 PAGINA_SQLITE_MINIMA = 512
 
@@ -92,6 +92,12 @@ class CofreFechado(RuntimeError):
 class PastaSumiu(FileNotFoundError):
     """A pasta de dados foi apagada com o diário aberto (o desinstalador com "apagar tudo", ou à
     mão). Salvar a recriaria com o que a pessoa mandou apagar: o cofre se recusa (seção 18.6)."""
+
+
+class CofreMudou(RuntimeError):
+    """O arquivo do diário mudou desde que este cofre o leu ou gravou: outra aba (no navegador,
+    outra cópia do app no mesmo armazenamento) gravou nele. Salvar por cima apagaria o que a outra
+    gravou: o cofre se recusa (seção 19.7)."""
 
 
 @dataclass(frozen=True)
@@ -310,6 +316,13 @@ def abrir_conteudo(conteudo: bytes, pin: str) -> CofreRecebido:
     return CofreRecebido(dados, chave, cabecalho.sal, parametros)
 
 
+# Espera entre as tentativas de `_substituir` (segundos -> nada). Quem roda no computador liga
+# `time.sleep` (o servidor.py faz isso ao ser importado): ali o antivírus às vezes segura o arquivo
+# por um instante. O cofre não dorme por conta própria porque também roda no navegador (Pyodide,
+# seção 19), onde não há como esperar nem antivírus segurando arquivo; lá tenta de novo direto.
+esperar_entre_tentativas: Callable[[float], None] | None = None
+
+
 def _substituir(origem: Path, alvo: Path) -> None:
     """os.replace com algumas tentativas: no Windows o antivírus às vezes segura o arquivo."""
     for tentativa in range(5):
@@ -319,7 +332,9 @@ def _substituir(origem: Path, alvo: Path) -> None:
         except PermissionError:
             if tentativa == 4:
                 raise
-            time.sleep(0.05 * 2 ** tentativa)
+            esperar = esperar_entre_tentativas
+            if esperar is not None:
+                esperar(0.05 * 2 ** tentativa)
 
 
 def _gravar_atomico(alvo: Path, conteudo: bytes) -> None:
@@ -346,10 +361,20 @@ class Cofre:
         self.pasta_backups = self.pasta / config.PASTA_BACKUPS
         self.hoje = date.today          # dá nome aos backups; os testes trocam por data fixa
         self.agora = datetime.now       # hora no nome da cópia de antes da restauração
+        # Quantas cópias automáticas (uma por dia) ficam em backups/. No navegador, menos: tudo o que
+        # está na pasta de dados é carregado na memória ao abrir (IDBFS, seção 19.7).
+        self.backups_automaticos = config.BACKUPS_AUTOMATICOS
+        # Cópias que não entram no rodízio (de antes da restauração, de um diário anterior e
+        # danificados): None = nunca apagadas (computador, onde a pessoa vê a pasta); um número = só
+        # as N mais novas de cada tipo (navegador, onde não há como apagá-las à mão).
+        self.copias_extras_maximas: int | None = None
         self._trava = threading.RLock()
         self._chave: bytearray | None = None
         self._sal: bytes | None = None
         self._parametros: tuple[int, int, int] | None = None
+        # (inode, tamanho, data) do arquivo do diário quando este cofre o leu ou gravou pela última
+        # vez: se mudou, outra aba gravou nele (CofreMudou). None = nada a comparar.
+        self._marca: tuple[int, int, int] | None = None
 
     def existe(self) -> bool:
         return self.arquivo.is_file()
@@ -368,15 +393,18 @@ class Cofre:
             chave = _derivar(pin, sal, *parametros)
             _gravar_atomico(self.arquivo, _cifrar(chave, sal, parametros, dados))
             self._guardar_chave(chave, sal, parametros)
+            self._marca = self._marca_do_arquivo()
 
     def abrir(self, pin: str) -> bytes:
         if not isinstance(pin, str):
             raise PinErrado("PIN incorreto.")
         with self._trava:
+            marca = self._marca_do_arquivo()
             cabecalho, cifrado = _separar(self._ler())
             chave = _derivar(pin, cabecalho.sal, cabecalho.n, cabecalho.r, cabecalho.p)
             dados = _decifrar(chave, cabecalho, cifrado)
             self._guardar_chave(chave, cabecalho.sal, (cabecalho.n, cabecalho.r, cabecalho.p))
+            self._marca = marca
             return dados
 
     def salvar(self, dados: bytes) -> None:
@@ -387,10 +415,12 @@ class Cofre:
                 raise CofreFechado("O cofre está bloqueado; desbloqueie antes de salvar.")
             if not self.pasta.is_dir():
                 raise PastaSumiu("A pasta de dados do Entre Nós não existe mais.")
+            self._conferir_marca()
             novo = _cifrar(self._chave, self._sal, self._parametros, dados)
             if self.existe():
                 self._guardar_backup()
             _gravar_atomico(self.arquivo, novo)
+            self._marca = self._marca_do_arquivo()
 
     def trocar_pin(self, atual: str, novo: str) -> None:
         """Re-cifra o arquivo e os backups automáticos com um sal e uma chave novos.
@@ -402,6 +432,9 @@ class Cofre:
         if not isinstance(atual, str):
             raise PinErrado("PIN incorreto.")
         with self._trava:
+            if self.aberto:
+                # Recifrar o que outra aba gravou e seguir salvando daqui apagaria aquilo.
+                self._conferir_marca()
             cabecalho, cifrado = _separar(self._ler())
             chave_antiga = _derivar(atual, cabecalho.sal, cabecalho.n, cabecalho.r, cabecalho.p)
             dados = _decifrar(chave_antiga, cabecalho, cifrado)
@@ -409,6 +442,7 @@ class Cofre:
             parametros = (SCRYPT_N, SCRYPT_R, SCRYPT_P)
             chave = _derivar(novo, sal, *parametros)
             _gravar_atomico(self.arquivo, _cifrar(chave, sal, parametros, dados))
+            self._marca = self._marca_do_arquivo() if self.aberto else None
             chaves_antigas = {(cabecalho.sal, cabecalho.n, cabecalho.r, cabecalho.p): chave_antiga}
             self._recifrar_backups(atual, chaves_antigas, chave, sal, parametros)
             if self.aberto:
@@ -437,6 +471,8 @@ class Cofre:
             _gravar_atomico(self.arquivo, _cifrar(chave, recebido._sal, recebido._parametros, conteudo))
             # Cópia da chave: descartar o `recebido` não pode apagar a chave do cofre aberto.
             self._guardar_chave(bytearray(chave), recebido._sal, recebido._parametros)
+            self._marca = self._marca_do_arquivo()
+            self._podar_copias_extras()
             return copia
 
     def confere_pin(self, pin: object) -> bool:
@@ -470,6 +506,15 @@ class Cofre:
             self._chave = None
             self._sal = None
             self._parametros = None
+            self._marca = None
+
+    def conteudo(self) -> bytes:
+        """Os bytes do arquivo do diário como está no disco (cifrado), para baixar como backup.
+        Com o cofre aberto, CofreMudou se outra aba gravou nele (a cópia não seria a desta)."""
+        with self._trava:
+            if self.aberto:
+                self._conferir_marca()
+            return self._ler()
 
     def copiar_backup(self, destino: Path) -> Path:
         """Copia o arquivo cifrado para `destino` como entrenos-backup-AAAA-MM-DD.cofre.
@@ -558,6 +603,8 @@ class Cofre:
                     mudadas += 1
                 except OSError as erro:
                     _log.warning("Não consegui separar uma cópia anterior: %s", type(erro).__name__)
+            if mudadas:
+                self._podar_copias_extras()
             return mudadas
 
     def danificado(self) -> bool:
@@ -590,6 +637,7 @@ class Cofre:
                 if alvo.exists():
                     continue
                 os.rename(self.arquivo, alvo)
+                self._podar_copias_extras()
                 return alvo
             raise FileExistsError("Há arquivos danificados demais guardados com esta data e hora.")
 
@@ -627,6 +675,47 @@ class Cofre:
             raise FileNotFoundError("Ainda não existe cofre nesta pasta.")
         return self.arquivo.read_bytes()
 
+    def _marca_do_arquivo(self) -> tuple[int, int, int] | None:
+        try:
+            info = os.stat(self.arquivo)
+        except OSError:
+            return None
+        return info.st_ino, info.st_size, info.st_mtime_ns
+
+    def _conferir_marca(self) -> None:
+        """CofreMudou se o arquivo do diário não é mais o que este cofre leu ou gravou por último.
+        Arquivo que sumiu (com a pasta existindo) não conta: é regravado da memória (seção 18.6)."""
+        if self._marca is None:
+            return
+        atual = self._marca_do_arquivo()
+        if atual is not None and atual != self._marca:
+            raise CofreMudou("O arquivo do diário foi gravado por outra aba ou janela.")
+
+    def _podar_copias_extras(self) -> None:
+        """No navegador (`copias_extras_maximas`): das cópias fora do rodízio, só as N mais novas de
+        cada tipo ficam. No computador (None) nada sai: a pessoa vê a pasta e decide."""
+        maximo = self.copias_extras_maximas
+        if maximo is None or not self.pasta_backups.is_dir():
+            return
+        grupos: dict[str, list[tuple[tuple[tuple[int, ...], str], Path]]] = {}
+        prefixos = (PREFIXO_ANTES_DA_RESTAURACAO, PREFIXO_DIARIO_ANTERIOR, PREFIXO_DANIFICADO)
+        try:
+            for p in self.pasta_backups.iterdir():
+                prefixo = next((x for x in prefixos if p.name.startswith(x)), None)
+                if prefixo is None or not p.name.endswith(".cofre") or not p.is_file():
+                    continue
+                # Data, hora e o -2, -3 de quem caiu no mesmo segundo, como números: o mais novo é o maior.
+                numeros = tuple(int(n) for n in _RE_NUMEROS.findall(p.name[len(prefixo):]))
+                grupos.setdefault(prefixo, []).append(((numeros, p.name), p))
+        except OSError:
+            return
+        for copias in grupos.values():
+            for _, caminho in sorted(copias, reverse=True)[max(0, maximo):]:
+                try:
+                    caminho.unlink()
+                except OSError as erro:
+                    _log.warning("Não consegui apagar uma cópia antiga: %s", type(erro).__name__)
+
     def _guardar_chave(self, chave: bytearray, sal: bytes, parametros: tuple[int, int, int]) -> None:
         if self._chave is not None and self._chave is not chave:
             _zerar(self._chave)
@@ -662,11 +751,12 @@ class Cofre:
             alvo = self.pasta_backups / f"entrenos-{self.hoje():%Y-%m-%d}.cofre"
             if not alvo.exists():
                 _gravar_atomico(alvo, self.arquivo.read_bytes())
-            for antigo in self.backups()[config.BACKUPS_AUTOMATICOS:]:
+            for antigo in self.backups()[max(1, self.backups_automaticos):]:
                 if self._chave_do_arquivo(antigo) == chave_atual:
                     antigo.unlink(missing_ok=True)
         except OSError as erro:
             _log.warning("Backup automático falhou: %s", type(erro).__name__)
+        self._podar_copias_extras()
 
     @staticmethod
     def _chave_do_arquivo(caminho: Path) -> tuple[bytes, tuple[int, int, int]] | None:
@@ -710,7 +800,7 @@ def _zerar(chave: bytearray) -> None:
         chave[i] = 0
 
 
-__all__ = ["Cofre", "CofreCorrompido", "CofreFechado", "CofreRecebido", "PREFIXO_ANTES_DA_RESTAURACAO",
+__all__ = ["Cofre", "CofreCorrompido", "CofreFechado", "CofreMudou", "CofreRecebido", "PREFIXO_ANTES_DA_RESTAURACAO",
            "PREFIXO_DANIFICADO", "PREFIXO_DIARIO_ANTERIOR", "PastaSumiu", "PinErrado", "abrir_conteudo",
            "conferir_verificador", "criar_verificador", "problema_do_pin", "tamanho_decifrado",
            "verificador_valido"]

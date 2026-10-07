@@ -32,10 +32,10 @@ from pathlib import Path
 from unittest import mock
 
 from entrenos import banco as banco_mod
-from entrenos import cofre, config, servidor
+from entrenos import cofre, config, nucleo, servidor
 from entrenos.banco import Banco
 from entrenos.modelos import Certeza, Item, PessoaEncontrada, Precisao, Relacao, TipoItem
-from testes.test_servidor import PIN, REF, ServidorDeTeste
+from testes.test_servidor import PIN, REF, Relogio, ServidorDeTeste
 
 PIN_BACKUP = "girassol na janela azul"
 PIN_IA = "cafe com canela e mel"
@@ -237,9 +237,11 @@ class Base(unittest.TestCase):
 
     @staticmethod
     def arquivos(s: ServidorDeTeste) -> dict[str, bytes]:
-        """Tudo o que há na pasta de dados (para provar que nada mudou)."""
+        """Tudo o que há na pasta de dados (para provar que nada mudou), menos o pin_espera.json:
+        ele guarda só o bloqueio do PIN errado, para fechar e abrir não zerá-lo (seção 19.7)."""
         pasta = Path(s.pasta)
-        return {str(p.relative_to(pasta)): p.read_bytes() for p in sorted(pasta.rglob("*")) if p.is_file()}
+        return {str(p.relative_to(pasta)): p.read_bytes() for p in sorted(pasta.rglob("*"))
+                if p.is_file() and p.name != nucleo.ARQUIVO_ESPERA_PIN}
 
     @staticmethod
     def textos(s: ServidorDeTeste) -> list[str]:
@@ -440,21 +442,31 @@ class TestRestaurarPrimeiroUso(Base):
         r = self.restaurar(s, "data:application/octet-stream;base64," + b64(self.backup))
         self.assertEqual(r.status, 200, r.dados)
 
-    def test_pin_errado_401_com_atraso_sem_criar_nada(self):
-        s = self.servidor(atraso_pin=0.3)
-        inicio = time.monotonic()
+    def test_pin_errado_401_com_bloqueio_sem_criar_nada(self):
+        relogio = Relogio()
+        s = self.servidor(atraso_pin=0.3, relogio=relogio)
         r = self.restaurar(s, self.backup, "pin que nao e o do backup")
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.29)
         self.assertEqual(r.status, 401)
-        self.assertEqual(r.dados["erro"], servidor.PIN_DO_BACKUP)
+        self.assertEqual((r.dados["erro"], r.dados["espere_segundos"]), (servidor.PIN_DO_BACKUP, 1))
         self.assertEqual(s.app._falhas_pin, 1)           # o mesmo contador do desbloqueio
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.3)
         self.assertEqual(self.arquivos(s), {})
+        # Só o bloqueio do PIN foi para o disco: contadores e horários, nada do backup nem do PIN.
+        espera = json.loads((Path(s.pasta) / nucleo.ARQUIVO_ESPERA_PIN).read_text("utf-8"))
+        self.assertEqual(set(espera), {"principal", "visto"})
+        self.assertEqual(set(espera["principal"]), {"falhas", "livre_em"})
         self.assertFalse(s.app.cofre.aberto)
-        inicio = time.monotonic()
+        # Dentro do bloqueio, nem o PIN certo do backup é testado (seção 19).
+        r = self.restaurar(s, self.backup)
+        self.assertEqual((r.status, r.dados["espere_segundos"]), (429, 1))
+        self.assertEqual(self.arquivos(s), {})
+        relogio.avancar(0.31)
         self.assertEqual(self.restaurar(s, self.backup, "outro pin errado ainda").status, 401)
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.59)   # dobra, como no desbloqueio
+        self.assertAlmostEqual(s.app.espera_do_pin(), 0.6)         # dobra, como no desbloqueio
+        relogio.avancar(0.61)
         self.assertEqual(self.restaurar(s, self.backup).status, 200)
         self.assertEqual(s.app._falhas_pin, 0)
+        self.assertFalse((Path(s.pasta) / nucleo.ARQUIVO_ESPERA_PIN).exists())     # acertou: sai
 
     def test_arquivo_que_nao_e_cofre_400_sem_gastar_tentativa(self):
         s = self.servidor(atraso_pin=0.5)
@@ -546,7 +558,8 @@ class TestRestaurarComAppAberto(Base):
             ia_pin=cofre.criar_verificador(PIN_IA_BACKUP),
             ia_principal={"provedor": "outro", "url": "http://127.0.0.1:9/v1", "modelo": "modelo-do-backup",
                           "tipo": "openai", "chave": None}))
-        self.s = self.servidor(atraso_pin=0.2)
+        self.relogio = Relogio()             # o bloqueio do PIN errado anda só quando o teste manda
+        self.s = self.servidor(atraso_pin=0.2, relogio=self.relogio)
         self.s.configurar(PIN, nome_dela="Ana")
         self.s.app._banco.criar_registro(TEXTO_ANTIGO, REF, [], [], [])
         r = self.s.pedir("POST", "/api/ia/pin", {"novo": PIN_IA})
@@ -560,12 +573,14 @@ class TestRestaurarComAppAberto(Base):
     def test_pin_atual_errado_401_sem_trocar_nada(self):
         s = self.s
         antes, token = self.arquivos(s), s.token
-        inicio = time.monotonic()
         r = self.restaurar(s, self.backup, token=token, pin_atual="nao e o pin de agora")
-        self.assertGreaterEqual(time.monotonic() - inicio, 0.19)
         self.assertEqual(r.status, 401)
-        self.assertEqual(r.dados["erro"], "O PIN atual não confere.")
+        self.assertEqual((r.dados["erro"], r.dados["espere_segundos"]), ("O PIN atual não confere.", 1))
         self.assertEqual(s.app._falhas_pin, 1)
+        # Dentro do bloqueio, nenhum dos dois PINs é testado.
+        self.assertEqual(self.restaurar(s, self.backup, token=token, pin_atual=PIN).status, 429)
+        self.assertEqual(s.app._falhas_pin, 1)
+        self.relogio.avancar(0.21)
         # PIN do backup errado (com o PIN atual certo): também 401, e nada muda.
         r = self.restaurar(s, self.backup, "pin que nao e o do backup", token=token, pin_atual=PIN)
         self.assertEqual(r.status, 401)
@@ -606,6 +621,7 @@ class TestRestaurarComAppAberto(Base):
         self.assertEqual(versao_do_banco(decifrar(arquivo.read_bytes(), PIN_BACKUP)), banco_mod.ESQUEMA_VERSAO)
         s.pedir("POST", "/api/bloquear")
         self.assertEqual(s.desbloquear(PIN).status, 401)
+        self.relogio.avancar(0.21)                       # passa o bloqueio do PIN errado
         self.assertEqual(s.desbloquear(PIN_BACKUP).status, 200)
         self.assertEqual(self.textos(s), sorted([TEXTO_MAE, TEXTO_MARI]))
 
@@ -620,6 +636,7 @@ class TestRestaurarComAppAberto(Base):
         self.assertEqual(s.pedir("GET", "/api/ia/config").status, 403)       # área fechada
         self.assertEqual(s.app._banco.config()["ia_principal"]["modelo"], "modelo-do-backup")
         self.assertEqual(s.pedir("POST", "/api/ia/entrar", {"pin_ia": PIN_IA}).status, 401)     # o PIN da IA de antes
+        self.relogio.avancar(0.21)                       # passa o bloqueio do PIN da IA errado
         self.assertEqual(s.pedir("POST", "/api/ia/entrar", {"pin_ia": PIN_IA_BACKUP}).status, 200)
 
     def test_restaurar_copia_antiga_do_mesmo_diario_nao_repete_ids(self):
