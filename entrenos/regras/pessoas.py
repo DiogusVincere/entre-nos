@@ -141,7 +141,12 @@ banco instituto clube estádio arena aeroporto lago serra ilha bairro condomíni
 pousada sítio fazenda chácara café cafeteria pizzaria lanchonete hamburgueria festival programa curso
 time rodoviária estação metrô livraria biblioteca capela catedral santuário zoológico aquário boate
 balada feira hospitalar laboratório farmácia posto cidade estado rio lagoa morro pico monte vale
+beco jardim vinícola sorveteria doceria confeitaria churrascaria cantina boteco bistrô trattoria
+pastelaria creperia temakeria galeria mirante cachoeira trilha spa pub adega empório quiosque orla
 """.split())
+# Depois de um lugar com nome próprio, "do/da/di/del" continua o nome do lugar ("Museu do Ipiranga",
+# "Beco do Batman", "Bacio di Latte").
+_RE_LIGA_LUGAR = re.compile(r"\s+(?:d[eoa]s?|di|del|della|dello)\s+")
 # Antes de um nome, o que faz dele obra ou artista ("fã da Anitta", "show do Coldplay",
 # "assistiu Friends", "ama Coldplay"). Com artigo ("ama a Mariana") continua sendo gente.
 _RE_ANTES_DE_OBRA = re.compile(
@@ -361,6 +366,18 @@ def _nome_no_inicio(texto: str, p: str, ini: int, fim: int) -> bool:
     return False
 
 
+def _depois_de_lugar(antes: str) -> bool:
+    """O nome vem logo depois de uma palavra de lugar em minúsculas ("restaurante Mangiare"), talvez
+    com palavras de nome de lugar no meio ("café Santo Grão", "praia de São Pedro" não: "de" separa)."""
+    palavras_antes = antes.split()
+    while palavras_antes and palavras_antes[-1][:1].isupper() and normalizar(palavras_antes[-1]) in _NAO_NOMES:
+        palavras_antes.pop()                           # "Santo", "São": parte do nome do lugar
+    if not palavras_antes:
+        return False
+    ultima = palavras_antes[-1]
+    return ultima.isalpha() and ultima.islower() and normalizar(ultima) in _PALAVRAS_LUGAR
+
+
 def _nomes(texto: str, p: str, conhecidas: list[dict], nome_dela: str | None) -> list[dict]:
     inicios = {i for i, _, _ in frases(texto)}
     bloqueios = [(m.start(), m.end()) for m in _RE_COMPOSTOS.finditer(p)]
@@ -388,14 +405,23 @@ def _nomes(texto: str, p: str, conhecidas: list[dict], nome_dela: str | None) ->
             grupos.append(t)
 
     saida = []
+    fim_do_lugar = -1          # onde terminou o último nome de lugar (para "Museu do Ipiranga")
     for ini, fim, inicio, lugar in grupos:
         nome = texto[ini:fim]
+        if fim_do_lugar >= 0 and _RE_LIGA_LUGAR.fullmatch(texto[fim_do_lugar:ini]):
+            fim_do_lugar = fim
+            continue  # "Museu do Ipiranga", "Beco do Batman": o resto do nome do lugar
+        fim_do_lugar = -1
         if nome_dela and _mesmo_nome(nome, nome_dela) and (
                 set(normalizar(nome).split()) <= set(normalizar(nome_dela).split())
                 or _nome_exato(nome, conhecidas) is None):
             continue  # é ela (pelo nome, parte dele ou apelido que não é de outra pessoa cadastrada)
         if normalizar(nome.split()[0]) in _PALAVRAS_LUGAR:
+            fim_do_lugar = fim
             continue  # "Shopping Iguatemi", "Parque Ibirapuera": lugar
+        if _depois_de_lugar(texto[max(0, ini - 40):ini]) and _nome_exato(nome, conhecidas) is None:
+            fim_do_lugar = fim
+            continue  # "restaurante Mangiare", "café Santo Grão", "festival Coala": o nome do lugar
         conhecido = _nome_exato(nome, conhecidas) is not None or _nome_parecido(nome, conhecidas) is not None
         comeco_valido = inicio and not lugar and not titulo and _nome_no_inicio(texto, p, ini, fim)
         saida.append({"ini": ini, "fim": fim, "nome": nome,

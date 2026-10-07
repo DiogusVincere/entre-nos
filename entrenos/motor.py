@@ -39,7 +39,7 @@ try:
 except ImportError:          # navegador sem o módulo ssl (seção 19): a IA ali não funciona mesmo
     ssl = None  # type: ignore[assignment]
 
-from . import config, provedores
+from . import config, provedores, recursos
 from .modelos import (CATEGORIAS, Certeza, DataEncontrada, Item, PessoaEncontrada, Precisao,
                       Proposta, Resposta, TipoItem, para_json)
 from .regras.categorias import categorias_de, classificar
@@ -80,13 +80,23 @@ class Conhecimento:
 
     pessoas: list[dict] = field(default_factory=list)   # como em extrair_pessoas
     nome_dela: str | None = None
+    # Leitura do diário aberto para o `extrair` dos recursos (seção 20.0.1): `consultar(sql,
+    # parametros=())` é o `Banco.consultar` (só leitura; escrever levanta OperacaoProibida). None
+    # quando o motor roda sem diário. A IA nunca recebe isto (ela só vê pessoas e o nome dela).
+    consultar: Callable[..., list[dict]] | None = field(default=None, repr=False, compare=False)
 
 
 def conhecimento_do_banco(banco) -> Conhecimento:
-    """Monta o Conhecimento a partir do Banco (pessoas cadastradas e nome dela)."""
+    """Monta o Conhecimento a partir do Banco (pessoas cadastradas, nome dela e a leitura do diário)."""
     pessoas = [{"id": p["id"], "nome": p["nome"], "relacao": p["relacao"],
                 "apelidos": list(p.get("apelidos") or [])} for p in banco.pessoas()]
-    return Conhecimento(pessoas=pessoas, nome_dela=banco.config().get("nome_dela"))
+
+    # Uma função (e não o método do Banco): os recursos recebem cópias do Conhecimento, e o
+    # deepcopy de um método copiaria o próprio Banco; a função passa como está.
+    def consultar(sql: str, parametros: tuple | list = ()) -> list[dict]:
+        return banco.consultar(sql, parametros)
+
+    return Conhecimento(pessoas=pessoas, nome_dela=banco.config().get("nome_dela"), consultar=consultar)
 
 
 @runtime_checkable
@@ -180,10 +190,12 @@ class MotorRegras:
         datas = extrair_datas(texto, referencia)
         pessoas = extrair_pessoas(texto, list(conhecimento.pessoas or []), nome_dela=conhecimento.nome_dela)
         itens = extrair_itens(texto, referencia, pessoas, datas)
+        # Os recursos (seção 20.0) leem o mesmo texto; um que falhe vira aviso, sem derrubar nada.
+        extras, avisos_extras = recursos.extras_do_texto(texto, referencia, pessoas, datas, itens, conhecimento)
         return Proposta(
             texto=texto, referencia=referencia, itens=itens, pessoas=pessoas, datas=datas,
             categorias=_categorias_da_proposta(itens, texto),
-            avisos=_avisos(datas, pessoas, referencia), motor=self.nome,
+            avisos=_avisos(datas, pessoas, referencia) + avisos_extras, motor=self.nome, extras=extras,
         )
 
     def responder(self, pergunta: str, trechos: list[dict]) -> Resposta:
@@ -298,6 +310,8 @@ fornecidos sobre a namorada ("ela"). Sugira no máximo 3 gestos pequenos, gentis
 - Cada sugestão é só uma possibilidade, nunca uma ordem: comece com "Talvez" ou "Pode ser uma boa".
 - Nada de manipular, testar, provocar ciúme, convencer, controlar ou influenciar decisões dela,
   nem explorar inseguranças ou medos dela.
+- Todo gesto é EM DIREÇÃO a ela. Nunca sugira se afastar, sumir, demorar a responder, esperar ela
+  procurar primeiro, sair sem avisar, mexer nas coisas dela, exigir algo dela ou "fazer ela perceber".
 - Não invente nada que não esteja nos registros. "porque" diz, em uma frase, de onde veio a ideia.
 - "registro_ids" traz o registro_id de cada registro usado (só os fornecidos).
 - Se os registros não permitem sugerir algo específico, devolva "sugestoes": []."""
@@ -584,7 +598,8 @@ _MANIPULACAO = re.compile(r"(?<![a-z0-9])(?:" + "|".join([
     r"test(?:ar|e|a) (?:ela|se ela|a fidelidade|o amor)", r"testa-la", r"teste de fidelidade",
     r"controlar (?:ela|o que ela|com quem|onde ela)", r"controla-la",
     r"vigi(?:ar|a-la)", r"espi(?:ar|onar)", r"monitor(?:ar|e) (?:ela|o que)", r"rastre(?:ar|e)",
-    r"(?:olhar|mexer|fucar|checar|ver|ler) (?:no |o |as |os |nas |nos )?(?:celular|mensagens|conversas|redes) dela",
+    r"(?:olhar|mexer|fucar|checar|ver|ler|pegar|vasculhar|abrir|desbloquear|conferir) (?:no |o |as |os |nas |nos |a |na )?"
+    r"(?:celular|telefone|whats\w*|zap|mensagens|conversas|redes|instagram|insta|e-?mail|bolsa|computador) dela",
     r"senha dela",
     r"obrig(?:ar|ue) ela", r"obriga-la", r"forc(?:ar|e) ela", r"forca-la", r"pression(?:ar|e)\w*",
     r"proib(?:ir|a)\w*", r"impedi(?:r ela|-la)",
@@ -619,6 +634,28 @@ _MANIPULACAO = re.compile(r"(?<![a-z0-9])(?:" + "|".join([
     r"(?:sua|tua) ex", r"ex-?namorad\w*",
     r"influenci\w*", r"induz\w*",
     r"provoc\w* (?:ela|nela|uma reacao|reacao)", r"provoca-la",
+    # Paráfrases da revisão de 07/10 (afastamento, retenção, "fazer ela perceber", controle).
+    r"(?:para|pra) (?:que )?ela (?:aprend\w*|valoriz\w*|dar valor|de valor|fique esperta|ficar esperta)",
+    r"(?:para|pra) (?:que )?ela (?:perceb\w*|sent\w*|sint\w*|ver|veja|not\w*|entend\w*) (?:(?:a|o|que|como|quanto) )?"
+    r"(?:sua |tua )?(?:falta|ausencia|perdeu|esta perdendo|vai perder|ciume\w*|medo|culpa|diferenca)",
+
+    r"o que (?:ela )?(?:perdeu|esta perdendo|vai perder)",
+    r"ate (?:que )?ela (?:procur\w*|te procur\w*|corr\w*|perceb\w*|sent\w*|sint\w*)",
+
+    r"esper(?:ar|e) (?:que )?ela (?:vir|venha|procurar|procure|ligar|ligue|falar|fale|mandar|mande)\w*"
+    r"(?: \w+){0,3} primeiro",
+    r"sem avisar", r"sem (?:dar )?(?:resposta|retorno|noticias?|satisfac\w*)",
+    r"dar (?:um )?tempo (?:nas|das|com as|de) (?:mensage\w*|conversas?|ligac\w*|resposta\w*)",
+    r"dar (?:um )?tempo (?:dela|nela|no namoro|na relacao|no relacionamento)",
+    r"(?:sentir|sinta|notar|note|perceber|perceba) (?:a )?(?:sua )?ausencia",
+    r"exig\w*",
+    r"outr[ao]s? (?:mulher\w*|garot[ao]s?|menin[ao]s?|cara|caras|homem|homens|pessoa\w*) na frente dela",
+    r"(?:elogi\w*|paquer\w*|flert\w*|dar em cima d\w*|olhar para|olhar pra) (?:uma |um )?outr[ao]s? \w+",
+    r"(?:para|pra) ver (?:a )?(?:reacao|como ela reage|se ela)",
+    r"(?:que ela|ela) (?:pare|parar|deixe|deixar) de (?:sair|ver|falar|usar|trabalhar|estudar|viajar|encontrar)",
+    r"deix\w* (?:ela|-la) (?:esperando|no vacuo|sem saber)",
+    r"enquanto ela (?:dorme|esta dormindo|ta dormindo|toma banho|nao ve|nao esta olhando)",
+
 ]) + r")(?![a-z0-9])")
 
 # Sugestão é possibilidade, nunca ordem (princípio 5): começa como possibilidade.

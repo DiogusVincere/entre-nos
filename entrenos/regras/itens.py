@@ -14,7 +14,7 @@ from ..modelos import CATEGORIAS, Certeza, DataEncontrada, Item, PessoaEncontrad
 from ..texto import data_br, frases, normalizar
 from .categorias import categorias_de
 from .certeza import classificar_certeza, trechos_confirmados, trechos_nao_afirmados
-from .pessoas import e_dela, genero_relacao, grupo_relacao, plano, relacao_base
+from .pessoas import RELACOES, e_dela, genero_relacao, grupo_relacao, plano, relacao_base  # noqa: F401
 
 _MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto",
           "setembro", "outubro", "novembro", "dezembro"]
@@ -73,7 +73,9 @@ foi vai quer prefere acha disse falou contou comentou normalmente geralmente cos
 mesmo por isso ai la tudo nada quando se me te nos
 """.split())
 _ALVOS_VAZIOS = frozenset("""mim voce ti nos ninguem nada isso isto aquilo tudo ela ele eles elas gente
-dela dele delas deles o a os as um uma que de do da dos das e ou com em no na""".split())
+dela dele delas deles o a os as um uma que de do da dos das e ou com em no na
+muito muita tanto tanta mais menos bem pouco demais assim so nao mt mto mta muitao bastante""".split())
+# (as palavras da última linha: "não curtiu muito" não é um gosto por "muito")
 # Palavras que só aparecem como verbo: um pedaço da lista que tem uma delas já é outra oração
 # ("ela ama gatos, o irmão dela é alérgico").
 _VERBOS_DE_ORACAO = frozenset("""
@@ -488,6 +490,8 @@ _RE_RESTRICAO = re.compile(
     r"|(?P<intolerancia>tem\s+intolerancia))\s+(?:a|ao|aos|as|de|d[oa]s?)\s+"
     r"|\b(?:nao|n)\s+(?:pode|deve|consegue)\s+(?P<vp>comer|beber|tomar|consumir|ingerir)\s+"
     r"|\b(?:nao|n)\s+(?P<vc>come|bebe)\s+(?!mais\s+nada\b|nada\b)"
+    # "parou de beber vinho" é como "não bebe mais vinho" (revisão de 07/10).
+    r"|\b(?<!se\s)(?:parou|deixou)\s+de\s+(?P<vparou>comer|beber)\s+(?!nada\b)"
 )
 _RESTRICOES_FIXAS = [
     (re.compile(r"\be\s+vegetarian[ao]\b"), "É vegetariana", "carne"),
@@ -510,9 +514,11 @@ def _restricoes(fr: _Frase, referencia: date) -> list[Item]:
             modelo = "Intolerante a"
         elif m.group("vp"):
             modelo = f"Não pode {m.group('vp')}"
+        elif m.group("vparou"):
+            modelo = "Não come" if m.group("vparou") == "comer" else "Não bebe"
         else:
             modelo = f"Não {m.group('vc')}"
-        comida = bool(m.group("vp") or m.group("vc"))
+        comida = bool(m.group("vp") or m.group("vc") or m.group("vparou"))
         fim = _segmento(fr, m.end())
         partes = _partes(fr, m.end(), fim)
         for a, b in partes:
@@ -520,7 +526,8 @@ def _restricoes(fr: _Frase, referencia: date) -> list[Item]:
             cats_alvo = categorias_de(alvo, 2)
             cats = ["Saúde"]
             if comida or "Comidas" in cats_alvo or "Bebidas" in cats_alvo:
-                cats += ["Bebidas"] if (m.group("vp") in ("beber",) or m.group("vc") == "bebe"
+                cats += ["Bebidas"] if (m.group("vp") in ("beber",) or m.group("vc") == "bebe" or m.group("vparou") == "beber"
+
                                         or ("Bebidas" in cats_alvo and "Comidas" not in cats_alvo)) else ["Comidas"]
             itens.append(_item(fr, TipoItem.RESTRICAO, f"{modelo} {alvo}", m.start(), b, cats + cats_alvo,
                                frase_cats=False, importancia=3, alvo=alvo, polaridade=-1))
@@ -704,6 +711,8 @@ def _especiais(fr: _Frase, referencia: date) -> list[Item]:
 _RE_ANIVERSARIO = re.compile(
     r"\b(?:aniversario(?P<namoro>\s+de\s+namoro)?|niver|faz\s+anos|fazer\s+anos|completa\s+(?:\d+\s+)?anos"
     r"|bodas|mesversario)\b")
+# Logo antes da data: ela é o prazo de outra coisa ("até dia 25", "antes do dia 25").
+_RE_PRAZO_ANTES = re.compile(r"\b(?:ate|antes\s+d[eoa]s?)\s+(?:o\s+|a\s+)?$")
 
 
 def _aniversarios(fr: _Frase, referencia: date) -> list[Item]:
@@ -713,6 +722,9 @@ def _aniversarios(fr: _Frase, referencia: date) -> list[Item]:
             continue
         i = _data_mais_perto(fr, m.start(), m.end(), referencia)
         if i is None:
+            continue
+        # "comprar o presente de aniversário dela até dia 25": a data é um prazo, não o aniversário.
+        if _RE_PRAZO_ANTES.search(fr.p, 0, fr.datas[i][0]):
             continue
         d = fr.datas[i][2]
         fr.datas_usadas.add(i)
@@ -809,6 +821,9 @@ def _base_evento(fr: _Frase, a: int, b: int, nome: str | None, memoria: bool) ->
 
 # "o resultado do exame (sai semana que vem)": o exame já foi; a data é do resultado.
 _RE_RESULTADO_DE = re.compile(r"\bresultados?\s+d[eoa]s?\s+(?:\w+\s+)?$")
+# "perguntar dos exames da mãe dela na sexta": a sexta é de perguntar, não a do exame (integração, 20.10).
+_RE_PERGUNTAR_DE = re.compile(r"\bpergunt(?:ar|ei|o|e|amos)\s+(?:sobre|d[eoa]s?|como\s+(?:foi|foram|vai|vao))\s+"
+                              r"(?:[oa]s?\s+)?$")
 # "semana passada brigou por causa do casamento": a data passada é da briga, não do casamento.
 _RE_POR_CAUSA_DE = re.compile(r"\bpor\s+causa\s+d[eoa]s?\s+(?:\w+\s+)?$")
 _RE_RECORRENTE_EVENTO = re.compile(r"\b(?:todo|todos\s+os|toda)\s+anos?\b|\banualmente\b|\baniversario\b")
@@ -823,7 +838,7 @@ def _campos_evento(fr: _Frase, d: DataEncontrada) -> dict:
 
 def _eventos(fr: _Frase, referencia: date) -> list[Item]:
     chaves = [k for k in _palavras_chave(fr) if fr.livre(k[0], k[1])
-              and not _RE_RESULTADO_DE.search(fr.p, 0, k[0])]
+              and not _RE_RESULTADO_DE.search(fr.p, 0, k[0]) and not _RE_PERGUNTAR_DE.search(fr.p, 0, k[0])]
     pares = []
     for ki, (a, b, *_resto) in enumerate(chaves):
         por_causa = _RE_POR_CAUSA_DE.search(fr.p, 0, a) is not None
@@ -885,7 +900,12 @@ _ADJ_NEG = (r"preocupad[ao]s?|nervos[ao]s?|ansios[ao]s?|triste|tristonh[ao]|chat
             r"|pra\s+baixo|para\s+baixo|de\s+mau\s+humor|mal\s+humorad[ao]|no\s+limite")
 _ADJ_POS = (r"animad[ao]s?|empolgad[ao]s?|feliz(?:es)?|content[ae]s?|aliviad[ao]s?|orgulhos[ao]s?"
             r"|tranquil[ao]s?|calm[ao]s?|radiante|realizad[ao]s?|grat[ao]s?|motivad[ao]s?|confiante"
-            r"|apaixonad[ao]|de\s+bom\s+humor|bem\s+humorad[ao]|em\s+paz")
+            r"|apaixonad[ao]|de\s+bom\s+humor|bem\s+humorad[ao]|em\s+paz|otim[ao]s?|melhor")
+# "a avó que tá doente": o estado é da pessoa da relação, não dela (revisão de 07/10).
+_RE_RELACAO_QUE = re.compile(r"(?:^|\s)(?P<r>[a-z]+)(?P<dela>\s+dela)?\s+que\s+$")
+# "cansada e triste": o segundo estado da mesma frase também conta.
+_RE_ESTADO_E = re.compile(r"\s*(?:,\s*|\s+e\s+)" + _RE_INTENS + r"(?:(?P<neg>" + _ADJ_NEG + r")|(?P<pos>"
+                          + _ADJ_POS + r"))\b")
 _ADJ_SAUDE = ("doente", "com dor", "gripad", "resfriad", "enjoad")
 _RE_ESTADO = re.compile(
     _SEM_NEGACAO + r"\b(?P<v>esta\s+se\s+sentindo|ta\s+se\s+sentindo|estava\s+se\s+sentindo|tava\s+se\s+sentindo"
@@ -937,13 +957,44 @@ def _estados(fr: _Frase, referencia: date) -> list[Item]:
                 + (["Saúde"] if adj_n.startswith(_ADJ_SAUDE) else [])
         else:
             cats = ["Coisas que deixam feliz"]
-        quando = next((d for _, _, d in fr.datas if d.data and _passou(d, referencia)), None)
-        itens.append(_item(fr, TipoItem.ESTADO, resumo, m.start(), m.end(), cats,
-                           data_evento=quando.data if quando else referencia,
-                           data_expressao=quando.expressao if quando else None,
-                           precisao=Precisao.DIA, alvo=adj, polaridade=-1 if neg else 1))
+        # A data da mesma oração ("triste ontem mas hoje tá ótima": o "ontem" não é do segundo estado).
+        validas = [(da, db, d) for da, db, d in fr.datas if d.data and _passou(d, referencia)]
+
+        def separado(x0: int, x1: int) -> bool:
+            return bool(re.search(r"\b(?:mas|porem|so\s+que)\b", fr.p[x0:x1]))
+        perto = [d for da, _db, d in validas if da >= m.end() and not separado(m.end(), da)]
+        antes = [d for _da, db, d in validas if db <= m.start() and not separado(db, m.start())]
+        quando = perto[0] if perto else (antes[-1] if antes else None)
+
+        # "a avó que tá doente": o estado é da pessoa logo antes do "que" (revisão de 07/10).
+        dono_estado = _SEM_DONO
+        rel = _RE_RELACAO_QUE.search(fr.p, 0, m.start())
+        if rel:
+            antes_que = next((x[2] for x in fr.pessoas if re.fullmatch(r"\s+que\s+", fr.p[x[1]:m.start()])), None)
+            if antes_que is not None:
+                dono_estado = antes_que
+            elif normalizar(relacao_base(rel.group("r"))) in RELACOES:
+                fr.ocupar(m.start(), fim)
+                continue                     # é de alguém que as regras não acharam: não vira estado dela
+
+        campos_estado = {"data_evento": quando.data if quando else referencia,
+                         "data_expressao": quando.expressao if quando else None, "precisao": Precisao.DIA}
+        itens.append(_item(fr, TipoItem.ESTADO, resumo, m.start(), m.end(), cats, pessoa=dono_estado,
+                           alvo=adj, polaridade=-1 if neg else 1, **campos_estado))
+        e2 = _RE_ESTADO_E.match(fr.p, fim if fim > m.end() else m.end())
+        if e2 and fim == m.end():
+            neg2 = bool(e2.group("neg"))
+            g2 = "neg" if neg2 else "pos"
+            adj2 = fr.texto[e2.start(g2):e2.end(g2)]
+            adj2_n = normalizar(adj2)
+            cats2 = (["Preocupações"] + (["Medos"] if "medo" in adj2_n else [])
+                     + (["Saúde"] if adj2_n.startswith(_ADJ_SAUDE) else [])) if neg2 else ["Coisas que deixam feliz"]
+            itens.append(_item(fr, TipoItem.ESTADO, f"{verbo} {adj2}", m.start(), e2.end(), cats2, pessoa=dono_estado,
+                               alvo=adj2, polaridade=-1 if neg2 else 1, **campos_estado))
+            fim = e2.end()
         fr.ocupar(m.start(), fim)
     return itens
+
 
 
 _RE_PADRAO_ADJ = re.compile(

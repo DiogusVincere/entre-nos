@@ -804,7 +804,28 @@ class TesteSugerir(_ComServidor):
                       "Talvez perguntar por que ela anda sumida, com carinho."):
             self.assertFalse(_manipuladora(frase), frase)
 
+    def test_filtro_pega_as_parafrases_da_revisao(self):
+        # Revisão de 07/10: 7 de 8 sugestões manipuladoras passavam e iriam para o Hoje.
+        for frase in ("Talvez esperar ela vir falar com você primeiro, para ela perceber o que perdeu.",
+                      "Talvez sair com os amigos sem avisar, para ela sentir a sua ausência.",
+                      "Talvez dar um tempo nas mensagens até ela procurar você.",
+                      "Talvez elogiar outra mulher na frente dela para ver a reação.",
+                      "Talvez exigir que ela pare de sair com a Mariana.",
+                      "Talvez pegar o celular dela enquanto ela dorme.",
+                      "Talvez deixar ela sem resposta por um dia inteiro.",
+                      "Talvez sumir uns dias pra ela dar valor.",
+                      "Talvez não ligar hoje para ela sentir a falta."):
+            self.assertTrue(_manipuladora(frase), frase)
+        for frase in ("Talvez dar um tempo para ela descansar depois da prova, sem cobrar nada.",
+                      "Talvez levar ela para ver o pôr do sol no parque que ela quer conhecer.",
+                      "Talvez fazer um jantar simples para ela sentir que você está por perto.",
+                      "Talvez arrumar a casa para ela perceber que você se importa com o cansaço dela.",
+                      "Talvez perguntar se ela quer ajuda para ver os voos da viagem.",
+                      "Talvez esperar até ela voltar da viagem para comemorar junto."):
+            self.assertFalse(_manipuladora(frase), frase)
+
     def test_sugestao_precisa_ser_possibilidade(self):
+
         # Princípio 5: "Talvez...", "Pode ser uma boa..."; ordem ("Leve...") sai na conferência.
         self.srv.conteudo = {"sugestoes": [
             self.sugestao("Leve tulipas para ela amanhã.", [2]),

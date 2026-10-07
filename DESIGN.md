@@ -6,7 +6,9 @@ regras). Uma IA pode ser ligada depois sem mudar o resto (motor plugável).
 
 Este documento é o contrato entre os módulos. `entrenos/modelos.py`, `entrenos/texto.py` e
 `entrenos/config.py` já estão prontos e **não devem ser alterados** sem atualizar este arquivo
-(`texto.semelhanca` mudou em 07/10/2026: seção 19.7).
+(`texto.semelhanca` mudou em 07/10/2026: seção 19.7; `Proposta.extras` entrou em 07/10/2026:
+seção 20.0; `texto.termos` passou a usar as stopwords normalizadas uma vez só, mesmo resultado:
+seção 20.10).
 
 ## 1. Princípios (valem para todo o código)
 
@@ -69,7 +71,11 @@ EntreNos/
     nucleo.py                         o app sem transporte: sessão, PIN, rotas da API (seção 19)
     servidor.py                       transporte do computador: HTTP local + segurança do pedido + página
     ponte.py                          transporte do navegador: o Pyodide chama (seção 19)
+    recursos/__init__.py              registro e pontos de encaixe dos recursos (seção 20.0)
+    recursos/<nome>.py                um por recurso (perguntas, presentes... eu; seção 20)
+                                      (testes/test_integracao.py: o que a integração mudou, seção 20.10)
   web/index.html app.js estilo.css    interface (SPA sem framework)
+  web/telas/<nome>.js <nome>.css      a tela de cada recurso, por window.EntreNos (seção 20.0)
   testes/test_*.py
   construir_instalador.ps1            testes + PyInstaller + Inno Setup → dist\ (seção 18.3/18.4)
   instalador/                         entrenos.spec, EntreNos.iss, entrenos.ico, gerar_icone.py
@@ -459,7 +465,8 @@ acao, tabela, linha_id, resumo)`, FTS5 `busca_fts(conteudo, tipo, ref_id, tokeni
 remove_diacritics 2")` mantida pelo próprio `Banco`. `PRAGMA user_version` = versão do esquema
 (migrações simples em `_migrar`). Esquema 2: `pessoas.nome_registro_id` e
 `pessoas.relacao_registro_id` (de qual registro o banco tirou o nome/relação que preencheu
-sozinho; editar a pessoa zera).
+sozinho; editar a pessoa zera). Esquema 3: `registros.privado` (seção 17.4). Esquema 4:
+`recursos_esquema(nome, versao)`, a versão das tabelas de cada recurso (seção 20.0).
 
 Apagar é apagar também em volta:
 - `apagar_registro` tira da pessoa o nome/relação que vieram só do texto apagado (se outro
@@ -1658,3 +1665,832 @@ IA (503) e reabrir com o PIN bloqueado (429).
 ter rodado num Pyodide de verdade; nada abriu navegador, `.exe`, PyInstaller ou ISCC, e o `app.js`
 (eventos de visibilidade) foi conferido só por leitura e por uma conferência de parênteses,
 chaves, textos e templates.
+## 20. Melhorias, ciclo e área 🪞 Eu (decidido pelo usuário em 06-07/10/2026)
+
+Tudo aqui roda **nas regras** (sem IA), no **núcleo** (seção 19), e tem de funcionar igual no PC
+e no celular (PWA com Pyodide): nada de threads, `sleep`, rede ou recurso só de Windows.
+Princípios da seção 1 continuam: nunca inventar (tudo cita registros), sugestão é possibilidade
+("Talvez…"), revisar antes de gravar, apagar é apagar.
+
+### 20.0 Fundação (feita ANTES dos recursos, para eles serem construídos em paralelo)
+
+Cada recurso mora em `entrenos/recursos/<nome>.py` + `web/telas/<nome>.js` + `testes/test_<nome>.py`
+e **não edita** os arquivos centrais (`banco.py`, `nucleo.py`, `motor.py`, `alertas.py`, `app.js`,
+`index.html`, `modelos.py`). A fundação cria os pontos de encaixe:
+
+- **Registro de recursos** (`entrenos/recursos/__init__.py`): lista fixa dos módulos
+  (`perguntas, presentes, promessas, rapida, lugares, marcos, semana, ciclo, eu`) importados de
+  forma tolerante (um recurso quebrado não derruba o app; o erro vai para o log sem conteúdo).
+  Cada módulo pode definir (tudo opcional):
+  - `NOME`, `ESQUEMA_VERSAO: int`, `ESQUEMA: list[str]` (DDL próprio; o banco guarda
+    `recursos_esquema(nome, versao)` e aplica migrações por recurso, dentro do mesmo arquivo cifrado);
+  - `extrair(texto, referencia, pessoas, datas, itens, conhecimento) -> list[dict]`: propostas
+    extras para a revisão (cada uma `{tipo, resumo, trecho, ...}`; `trecho` literal);
+  - `gravar_extras(banco, registro_id, extras_confirmados, referencia)`;
+  - `marca_privado(extras) -> bool` (o ciclo devolve True: o registro vira 🔒);
+  - `rotas() -> list[Rota]` (handlers `fn(nucleo, pedido, banco) -> Any`, acesso como no núcleo);
+  - `cartoes_hoje(banco, referencia) -> list[Alerta]` (o anti-excesso continua central:
+    todos os importantes, até 3 lembretes, 1 sugestão por fornecedor no máximo e 2 no total);
+  - `exportar(banco) -> dict`, `importar(banco, dados, mapa_registros) -> dict` (juntar sem duplicar),
+    `ao_apagar_registro(banco, registro_id)` (o que depende do registro some junto);
+  - `fora_da_ia(banco) -> set[int]` (registros que nunca vão para a IA; o ciclo e o eu usam);
+  - (correção final, 20.10.1) `discretos(banco)`, `reservado(texto) -> bool` e `TIPOS_FORA_PELO_TEXTO`.
+- `Proposta.extras: dict[str, list[dict]]` (campo novo em `modelos.py`, padrão vazio; entra em
+  `para_json`). `MotorRegras.analisar` chama os `extrair` registrados; `POST /api/registros`
+  aceita `extras` confirmados e chama `gravar_extras`. A IA (✨) nunca recebe `extras` nem nada
+  de `fora_da_ia`.
+- `Banco` ganha ajudantes genéricos para os recursos (`executar`, `consultar`, `inserir`,
+  `atualizar`, `apagar` com histórico sem conteúdo) e chama os ganchos em exportar/importar/apagar.
+- `nucleo` junta às `ROTAS` as rotas dos recursos (prefixo `/api/<recurso>/...`).
+- `alertas.hoje()` junta os `cartoes_hoje` de cada recurso.
+- **Web:** `index.html` carrega `web/telas/<nome>.js` (um por recurso, já criados vazios pela
+  fundação, sem editar o HTML depois). `app.js` expõe `window.EntreNos = { api, h, selo, navegar,
+  registrarTela(rota, render), registrarCartaoHoje(tipo, render), registrarAbaEla(id, titulo,
+  render), registrarSecaoAjustes(id, titulo, render), registrarRevisaoExtra(tipo, render),
+  registrarMenu(rota, rotulo, icone, grupo) }`. Menu: no celular a barra de baixo tem Hoje,
+  Registrar (+), Ela, Buscar e Mais; o resto vai para "Mais".
+- O teste de compatibilidade com o navegador (seção 19) passa a cobrir `entrenos/recursos/`.
+- Esquema do banco: `ESQUEMA_VERSAO` central sobe para 4 (só `recursos_esquema` + o que a
+  fundação precisar); as tabelas de cada recurso são do próprio recurso, **com as colunas desta
+  seção como contrato** (outros recursos leem: o `eu` lê promessas, perguntas, atitudes etc.).
+
+#### 20.0.1 Como ficou a fundação (07/10/2026) — o guia de quem escreve um recurso
+
+Detalhes decididos ao construir; valem junto com a lista acima (onde discordarem, vale esta). Testes
+em `testes/test_fundacao_recursos.py` (um recurso FALSO que usa todos os ganchos) e
+`testes/test_compat_navegador.py`.
+
+**Registro (`entrenos/recursos/__init__.py`).**
+- `NOMES` é a lista fixa (a ordem é a dos extras na revisão e a das chamadas). Os nove módulos
+  existem como esqueletos (só `NOME`). O registro carrega na primeira chamada a `carregados()` (o
+  banco chama ao abrir), confere o contrato e deixa de fora quem falhar: `falhas()` = `{nome: tipo do
+  erro}`, e o log guarda `recurso <nome> (<onde>)` + tipo + pontos do código, nunca a mensagem.
+- Contrato conferido: `NOME` igual ao nome do arquivo (`[a-z][a-z0-9_]{0,30}`); `ESQUEMA_VERSAO`
+  igual a `len(ESQUEMA)` (sem `ESQUEMA_VERSAO`, vale o tamanho); ganchos que existem são funções.
+  Opcionais novos: `ROTULO` (nome para a tela nos avisos; sem ele, o `NOME`) e `TIPOS_EXTRAS` (os
+  `tipo` aceitos nos extras; sem ele, só `tipo == NOME`).
+- Para os testes: `recursos.usando(*modulos, com_os_fixos=False)` troca a lista (e devolve no fim) e
+  `recarregar()` lê a lista fixa de novo. `geracao()` muda a cada troca: o núcleo (rotas) e o banco
+  (objetos esperados do esquema) refazem os caches.
+- Ajudantes para os recursos: `rota(metodo, caminho, funcao, acesso="sessao")`, `cartao(chave,
+  nivel, texto, porque="", relevancia=50, data=None, registro_ids=(), tipo=None, dados=None)`,
+  `registrar_erro(erro, recurso, onde)`.
+
+**Esquema dos recursos.**
+- Central v4 = `recursos_esquema(nome TEXT PRIMARY KEY, versao INTEGER NOT NULL)`. Depois das
+  migrações centrais, `Banco._migrar_recursos` leva cada recurso da versão gravada até a do código:
+  `ESQUEMA[v]` (v -> v + 1) é texto (comandos separados por ";", divididos com
+  `sqlite3.complete_statement`) ou função `(conexão) -> None`; cada passo numa transação.
+- Enquanto o passo roda, um **autorizador do SQLite** só deixa criar, mudar e apagar tabelas e índices
+  do próprio recurso (e mexer nos dados delas). Recusado: tabela central (mais `sqlite_*` e
+  `busca_fts*`), gatilho (mesmo na tabela do recurso), visão, tabela virtual ou temporária, ATTACH,
+  PRAGMA que muda algo e BEGIN/COMMIT/SAVEPOINT; e os contadores de `sqlite_sequence` das tabelas
+  centrais não podem mudar. Passo que falha: desfeito, no log, o recurso fica na versão em que estava
+  e o diário abre normalmente (tenta de novo na próxima abertura). O `ponte.autoteste()` ganhou o
+  passo `sqlite_autorizador` (o Pyodide precisa do `set_authorizer`, e do `None` para desligar).
+- Versão gravada maior que a do código: `ValueError(DADOS_DE_VERSAO_NOVA)`, como no esquema central.
+- `conferir_integridade` (restaurar): as tabelas dos recursos carregados fazem parte do esperado.
+  Com algum recurso em `falhas()`, tabelas e índices não centrais a mais são aceitos (não dá para
+  conferir a forma deles); gatilho e visão nunca.
+- Use `id INTEGER PRIMARY KEY AUTOINCREMENT`: `maiores_ids`/`garantir_ids_acima` passam a cobrir as
+  tabelas dos recursos (ao restaurar uma cópia antiga, ids não se repetem e apagar pelo id nas cópias
+  continua seguro).
+
+**Ajudantes do Banco** (todos passam pelo autorizador; violar levanta `banco.OperacaoProibida`, que
+o núcleo responde como 500 e o log guarda só o tipo):
+- `consultar(sql, parametros=()) -> list[dict]`: só leitura, em qualquer tabela (o `eu` lê itens,
+  promessas...). JSON e datas voltam como o SQLite guarda (texto).
+- `executar(sql, parametros=()) -> int`: um INSERT/UPDATE/DELETE nas tabelas dos recursos (linhas
+  mudadas). Nada de DDL, PRAGMA, ATTACH ou transação.
+- `inserir(tabela, valores) -> id`, `atualizar(tabela, id, valores)`, `apagar(tabela, id)`
+  (`NaoEncontrado` se não existe): só tabela de recurso; `id` é do banco; dict/lista viram JSON, data
+  vira ISO, verdadeiro/falso vira 1/0. Histórico só "tabela #id criado / atualizado: colunas / apagado".
+- `transacao()`: várias escritas como uma só (tudo ou nada) e o arquivo gravado uma vez no fim.
+  Escrita dentro de escrita vira **ponto de salvamento** (`SAVEPOINT`): um erro desfaz só aquela parte.
+- `esquecer_alertas(prefixo)`: tira dos dispensados as chaves do próprio recurso (`"<NOME>:..."`;
+  `%` e `_` são letras). A chave de um cartão pode revelar a data do que foi apagado.
+
+**Extras (revisão e gravação).**
+- `extrair` recebe cópias (pessoas, datas, itens, conhecimento): mexer nelas não muda a proposta.
+  Cada extra precisa de `tipo` em `TIPOS_EXTRAS`, `trecho` literal (não vazio) do texto e `resumo`
+  em texto (vazio = o trecho); o que não cumpre é descartado (log com a contagem, sem conteúdo). Até
+  50 por recurso. Chaves que começam com "_" são da fundação: saem do que o recurso devolve.
+- A fundação chama `marca_privado([extra])` em cada extra e marca `"_privado": true` (erro conta como
+  sim: na dúvida, 🔒); com algum, a proposta ganha o aviso `recursos.AVISO_PRIVADO`. Erro em `extrair`
+  vira o aviso `AVISO_EXTRAIR` com o `ROTULO` e a análise continua.
+- `POST /api/registros {..., extras: {NOME: [extras confirmados]}}`: recurso sem `gravar_extras`,
+  tipo desconhecido, trecho que não está no texto, formato errado ou mais de 200 extras → 400
+  (`EXTRA_DESCONHECIDO`, `EXTRA_SEM_TRECHO`, `EXTRAS_FORMATO`, `EXTRAS_DEMAIS`) e nada é gravado. As
+  chaves "_" que a tela mandar são ignoradas (o servidor confere tudo de novo).
+- Registro e extras numa transação só (um arquivo gravado). `gravar_extras` de cada recurso num ponto
+  de salvamento: `ValueError` → 400 com a mensagem e nada gravado; outro erro → a parte do recurso é
+  desfeita, o registro fica e a resposta traz o aviso `AVISO_GRAVAR`.
+- `marca_privado(extras confirmados)` verdadeiro (ou com erro) → registro gravado 🔒 mesmo com
+  `privado: false`. Resposta: `{id}` e, quando for o caso, `privado: true` e `avisos`
+  (`AVISO_PRIVADO_GRAVADO` primeiro).
+
+**IA (✨).**
+- `nucleo.fora_da_ia(banco)` = registros 🔒 ∪ `fora_da_ia` de cada recurso. Sem saber com segurança
+  (um recurso da lista não abriu, o gancho falhou ou devolveu algo que não é id): 503
+  `FORA_DA_IA_INDISPONIVEL` e nada vai para a IA.
+- `/api/ia/busca` e `/api/ia/sugestao` (`contexto_sugestao`) usam `fora_da_ia`. `/api/busca` marca
+  `privado` em cada achado pelo mesmo conjunto; sem saber, `para_ia` é falso (o ✨ não aparece).
+  `GET /api/registros/{id}` traz `fora_da_ia` (um recurso o deixa fora da IA; `null` = não deu para
+  saber): o detalhe trava a caixinha 🔒 marcada, porque desmarcar não o mandaria para a IA.
+- `/api/ia/analisar`: com recurso em `falhas()`, 503; texto com algum extra `_privado` → 403
+  `TEXTO_FICA_FORA_DA_IA` (mesmo com a caixinha desmarcada); a proposta das regras vai para a IA com
+  `extras` vazio, e a resposta volta com os extras das regras (a IA nunca os vê).
+
+**Rotas.** `rotas()` devolve `recursos.rota(...)`: `caminho` relativo (segmentos `[a-z0-9_-]` ou
+`{id}`), servido em `/api/<NOME>/<caminho>` (vazio = `/api/<NOME>`); acesso `"sessao"` (padrão, com a
+trava do app) ou `"livre"` (sem a trava: pegue `with nucleo.trava:` antes de mexer no banco); nunca
+pública. As do núcleo vêm antes (`nucleo.todas_as_rotas()`); rota repetida: vale a primeira; recurso
+com uma rota fora do contrato fica sem nenhuma (log). Handler `fn(nucleo, pedido, banco)`: `pedido.corpo`,
+`pedido.id`, `pedido.parametro(nome)`, `pedido.inteiro(...)`; `ValueError` → 400 com a mensagem,
+`NaoEncontrado` → 404, outro erro → 500 sem conteúdo no log. Rota que apaga algo repete nas cópias
+automáticas com `nucleo.limpar_copias(lambda copia: copia.apagar(tabela, id))`.
+
+**Hoje.** `cartoes_hoje` devolve `Alerta` ou dict (`recursos.cartao`). O centro normaliza em
+`alertas.CartaoRecurso` (Alerta + `recurso`, `tipo` — padrão o NOME — e `dados`, JSON), põe o prefixo
+`"<NOME>:"` na chave, descarta o que não cumpre (log), aceita até 20 por recurso e tira os dispensados.
+Anti-excesso central: todos os importantes; até 3 lembretes somando todos; no máximo 1 sugestão por
+fornecedor (o Hoje e cada recurso) e 2 no total (`MAX_SUGESTOES_TOTAL`). Sem cartões de recurso, a
+página sai igual a antes.
+
+**Exportar, importar, apagar.**
+- `exportar()` ganha `"recursos": {NOME: dados}` (o `exportar` de cada um); quem falha fica de fora e
+  o arquivo leva `"avisos"`.
+- Importar: `"recursos"` do arquivo (precisa ser objeto, senão 400) vai para o `importar` de cada
+  recurso dentro da transação da importação (um ponto de salvamento cada; a prévia desfaz tudo), com
+  `mapa_registros` = {id no arquivo: id aqui} dos registros novos e dos repetidos. O resumo ganha
+  `"recursos": {NOME: o que o importar devolveu}` (só quando há) e os avisos (recurso que falhou;
+  dados de recurso que este aparelho não tem). A tela mostra o `texto` de cada um e conta `novos`.
+- Apagar registro: primeiro o `ao_apagar_registro` de cada recurso (o registro ainda existe; erro vai
+  para o log), depois **toda tabela não central com coluna `registro_id`** perde as linhas daquele
+  registro (vale também para recurso que não abriu ou cujo gancho falhou), depois o resto. As cópias
+  automáticas repetem tudo isso (o núcleo chama `apagar_registro` nelas).
+
+**Página.**
+- `index.html` carrega `telas/<nome>.css` (depois de `estilo.css`) e `telas/<nome>.js` (com `defer`,
+  depois do `app.js`), na ordem de `NOMES`. Os 18 arquivos nasceram só com um comentário. O CSS por
+  recurso é decisão da fundação: cada recurso tem o seu sem disputar o `estilo.css`.
+- O `app.js` só começa (`carregarEstado`) no `DOMContentLoaded` (`quandoPronto`), depois de todas as
+  telas: o primeiro desenho já tem cartões, abas e menus dos recursos.
+- `window.EntreNos` (congelado): `api(metodo, '/rota', corpo)` (o `/api` vem sozinho), `h`, `selo`,
+  `navegar(hash)`, `registrarTela(rota, render(main, partes, atual))` (rota do núcleo é recusada);
+  `registrarCartaoHoje(tipo, render(cartao, {dispensar, remover, recarregar, botaoDispensar}) -> Node)`
+  (procura pelo `tipo` do cartão, depois pelo NOME; sem desenho, ou com erro, o cartão genérico);
+  `registrarAbaEla(id, "🌙 Título", render(painel, {perfil, pessoas, atual}))`;
+  `registrarSecaoAjustes(id, "🌙 Título", render(corpo, {config, salvarConfig, atual}))` (antes do
+  Histórico); `registrarRevisaoExtra(tipo, render(extra, {recurso, revisao, redesenhar}) -> Node)`
+  (o miolo; confirmar/não guardar/desfazer são da fundação); `registrarMenu(rota, rotulo, icone,
+  grupo)`. Os `render` de área (aba, seção) podem ser assíncronos e devolver um nó; erro vira uma
+  mensagem só ali. `EntreNos.util` traz os ajudantes das telas daqui (`cabecalho`, `secao`, `campo`,
+  `carregando`, `estadoVazio`, `vazioPequeno`, `caixaErro`, `citacao`, `linkRegistro`, `avisar`,
+  `avisarErro`, `falar`, `confirmar`, `dataBr`, `dataLonga`, `diasAte`, `textoDias`, `hojeIso`,
+  `salvarConfig`...). Identificadores: `[a-z][a-z0-9_-]{0,39}`.
+- Menus: no computador, no menu lateral antes de Ajustes; no celular, dentro de "Mais" (a barra de
+  baixo fica Hoje, Ela, o botão redondo **+** Registrar no centro, Buscar e Mais), agrupados por
+  `grupo`. O menu "Mais" e o lateral rolam por dentro quando crescem. Rotas só as próprias
+  (`#toString` não vira tela).
+- Revisão: seção "🧩 Mais coisas que eu notei" com os extras; cada um começa **sem decisão** e só
+  vai se for confirmado (✔️ Confirmar / 🗑️ Não guardar / ↩️ Desfazer); salvar com algum sem
+  decisão pede confirmação. Extra `_privado` confirmado trava a caixinha 🔒 marcada (com o porquê);
+  qualquer extra `_privado` esconde o ✨ Analisar a fundo com IA. Os extras ficam ao trocar regras ↔ IA.
+  Depois de salvar: "Ele ficou 🔒 fora da IA" e os avisos da resposta.
+- Conhecendo Ela com mais de 3 abas: as abas quebram linha (360 px sem rolagem para o lado).
+
+**Testado (07/10/2026):** a suíte inteira; os testes novos de proteção (autorizadores, contadores,
+apagar sem gancho, `fora_da_ia`) falham com a proteção desligada. O `app.js` foi conferido com
+`Code.exe --check` e por fumaças num DOM de mentira no Node, fora da suíte: o arquivo roda inteiro, o
+contrato existe e é congelado, os registros recusam o que devem, os menus entram antes de Ajustes,
+nada é pedido antes do `DOMContentLoaded`; na revisão, extra pendente não vai, confirmar/não guardar
+mudam o corpo enviado e o 🔒 forçado; no Hoje, desenho do recurso, genérico quando falta ou falha, e
+cartão do núcleo nunca usa desenho de recurso; aba de recurso em Ela (com erro mostrado só nela) e
+seção em Ajustes. Nenhum navegador foi aberto.
+
+### 20.1 Perguntas profundas (`recursos/perguntas.py`)
+
+- Banco de perguntas (≥ 70) nas categorias da seção 10 da especificação: Infância, Sonhos, Medos,
+  Relacionamentos, Valores, Autoconhecimento, Futuro (as da especificação + novas no mesmo tom).
+  Sem perguntas superficiais.
+- Tabela `perguntas_feitas(id, pergunta_id, sugerida_em, status: sugerida|guardada|feita|pulada,
+  feita_em, registro_id)`.
+- **Escolha inteligente** (pontuação explicável): categoria sobre a qual se sabe menos (itens
+  por categoria) + gancho no que ela contou nos últimos 14 dias (ex.: falou do trabalho →
+  Futuro/Valores) + nunca repetir + espaçamento (no máximo uma sugestão nova a cada
+  `dias_entre_perguntas`, padrão 3). **Sensibilidade:** com ESTADO negativo recente (últimos 3
+  dias), não sugere Medos/Infância; prefere apoio ou nada.
+- Cartão "💬 Conheça melhor" no Hoje: a pergunta + por quê ("você ainda sabe pouco sobre os
+  sonhos dela"; "ela falou do trabalho na terça") + Vou perguntar / Perguntei → registrar
+  resposta (abre Registrar com `pergunta_id` e o contexto) / Outra / Agora não.
+- Tela `#perguntas`: por categoria, o que já foi perguntado e as respostas (links).
+
+#### 20.1.1 Como ficou (07/10/2026)
+
+- **Banco de perguntas** no próprio `perguntas.py` (o teste de compatibilidade exige um arquivo por
+  recurso): 112 perguntas de id fixo — 78 profundas (11-12 em cada uma das 7 categorias), 24 de
+  "Nós dois" (para fazer A ELA; as de acompanhamento repetem depois de 30-90 dias) e 8 "Com cuidado"
+  (leves, só para momentos sensíveis). Cada uma com nível 1-3 e raízes de assunto.
+- **Tabela `perguntas_feitas`**: o contrato mais `trilha` (profundas|nos_dois|apoio), `categoria`,
+  `pergunta` (texto), `origem` (sugestao|tela|registro), `guardada_em`, `feita_por`, `pulada_em`,
+  `adiada_ate`, `resposta` (trecho LITERAL do registro: o campo público que o `eu` lê), `certeza`,
+  `recusou`, `criado_em`.
+- **Escolha com pontos explicáveis**: lacuna da categoria (até 30), gancho dos últimos 14 dias pela
+  categoria do item (20/16/10; +8 se o texto tem os termos), começar leve, ela animada puxa Sonhos e
+  Futuro, variedade (−10 mesma categoria, −12 categoria pulada 2×, −8 sugerida e ignorada); Nós dois
+  (+20 sem resposta em 60 dias, +25 nos últimos 7 dias do mês, +15 depois de um reparo), no máximo
+  uma a cada 14 dias e desligável. Nunca repete; "ela não quis responder" descansa a categoria 90 dias.
+  Espaço entre sugestões `dias_entre_perguntas` (3; 1-30); mínimo de 5 registros (nada genérico).
+- **Sensibilidade**: estado negativo mais recente dos últimos 3 dias ou evento de importância 3 hoje
+  ou amanhã → nada fundo; só uma de "Com cuidado" quando o momento veio de um estado, sem APOIO
+  conhecido e sem nada marcado para hoje/amanhã. Registro que outro recurso deixa fora da IA nunca
+  vira gancho.
+- **Registrar a resposta**: "Perguntei" abre o Registrar (EntreNos.abrirRegistrar, 20.10) com
+  `Eu perguntei: “…”` e `Ela respondeu: ` embaixo do que já estava escrito. A revisão reconhece a
+  pergunta (literal, parecida ≥ 90 ou livre), ignora negação, "ela me perguntou" e pergunta a outra
+  pessoa; "vou perguntar" vira `pergunta_guardada`. Resposta sempre literal; certeza 🟢 com a marca de
+  resposta. `TIPOS_EXTRAS = pergunta_feita, pergunta_guardada`; a gravação confere tudo de novo (400).
+- **Nós dois é da área Eu**: a resposta deixa o registro 🔒 (`marca_privado`, `fora_da_ia`).
+- **Hoje**: cartão `pergunta` (sugestão, relevância 44-50, sempre "Talvez…"). Desde a integração o
+  cartão sai "nova" e a sugestão só é gravada como "sugerida" quando o cartão **aparece de verdade**
+  (`cartoes_mostrados`, 20.10); a chave é `sugestao:p<id>:<dia>`, a mesma antes e depois de gravar.
+- **Apagar o registro**: a pergunta continua "já perguntada", sem data, resposta nem link; a
+  "Vou perguntar" que só existia por causa dele sai. Exportar/importar juntam sem duplicar (não levam
+  as só sugeridas; a resposta só entra se for literal do registro daqui).
+- **Rotas**: `GET /api/perguntas`, `GET /api/perguntas/respostas`, `POST /api/perguntas/outra`,
+  `POST /api/perguntas/{id}/guardar|perguntei|pular|agora-nao|voltar`, `DELETE /api/perguntas/linhas/{id}`.
+  API para outros recursos: `respostas_nos_dois`, `respostas`, `sugestao_atual` (não grava), `pergunta`.
+- **Tela**: menu "💬 Perguntas" (`#perguntas`), cartão do Hoje com Vou perguntar / Perguntei / Outra /
+  Agora não, miolo dos extras e Ajustes → 💬 Perguntas.
+
+### 20.2 Ideias de presentes (`recursos/presentes.py`)
+
+- Tabela `presentes(id, descricao, data, ocasiao, de_quem: eu|outro, reacao:
+  gostou|nao_gostou|neutra|nao_sei, registro_id, criado_em)`.
+- Regras: "dei X para ela", "ela ganhou X", "ela amou o X que eu dei", "não curtiu o X" →
+  presente + reação; DESEJO de objeto ("queria um fone novo") → desejo.
+- Tela `#presentes` com as listas: **Ela comentou que gostaria** (com "há 8 meses"), **Ideias
+  possíveis** (🔵, só derivadas de preferências fortes e hobbies registrados, citando a origem),
+  **Já recebeu** (de você / de outros), **Gostou**, **Não gostou**, **Não recomendados** (não
+  gosta, restrições, já dado — evita repetir). Marcar desejo como "dei" move para Já recebeu.
+- Ocasião próxima (aniversário dela, do namoro, Natal, Dia dos Namorados em ≤ 45 dias) → cartão
+  no Hoje: "Ideias para o aniversário dela (em 30 dias): 3 coisas que ela mencionou".
+
+#### 20.2.1 Como ficou (07/10/2026)
+
+- **Tabelas**: `presentes` (o contrato + `trecho`, `quem`, `certeza`, `planejado`, `desejo_item_id`,
+  `desejo_id`, `atualizado_em`), `presentes_desejos` (desejos que as regras não pegam) e
+  `presentes_ocultos` (o que você escondeu e desejos já realizados). Tudo com `registro_id`.
+- **Extras** `presente` e `presente_desejo` (ROTULO "Ideias de presentes"), sempre com a frase
+  literal (ou duas, quando a reação vem logo depois: "Dei um colar. Ela amou!"). Pega "dei/presenteei",
+  "comprei/trouxe/fiz" para ela, "vou dar / comprei pra dar" (separado), "ela ganhou de X", listas;
+  recusa negação, "se", pergunta, ironia, "dei carona/um beijo", "ganhou o jogo", presente para outra
+  pessoa. Desejos: "tá doida por", "de olho num", "precisa de um X novo", "adoraria ganhar", "lista de
+  desejos"... O desejo que o núcleo já guarda ("queria um fone novo") não duplica.
+- **Ideias possíveis 🔵** só de preferências fortes (dela ou 2+ registros), hobbies e nomes que ela ama,
+  em categoria que dá presente; caem se contraditas, velhas (12 meses), não desejadas, não gostou ou já
+  dadas. Restrição alimentar entra citada nas ideias de comida. **Não recomendados** citam a origem.
+- **Hoje**: cartão `presentes_ocasiao` (aniversário dela — Ajustes ou registro —, de namoro, Natal e
+  Dia dos Namorados em até 45 dias, só com algo registrado), relevância 55-75; chave
+  `ocasiao:<origem>:<data>`. Desde a integração ele entra no rodízio das sugestões (20.10).
+- **Rotas** em `/api/presentes` (GET; PATCH/DELETE `{id}`; `itens|desejos/{id}/dei|ocultar`;
+  `DELETE desejos/{id}`; `ideias/{id}/ocultar`; `DELETE ocultos/{id}`), apagando também nas cópias.
+  Exportar leva o vínculo com desejos do núcleo como registro + trecho; importar junta sem duplicar.
+- Sem `marca_privado`/`fora_da_ia` (presente não é sensível; a IA nunca vê extras).
+- **Tela** `#presentes` (menu 🎁): ocasiões, o momento dela (com o que ajuda, citado), desejos,
+  ideias, separados, recebidos (de você / de outros) com a reação, gostou/não gostou, não recomendados,
+  ocultos.
+
+### 20.3 Promessas (`recursos/promessas.py`)
+
+- Tabela `promessas(id, texto, prazo, status: aberta|cumprida|desisti, registro_id, criado_em,
+  concluida_em)`.
+- Regras (primeira pessoa): "prometi…", "fiquei de…", "combinei de…", "vou levar ela…",
+  "tenho que levar ela…" → promessa (prazo pelas datas do texto).
+- Hoje: prazo chegando (lembrete); aberta há mais de 14 dias sem prazo (sugestão gentil).
+- Alimenta o espelho da área Eu.
+
+#### 20.3.1 Como ficou (07/10/2026)
+
+- **Tabela `promessas`**: o contrato + `trecho` (frase literal; à mão = o texto), `prazo_expressao`,
+  `precisao` (dia|semana|mes|ano), `pessoa`, `forma` (prometi|fiquei_de|combinei|vou|disse_que|manual),
+  `feita_em` (o dia da promessa; o `eu` conta por ela, não por `criado_em`), `concluida_registro_id`.
+- **Extras** `promessa` (texto e prazo editáveis; datas ambíguas viram botões; força fraca com "acho
+  que") e `promessa_cumprida` (só cumprimento dito: "como prometi", "cumpri a promessa"…; a revisão
+  busca `POST /api/promessas/candidatas` e a pessoa escolhe; sem escolha, nada muda). Resumo só com
+  palavras do trecho; prazo = a primeira data futura depois do gatilho; não duplica (semelhança ≥ 88 e
+  mesmo prazo). Nenhum dos dois marca 🔒.
+- **Hoje**: `promessa_prazo` (lembrete; hoje 86, amanhã 80, 2-3 dias 70; semana/mês em volta do
+  período; conflito com evento dela no mesmo dia), `promessa_gentil` (sugestão: prazo passado até 30
+  dias, ou aberta há mais de 14 dias sem prazo) e `promessa_cumprida_talvez`. Momento difícil dela: a
+  sugestão desce 12, ou sobe citando o APOIO que combina. O lembrete não aparece quando o próprio
+  registro já virou EVENTO do núcleo na mesma data.
+- **Rotas**: `GET|POST /api/promessas`, `PATCH|DELETE /api/promessas/{id}`, `POST .../parecidas`,
+  `POST .../candidatas`. Apagar o registro da promessa apaga a promessa; a prova de cumprimento
+  apagada deixa a promessa cumprida sem a data e sem o vínculo.
+- **Tela** `#promessas` (menu 🤝), sem placar nem porcentagem.
+
+### 20.4 Anotação rápida (`recursos/rapida.py`)
+
+- Tabela `rascunhos(id, texto, criado_em, referencia)`. Salvar sem revisar (um campo e um
+  botão; no celular, o botão "+" grande; no PC, atalho de teclado). **A data de referência é a
+  do momento da anotação** (para "amanhã" continuar certo quando organizar depois).
+- Hoje: "📝 3 anotações para organizar" → abre a revisão normal com a referência guardada.
+- Rascunho é criptografado como o resto e some ao ser organizado ou apagado.
+
+#### 20.4.1 Como ficou (07/10/2026)
+
+- **Tabela `rascunhos`**: o contrato + `privado`, `contexto`, `humor`; sem `registro_id`. A referência é
+  a do formulário ou hoje, nunca mais de 1 dia no futuro. A lista mostra as datas da anotação
+  calculadas pela referência, "urgente" (fala de hoje/amanhã) e "parece organizada".
+- **Rotas**: `GET|POST /api/rapida/rascunhos`, `PATCH|DELETE /api/rapida/rascunhos/{id}`,
+  `POST /api/rapida/rascunhos/{id}/organizado {registro_id}` (só apaga se o texto está no registro —
+  ou semelhança ≥ 80 — e o registro é de depois; apaga nas cópias também).
+- **Organizar** (desde a integração, pelo contrato do app, 20.10): `EntreNos.abrirRegistrar({texto,
+  data: referência, privado, contexto, humor, organizar: true, aoSalvar})` — a revisão abre sozinha e,
+  salvo o registro, `aoSalvar(id)` chama o `/organizado`. O que já estava em Registrar vira outra
+  anotação antes (nada se perde).
+- **Guardar sem revisar**: tela `#anotar` (menu 📝, grupo "registrar"; **Alt+N** fora de campo de texto;
+  Ctrl+Enter guarda) e o botão "📝 Guardar para organizar depois" no formulário de Registrar
+  (`registrarAcaoRegistrar`), que é para onde leva o **+** da barra de baixo do celular.
+- **Hoje**: lembrete `rapida` "📝 N anotações para organizar" (40 + 3/dia da mais antiga + N; 82 se
+  alguma fala de hoje, 76 de amanhã; chave `n<maior_id>:pendentes`).
+- Nunca vai para a IA nem para a busca.
+
+### 20.5 Lugares (`recursos/lugares.py`)
+
+- Tabela `lugares(id, nome, tipo, status: fomos|queremos_ir, opiniao (+1/-1/None), cidade,
+  registro_ids JSON, criado_em)`.
+- Regras: "fomos no/ao <Lugar>", "jantamos no…", "ela quer conhecer…", "restaurante/bar/café/
+  praia/parque <Nome>", "viagem para <Cidade>" com a opinião dela quando houver.
+- Aba "Lugares" em Conhecendo Ela; sugestão no Hoje (no máximo uma por semana): "Talvez o
+  <Lugar> que ela quer conhecer seja uma boa para o próximo encontro".
+
+#### 20.5.1 Como ficou (07/10/2026)
+
+- **Tabelas**: `lugares` (o contrato + `chave`, `generico`, `juntos`, `quem_quer`, `editado` JSON,
+  `visitado_em`) e `lugares_mencoes` (uma linha por vez que o lugar aparece: `registro_id`, trecho
+  literal, `mencao` visita|vontade|opiniao, `quem`, opinião, reação literal, ressalvas, voltar, data,
+  nome, tipo, cidade). A situação do lugar sai das menções; a correção feita à mão vale mais.
+- **Extração** (extra `lugar`; desenho registrado pelo NOME `lugares`): tipo + nome ("restaurante
+  Mangiare"), tipo + cozinha (genérico), nomes com maiúscula depois do verbo, cidades e pontos
+  conhecidos; fomos/jantamos/viajamos, ela quer/sonha/tá doida pra conhecer, a gente vai, ela
+  adora/odeia (só com lugar reconhecível), reação na mesma frase ou na seguinte; "achou caro" é
+  ressalva. Tipo sozinho ("a praia") não vira lugar. Datas pelo `regras/datas.py`, só dia exato.
+- **Pontuação explicável** (ela quer +3, combinaram +2, ideia sua +1, palavras dela +2, vezes +n até 3,
+  recência, gosto forte +2, gosto negativo −3, restrição citada, momento difícil, viagem registrada +3,
+  cada "agora não" −1).
+- **Hoje**: no máximo um cartão `lugares_sugestao` por semana ISO (chave
+  `sugestao:<id>:<AAAA-Www>`), nunca com estado difícil dela nos últimos 3 dias nem se vocês já saíram
+  na semana; modos conhecer/voltar/rever; sempre "Talvez…"; considera aniversário e viagem.
+- **Rotas**: `GET /api/lugares`, `GET|PATCH|DELETE /api/lugares/{id}`, `POST /api/lugares/{id}/fomos`,
+  `DELETE /api/lugares/mencoes/{id}` (apagam também nas cópias). Sem `marca_privado`/`fora_da_ia`.
+- **Tela**: aba "📍 Lugares" em Conhecendo Ela (`#ela/lugares`), sem item de menu.
+- Integração (20.10): nome com maiúscula logo depois de uma palavra de lugar em minúsculas
+  ("restaurante Mangiare", "café Santo Grão", "festival Coala") e o resto de um nome de lugar ("Museu
+  do Ipiranga", "Beco do Batman") deixaram de virar "Pessoa nova" em `regras/pessoas.py`.
+
+### 20.6 Marcos, linha do tempo e "Neste dia" (`recursos/marcos.py`)
+
+- Tabela `marcos(id, titulo, data, tipo: primeiro_encontro|namoro|viagem|familia|eu_te_amo|outro,
+  descricao, registro_id, criado_em)`.
+- Regras: "primeiro encontro", "pedi ela em namoro", "nossa primeira viagem", "conheci a mãe/
+  família dela", "dissemos eu te amo" → marco (com a data do texto ou do registro).
+- **Marcos de tempo juntos** (calculados de `inicio_namoro`): 100 dias, 6 meses, 1 ano, 500 dias,
+  1.000 dias, anos seguintes; aviso 7 dias antes e no dia (além dos mesversários que já existem).
+- Tela `#tempo`: linha do tempo (marcos + eventos passados + registros importantes), por ano,
+  cada ponto clicável com o contexto (registro, pessoas, relações).
+- "Neste dia" no Hoje: registro ou marco de anos anteriores no mesmo dia/mês (e "há 6 meses")
+  — só o que foi registrado.
+
+#### 20.6.1 Como ficou (07/10/2026)
+
+- **Tabela `marcos`**: o contrato (tipo com CHECK nos 6 valores) + `precisao`, `pessoa` (literal),
+  `trecho`, `data_expressao` (literal), `data_origem` (texto|registro|ajustada|manual). "Vocês se
+  conheceram" fica como `primeiro_encontro`; noivado, casamento, morar juntos, pet, primeiro beijo como
+  `outro` (tipos novos pediriam mudar este contrato).
+- **Extra `marco`** (campo `marco_tipo`): primeiro encontro, pedido de namoro, primeira viagem (com o
+  destino), conheci a família dela (com o nome escrito), primeiro "eu te amo", "nosso primeiro X juntos".
+  Fora: negação, plano, futuro, pergunta, dúvida, ironia, ex, marco de outras pessoas, briga e o tempo
+  juntos (é calculado). Datas: "hoje faz 1 ano do…" calculado; "há 2 anos" sem "hoje" vira precisão de
+  ano/mês; **data futura em frase no passado** volta para a última vez que passou (`ajustada`, com nota
+  na revisão); sem data, o dia do registro. Integração (20.10): "conheci/comi/perdi…" (1ª pessoa do
+  pretérito em -i) passaram a contar como passado no `regras/datas.py`; "pedi" continua fala (como
+  "pediu") e segue ajustado só no marco.
+- **Tempo juntos**: base em `inicio_namoro` (ou no marco de namoro mais antigo); 100, 500 e cada 1.000
+  dias como lembretes daqui (7 dias antes e no dia); 6 meses e anos o núcleo já avisa (aqui só o
+  "relembrar" no dia, com marcos guardados).
+- **Hoje**: aniversário de marco (7 dias antes e no dia), "Neste dia" (marco ou registro de anos
+  anteriores ou de 6 meses atrás, com pontos explicáveis), aniversário de perda dela (cuidado, véspera e
+  dia), momento difícil reduz e tira o convite; 29/02 em 28/02.
+- **Privacidade**: o que os recursos deixam fora da IA nunca volta no Neste dia nem na linha do tempo
+  (sem saber, ficam fora todos os 🔒); trecho com palavra do ciclo nunca é citado.
+- **Rotas**: `GET|POST /api/marcos`, `PATCH|DELETE /api/marcos/{id}`, `GET /api/marcos/linha?tudo=1`,
+  `GET /api/marcos/neste-dia`, `POST /api/marcos/parecidos`.
+- **Tela** `#tempo` (menu 🕰️ "Linha do tempo"): "Vocês", "Neste dia", marco à mão, filtro essencial/tudo
+  e a linha por ano com o contexto de cada ponto.
+
+### 20.7 Diário de conversa e resumo da semana (`recursos/semana.py`)
+
+- Registrar ganha o modo **"Depois de uma conversa"** (formulário curto: onde/contexto, o que
+  ela contou, como ela estava, assuntos importantes, o que preciso lembrar) que vira um texto
+  só + `contexto`/`humor`, analisado pelas regras como sempre.
+- **Resumo da semana** (dia configurável, padrão domingo): cartão no Hoje com o que ela contou
+  na semana (por categoria, citando), o que ficou em aberto (pendências e promessas), os
+  próximos 7 dias e a pergunta sugerida. Tela `#semana/AAAA-Www` com o histórico.
+
+#### 20.7.1 Como ficou (07/10/2026)
+
+- **Tabelas** (contrato para o `eu` ler): `semana_lembretes(id, texto, trecho, data, precisao,
+  data_expressao, status aberto|feito|descartado, registro_id, criado_em, concluido_em)` e
+  `semana_assuntos(id, assunto, chave, trecho, registro_id, criado_em)`. O resumo não é guardado: é
+  calculado na hora (apagar um registro tira tudo dele do resumo).
+- **Semana**: os 7 dias que terminam no dia do resumo (`semana_dia`, padrão domingo); nome ISO do
+  último dia. `semana_no_hoje` liga/desliga o cartão do resumo.
+- **Depois de uma conversa**: `POST /api/semana/conversa {onde, contou, humor, assuntos, lembrar}`
+  devolve `{texto, contexto, humor}` sem gravar ("Ela estava X.", "Assuntos importantes: a, b e c.",
+  "Lembrar: X."). A tela `#conversa` traz o que já estava no Registrar e, desde a integração, entra no
+  Registrar pelo contrato do app: o modo "🗣️ Depois de uma conversa" no alto do formulário
+  (`registrarModoRegistrar`) e `abrirRegistrar({..., organizar: true})` (20.10).
+- **Extras** `conversa_assuntos` e `conversa_lembrete` (frase literal; data pelo Python; ambígua com
+  alternativas; "lembrar que ela não gosta de cebola" é fato, não lembrete). Integração (20.10): o
+  lembrete confirmado deixa "descartado" o acontecimento que as regras tiraram da mesma frase com a
+  mesma data (antes o Hoje avisava duas vezes, uma como se fosse um acontecimento dela).
+- **Resumo**: o que ela contou por categoria, destaques com pontos explicáveis, como ela estava (só
+  estados dela), momento sensível, assuntos e pessoas que voltaram, em aberto (pendências, promessas,
+  lembretes), próximos 7 dias, até 3 "Talvez" e a pergunta sugerida (`perguntas.sugestao_atual`).
+  O ciclo fica de fora (palavras e trechos de `ciclo_eventos`).
+- **Hoje**: `semana_resumo` (lembrete, do dia do resumo até 2 dias depois, só com 2+ registros na
+  semana), `semana_lembrete` (hoje 82 / amanhã 76; atrasado até 7 dias vira sugestão gentil).
+- **Rotas**: `GET /api/semana`, `GET /api/semana/historico`, `POST /api/semana/conversa`,
+  `GET /api/semana/lembretes`, `PATCH|DELETE /api/semana/lembretes/{id}`, `DELETE /api/semana/assuntos/{id}`.
+
+### 20.8 Ciclo (`recursos/ciclo.py`) — ela sabe e concorda
+
+- Tabelas `ciclos(id, inicio, fim, criado_em)` e `ciclo_eventos(id, data, tipo:
+  inicio|durante|fim|fluxo|sintoma, valor, trecho, registro_id, criado_em)`.
+- Regras: início ("menstruou", "ficou menstruada", "desceu", "veio a menstruação", com a data
+  certa: "ontem", "desde segunda"); durante ("está menstruada" → pergunta "sabe quando
+  começou?"); fim ("parou", "acabou a menstruação"); fluxo (leve/moderado/intenso, só se ela
+  disser); sintomas com as palavras dela (cólica, dor de cabeça/enxaqueca, inchaço, cansaço,
+  dor nas costas, seios sensíveis, náusea, espinhas, desejo de doce...); "o que ajuda" =
+  APOIO ligado ao ciclo ("quando está com cólica, bolsa de água quente ajuda").
+- **Registro com informação de ciclo vira 🔒 automaticamente** (com aviso na revisão).
+- **Previsão:** intervalos entre inícios; registro esquecido (intervalo ≈ 2× a mediana) gera a
+  pergunta "faltou registrar um mês?" e não entra no cálculo; mês muito fora do padrão é
+  descartado; **só a partir de 3 ciclos**; **faixa** (mediana ± dispersão, mínimo ±2 dias),
+  "irregular" se a variação dos últimos ciclos passa de 7 dias; duração média pelos fins.
+- **Período fértil (incluído pelo usuário, com aviso):** só com ≥ 3 ciclos e regulares; faixa
+  de trás para frente (ovulação ≈ próximo início − 14 ± 2; janela −5..+1), 🔵, com o aviso
+  fixo: "Estimativa aproximada, feita a partir de anotações. Não serve como método para evitar
+  ou planejar gravidez; para isso, o ideal é um ginecologista." **Só no cartão**, nunca no Hoje
+  nem em notificação.
+- **Padrões de sintomas:** "cólica em 3 dos últimos 4 ciclos, quase sempre no 1º dia" (fato dos
+  registros, sem diagnóstico).
+- **Hoje:** 1-2 dias antes da faixa prevista, um lembrete NEUTRO ("💙 Um lembrete de cuidado
+  para os próximos dias") com sugestão só do que ela disse que ajuda; sem fala dela, sem
+  sugestão. O texto do Hoje nunca usa as palavras menstruação/ciclo/TPM.
+- **Planejamento:** evento futuro registrado que cai na faixa + algo que ela já disse sobre isso →
+  aviso no cartão do ciclo e na revisão daquele evento.
+- **Cartão "🌙 Ciclo" em Conhecendo Ela**: faixa prevista, duração média, histórico (calendário
+  simples com duração e intervalo de cada ciclo), sintomas, o que ajuda, período fértil com
+  aviso, editar/apagar um ciclo, **"apagar todos os dados do ciclo"**.
+- **Limites no código (com testes):** nada do ciclo vai para a IA (fora de todo contexto/
+  trecho/sugestão mandados à IA, mesmo com o registro desmarcado de 🔒); o ciclo nunca entra em
+  "Como ela está" nem em frase que explique humor/comportamento; nada de diagnóstico.
+
+#### 20.8.1 Como ficou (07/10/2026)
+
+- **Tabelas**: `ciclos(id, inicio, fim, criado_em)` + `exatidao` (dia|aproximada|talvez), `origem`
+  (registro|manual), `registro_id` (o do início), `fim_registro_id`, `intervalo_confirmado`;
+  `ciclo_eventos(id, data, tipo, valor, trecho, registro_id, criado_em)` + `ciclo_id`, `palavras`,
+  `polaridade`, `certeza`, `de_quem` (tipos também `ajuda` e `mencao`); `ciclo_ajustes(chave, valor)`
+  (`lembrete_hoje`, `mostrar_fertil`).
+- **Extras com prefixo** (`ciclo_inicio|durante|fim|fluxo|sintoma|ajuda|mencao`; o desenho da revisão é
+  escolhido pelo tipo): um por acontecimento, com sintomas e fluxo da frase. Dono pela oração ("a irmã
+  dela", "minha" → `ciclo_mencao` de outra pessoa: não entra no 🌙 dela, mas o registro fica 🔒).
+  Negação, dúvida, hábito e futuro viram comentário; "acho que" vira `talvez` (fora da previsão).
+  Humor nunca vira sintoma; "cólica" e "fluxo intenso" sozinhos são marcadores fracos.
+- **Gravar**: todo dado do ciclo pede 🔒; os itens das regras da mesma frase (menos a nota) ficam
+  "descartados" (`banco.atualizar_item`; continuam no registro e dá para reativar). Início a até 10
+  dias de outro é o mesmo ciclo.
+- **`fora_da_ia`** = registros com dado guardado + qualquer registro cujo texto fala do ciclo (mesmo
+  sem nada confirmado). **`discretos`** (integração, 20.10) = os mesmos. Desde a correção final
+  (20.10.1), "fala do ciclo" é **o mesmo critério da revisão** (`texto_fala_do_ciclo`: o `extrair` acha
+  algo), com "a regra dela" no vocabulário; os itens da frase aparecem nas telas centrais pelo
+  `reservado` (sem humor explicado pelo ciclo, sem as palavras dele), confirmado ou não.
+- **Previsão**: só com 3 ciclos completos (dos últimos 6); faixa do menor ao maior intervalo, mínimo
+  mediana ±2; variação > 7 = irregular; intervalo ≈ 2× pergunta "faltou registrar um mês?"; fora do
+  padrão sai da conta. Período fértil só regular, base exata, com o aviso literal, só no cartão.
+- **Hoje**: lembrete neutro `ciclo_cuidado` 1-2 dias antes da faixa ("💙 Um lembrete de cuidado para
+  os próximos dias."), com no máximo 2 coisas que ELA disse que ajudam; sem data e sem registro.
+- **Planejamento**: no cartão 🌙 e, desde a integração (20.10), **na revisão** do acontecimento que cai
+  nos dias previstos: extra `ciclo_planejamento` (o `extrair` lê o diário por `conhecimento.consultar`),
+  só informação — não é dado do ciclo, não deixa o registro 🔒, não grava nada, e salvar sem decidir
+  não pede confirmação (`registrarRevisaoExtra(..., {opcional: true})`).
+- **Cartão 🌙 Ciclo** em Conhecendo Ela (`#ela/ciclo`, sem item de menu): agora, faixa 🔵, perguntas,
+  duração, planejamento, padrões de sintomas, o que ajuda, período fértil, histórico (editar/apagar),
+  anotar um início, ajustes e "apagar todos os dados do ciclo" (`POST /api/ciclo/apagar-tudo`).
+- **Rotas**: `GET /api/ciclo`, `POST /api/ciclo/ciclos`, `PATCH|DELETE /api/ciclo/ciclos/{id}`,
+  `POST /api/ciclo/ciclos/{id}/intervalo`, `DELETE /api/ciclo/eventos/{id}`, `PATCH /api/ciclo/ajustes`,
+  `POST /api/ciclo/apagar-tudo`. Tudo o que apaga repete nas cópias e esquece as chaves `ciclo:`.
+- **Em aberto (decisão do usuário)**: "cólica" sozinha (sem outra palavra do ciclo) hoje vira um
+  sintoma para confirmar e esconde o ✨ daquela revisão; "cólica renal/intestinal/de bebê" não.
+
+### 20.9 Área 🪞 Eu (`recursos/eu.py`) — como estou sendo com ela
+
+Sem nota, sem placar, sem ranking; comemora mais do que cobra; tudo cita a origem; **🔒: nada da
+área Eu vai para a IA**; sem PIN extra. Telas `#eu` (visão geral), `#eu/checkin`, `#eu/mes`,
+`#eu/aprendizados`, `#eu/reparos`, `#eu/cartas`.
+
+1. **Check-in semanal curto** (≈ 1 min) e **reflexão mensal**. Tabela `checkins(id, tipo:
+   semanal|mensal, periodo, respostas JSON, criado_em)`. As perguntas do semanal são
+   **escolhidas pela semana real** (2-3): semana difícil dela registrada → "Como você a apoiou
+   na semana difícil dela?"; promessa vencendo → "Conseguiu cumprir X?"; pergunta profunda feita
+   → "Como foi a conversa sobre Y?"; sem gancho → "Uma coisa boa que você fez por ela" e "Algo
+   que faria diferente". Escala de presença em 5 emojis (só sua, nunca vira nota dela).
+2. **Espelho (observações dos registros)**, por semana e por mês: promessas feitas × cumpridas;
+   acompanhamento das pendências ("ela contou da entrevista no dia 12; você marcou que perguntou
+   no dia 15"); equilíbrio (preocupações × alegrias registradas); antecedência nas datas;
+   perguntas profundas feitas; atitudes que combinam com o que ela disse que ajuda. Cada linha
+   com link para o registro. Tendência ao longo dos meses em texto ("em agosto…, em outubro…").
+3. **Minhas atitudes:** regras em primeira pessoa ("levei café para ela", "fiquei com ela no
+   hospital", "escutei sem dar conselho") → ATITUDE (tabela `atitudes(id, texto, data,
+   registro_id)`), **cruzadas com o que ela disse**: "combina com o que ela disse que ajuda
+   (30/09)"; e, com cuidado, o descompasso como pergunta: "Ela disse que prefere que você não
+   tente resolver; em 2 registros você anotou que deu conselho. Como foi?".
+4. **Aprendizados que voltam na hora certa:** tabela `aprendizados(id, texto, gatilhos JSON,
+   criado_em, mostrado_em)`. Gatilhos tirados do texto (termos, categorias, estados: "quando ela
+   chega cansada" → ESTADO cansada). Quando um registro novo casa com o gatilho, a revisão e o
+   Hoje mostram o seu aprendizado.
+5. **O que ela diz (retorno dela):** perguntas para fazer A ELA sobre a relação ("Tem algo que
+   eu possa fazer melhor por você?", "O que te fez se sentir cuidada este mês?"...), no mesmo
+   esquema das perguntas profundas (categoria "Nós dois"); a resposta é 🟢 dela e, no mês,
+   aparece lado a lado com o seu check-in ("o que eu achei" × "o que ela disse").
+6. **Intenção do mês:** sugerida pelos dados (ex.: poucas alegrias registradas → "notar o que a
+   deixa feliz"); você escolhe ou escreve; lembrete gentil no meio do mês; revisão no fim.
+7. **Desentendimentos e reparos** (incluído pelo usuário): tabela `reparos(id, data, aconteceu,
+   eu_senti, ela_pode_ter_sentido (🔵 até ela dizer), faria_diferente, conversamos (null/sim/
+   não), reparo, tema, intensidade 1-3, criado_em, acompanhado_em)`. **Só a sua parte — não
+   existe campo "o que ela errou".** Depois de 2-3 dias: "Vocês conversaram sobre aquilo?".
+   Tema repetido (3 vezes) → "esse assunto voltou 3 vezes; talvez valha uma conversa calma".
+   Se ficarem frequentes e intensos (≥ 3 de intensidade 3 em 30 dias) → sugere, com cuidado,
+   conversar com ela ou com um profissional.
+8. **Admiração e gratidão:** "o que admiro nela" em uma linha (tabela `admiracoes`), que
+   alimenta cartas e a reflexão.
+9. **Ajuda para cartas:** escolhe a ocasião; o app junta blocos dos registros (marcos, frases
+   dela 🟢, coisas que ela gosta, momentos felizes, admirações) para marcar; monta um esqueleto
+   de carta só com o que foi escolhido (frases-modelo "Lembro de quando…"); você escreve e
+   guarda (tabela `cartas`, 🔒).
+10. **Cuidar de você:** se o seu check-in de presença cair por 3 semanas seguidas → "As últimas
+   semanas parecem mais pesadas para você. Como você está?" (sem diagnóstico).
+
+#### 20.9.1 Como ficou (07/10/2026)
+
+- **Tabelas** (esquema v1): `checkins(id, tipo semanal|mensal, periodo AAAA-Www|AAAA-MM, respostas JSON,
+  presenca 1-5, criado_em, atualizado_em)` (única por tipo + período); `atitudes(id, texto, data,
+  registro_id, trecho, jeito, criado_em)`; `aprendizados(id, texto, gatilhos JSON, criado_em,
+  mostrado_em, data, registro_id, trecho)`; `reparos(id, data, aconteceu, eu_senti,
+  ela_pode_ter_sentido, ela_certeza, faria_diferente, conversamos, reparo, tema, intensidade 1-3,
+  criado_em, acompanhado_em, registro_id, trecho)`; `admiracoes(id, texto, data, registro_id, trecho,
+  criado_em)`; `cartas(id, ocasiao, titulo, texto, blocos JSON, criado_em, atualizado_em)`;
+  `intencoes(id, mes único, texto, origem sugerida|escrita, sugestao, criado_em, revisao, revisada_em)`.
+- **Extras** `atitude`, `aprendizado`, `reparo`, `admiracao` (deixam o registro 🔒; `fora_da_ia`
+  continua valendo mesmo com a caixinha desmarcada) e `aprendizado_lembrete` (não deixa 🔒; é só um
+  lembrete — desde a integração é `{opcional: true}` na revisão e o `extrair` lê os aprendizados por
+  `conhecimento.consultar`, 20.10; a referência fraca ao diário ficou só de reserva).
+- **Regras**: atitudes em 1ª pessoa no passado com "jeito" (cuidado, presença, escuta, espaço, carinho,
+  ajuda, interesse, desculpas, gratidão, conselho); aprendizado ("aprendi que", "da próxima vez",
+  "nota mental:"); desentendimento só com sujeito "a gente/nós/eu e ela", intensidade por palavras,
+  **só a sua parte** (campo estranho no reparo → 400 `SO_A_SUA_PARTE`); o que ela pode ter sentido com a
+  certeza da frase (🔵 até ela dizer); admiração.
+- **Check-in semanal** (sexta a domingo: a semana que acaba; segunda a quinta: a que passou), até 2
+  ganchos da semana real + "Uma coisa boa que você fez por ela"; escala de presença em 5 emojis, nunca
+  número. **Reflexão mensal** do dia 25 em diante. **Espelho** por semana e mês (cada linha com os
+  registros), tendência em texto. **Atitudes × APOIO** dela (combina / descompasso como pergunta).
+  **O que ela diz** lê `perguntas_feitas` (Nós dois). **Intenção do mês** sugerida com o porquê.
+  **Reparos**: "Vocês conversaram sobre aquilo de <dia>?" de 2 a 7 dias depois; tema repetido 3× em
+  180 dias; 3 de intensidade 3 em 30 dias → conversar com ela ou com um profissional (sem diagnóstico).
+  **Cuidar de você** quando a presença pesa 3 semanas. **Cartas** com blocos só do registrado e
+  esqueleto montado no servidor.
+- **Ciclo nunca explica nada aqui**: registros que outros recursos deixam fora da IA (menos as
+  respostas de Nós dois) não viram semana difícil, gatilho, momento dela nem bloco de carta.
+- **Hoje**: `eu_checkin`, `eu_mes` (desligáveis em Ajustes → 🪞), `eu_intencao`, `eu_reparo`, `eu_tema`,
+  `eu_cuidado_relacao`, `eu_aprendizado`, `eu_cuidar`, `eu_carta`; chaves sem conteúdo.
+- **Rotas** (todas de sessão): `GET /api/eu`, `GET|POST /api/eu/checkin`, `GET /api/eu/checkins`,
+  `DELETE /api/eu/checkins/{id}`, `GET /api/eu/mes`, `GET /api/eu/espelho`, atitudes, aprendizados
+  (+ `/{id}/lembrei`), reparos, admirações, intenção, cartas (+ `blocos`, `esqueleto`).
+- **Telas**: `#eu`, `#eu/checkin[/AAAA-Www]`, `#eu/mes[/AAAA-MM]`, `#eu/aprendizados`, `#eu/reparos`,
+  `#eu/cartas`; Ajustes → 🪞 Área Eu.
+
+### 20.10 Integração dos recursos (07/10/2026)
+
+Os nove recursos foram escritos em paralelo sobre a fundação (20.0.1) e depois juntados. Vale junto com
+20.0 a 20.9; onde discordarem, vale esta. Testes em `testes/test_integracao.py` (cada proteção nova
+falha com ela desligada; conferido por mutação).
+
+**O que os recursos pediram e entrou no centro**
+- **Resumo da importação**: um recurso só aparece em `recursos` quando o arquivo trouxe linhas dele
+  (listas com conteúdo; versão e ajustes não contam) ou quando o `importar` contou algo (> 0). Todo
+  recurso exporta a sua parte mesmo vazia; antes, "0 marcos novos" de sete recursos enchia a prévia. Só
+  dados de recurso novos (registros repetidos) já não dizem "nada novo para juntar".
+- **`conhecimento.consultar`** (`motor.Conhecimento`, campo novo, fora da comparação e da IA): a leitura
+  do diário aberto para o `extrair` (é o `Banco.consultar`, só leitura). É uma função, não o método:
+  o `extrair` recebe cópias do conhecimento, e copiar o método copiaria o Banco. Usam: a área Eu (o
+  aprendizado na revisão) e o ciclo (o aviso de planejamento na revisão).
+- **Gancho `discretos(banco) -> set[int]`** (o ciclo): registros cujo texto fica só na tela do recurso.
+  O Hoje mostra "🔒 Um registro reservado (abra para ver)." em "Últimos registros" (sem pessoas nem
+  categorias, `discreto: true`), Pessoas não cita a frase (`Banco.mencoes(..., excluir=)`) nem mostra a
+  anotação solta dele como informação da pessoa, e a ligação "mesma pessoa" não o usa. Na dúvida (um
+  recurso não abriu ou o gancho falhou), todos os 🔒 também. Os itens tirados da frase do ciclo o
+  próprio ciclo descarta ao gravar (o humor de outra frase do mesmo registro continua valendo).
+- **Gancho `cartoes_mostrados(banco, referencia, cartoes)`**: depois do anti-excesso, cada recurso sabe
+  quais cartões dele apareceram (`[{chave sem o prefixo, nivel, tipo, dados}]`, num ponto de salvamento).
+  As perguntas passaram a gravar "sugerida" aqui (antes gravavam no `cartoes_hoje`, mesmo quando o cartão
+  ficava de fora num dia cheio — e o espaço entre sugestões contava sem a pessoa ter visto nada).
+- **Anti-excesso das sugestões**: a do núcleo (sobre ela, agora) vem primeiro; depois as dos recursos com
+  relevância ≥ `alertas.SUGESTAO_URGENTE` (70), pela relevância; as outras num **rodízio pelo dia**
+  (ordenadas pelo NOME, deslocadas pelo número do dia). Continua no máximo 1 por fornecedor e 2 no total.
+  Medido num mês de teste: sem o rodízio, as ideias de presente (45 dias antes de cada data) ocupavam a
+  vaga todo dia e a pergunta da semana nunca aparecia; com ele, cada recurso tem a sua vez.
+- **`Banco.transacao()` sem mudança não regrava**: o arquivo só é recifrado e gravado quando
+  `total_changes` mudou (o Hoje abre um ponto de salvamento para `cartoes_mostrados` a cada visita).
+- **`texto.termos`** com as stopwords normalizadas uma vez só (mesmo resultado; era 90% do tempo do
+  `GET /api/eu` num diário de 400 registros).
+- **Regras**: "conheci/comi/perdi/recebi/assisti…" (1ª pessoa do pretérito em -i) e "trouxe, quis, pude,
+  soube, pus" contam como passado em `regras/datas.py` ("conheci os pais dela em 12/03" era 12/03 do ano
+  que vem); "pedi/falei/contei" continuam fala. **Data mais adiante no ano com verbo no passado continua
+  indo para a próxima** ("reservei o restaurante dia 25 de outubro" é um plano; o marco ajusta o dele):
+  perder um lembrete seria pior. Data logo depois de "até"/"antes do" é **prazo**: não é aniversário nem
+  se repete ("comprar o presente de aniversário dela até dia 25" virava o aniversário dela em 25/10, todo
+  ano). Acontecimento logo depois de "perguntar dos/sobre/como foi" não leva a data ("perguntar dos
+  exames da mãe dela na sexta": a sexta é de perguntar). Nome com maiúscula logo depois de palavra de
+  lugar em minúsculas, e o resto de um nome de lugar ("Museu do Ipiranga"), não é pessoa (20.5.1).
+  "muito/tanto/mais/bem/demais…" sozinhos não são alvo de gosto ("não curtiu muito").
+- **Lembrete da conversa** confirmado descarta o acontecimento das regras da mesma frase e data (20.7.1).
+- **Planejamento do ciclo na revisão** (20.8.1).
+
+**Página (`web/app.js`): o contrato `window.EntreNos` ganhou**
+- `abrirRegistrar({texto, data, contexto, humor, privado, juntar, organizar, aoSalvar})` → `{ok}` ou
+  `{ok: false, motivo: 'revisao'|'bloqueado'}`: preenche o rascunho (com `juntar`, embaixo do que já
+  estava, sem repetir), abre o Registrar com o cursor no fim ou já organiza; `aoSalvar(id)` é chamado
+  quando ESTE rascunho for salvo (vários podem esperar o mesmo; trocar o texto esquece os anteriores).
+  Com uma revisão aberta, mostra a revisão e não mexe em nada.
+- `rascunhoAtual()` → cópia de `{texto, data, contexto, humor, privado, emRevisao}`.
+- `registrarAcaoRegistrar(id, rotulo, acao(rascunho, {limpar, focar}))`: botão ao lado do Organizar.
+- `registrarModoRegistrar(id, rotulo, aoEscolher(rascunho), dica?())`: no alto do Registrar, ao lado de
+  "✍️ Texto livre".
+- `registrarRevisaoExtra(tipo, render, {opcional: true})`: extra só informativo; salvar sem decidir não
+  pede confirmação (a revisão diz "É só um lembrete").
+- Eventos em `window`: `entrenos:registro-salvo` `{id, privado}` e `entrenos:bloqueado` (ao ir para o
+  portão).
+- As telas das perguntas, da anotação rápida e da conversa deixaram de mexer nos campos do Registrar
+  pelos ids (`#reg-*`) e de observar a tela (`MutationObserver`): usam só o contrato.
+
+**Decisões de integração**
+- `web/telas/<nome>.css` pode ter estilo do recurso (o `index.html` carrega); hoje todos ficaram só com o
+  comentário e usam as classes do `estilo.css`.
+- `PATCH /api/registros/{id} {privado: false}` num registro que um recurso deixa fora da IA continua
+  aceito (a caixinha só muda o 🔒 do usuário; ele continua fora pelo `fora_da_ia`, e a tela trava a
+  caixinha com o `fora_da_ia` do `GET`).
+- Texto com algum extra `_privado` continua sem ✨ e com 403 em `/api/ia/analisar` **mesmo que a pessoa
+  escolha "Não guardar"** o extra: o texto é o mesmo; na dúvida, fica fora da IA.
+- Itens das regras que um recurso tira das telas centrais: o recurso os deixa "descartados" pelo
+  `banco.atualizar_item` dentro do `gravar_extras` (ciclo, lembrete da conversa) — continuam no registro
+  e dá para reativar. É o jeito oficial (não há gancho separado).
+
+**Testado (07/10/2026):** a suíte inteira. Um mês fictício pela API, com o servidor em processo (pasta
+temporária, PIN de teste) e o "hoje" do núcleo andando dia a dia de 06/06 a 19/10/2026: 35 registros
+cobrindo os nove recursos (5 ciclos com sintomas e o que ajuda; perguntas sugeridas e respondidas,
+inclusive uma de Nós dois; presentes e desejos com o aniversário de namoro chegando; promessas com
+cumprimento; anotação rápida organizada depois com a data de quando foi anotada; lugares; marcos;
+conversa guiada; atitudes, aprendizado que volta na revisão, desentendimento com acompanhamento,
+check-ins semanais e mensal, intenção, admiração e carta). Conferido: anti-excesso e textos do Hoje todo
+dia (nunca uma palavra do ciclo visível), perfil (Pessoas e Como ela está sem o ciclo), as telas de cada
+recurso pelas rotas, exportar → importar num diário vazio (nada perdido; de novo, nada duplicado),
+apagar registro levando junto o que depende dele (e sumindo da exportação), uma IA falsa local que não
+recebeu nada do ciclo, da área Eu, das respostas de Nós dois nem do 🔒, e bloquear/desbloquear. A página
+(`app.js` e as nove telas) rodou num DOM de mentira no Node (Electron como Node), falando com esse
+servidor: todas as telas e o Hoje de cada dia do mês sem "undefined/null/NaN", sem caixa de erro, sem
+campo sem rótulo, sem HTML montado nem estilo inline, e os fluxos novos (abrirRegistrar, ação e modo do
+Registrar, extras opcionais, eventos); cinco mutações na página foram todas pegas. Nada abriu navegador,
+`.exe`, PyInstaller ou ISCC, e o núcleo continua sem ter rodado num Pyodide de verdade.
+
+#### 20.10.1 Correção final das etapas 2-4 (07/10/2026)
+
+Três revisões independentes (privacidade, português, telas) acharam 43 problemas; o que mudou está
+abaixo, cada mudança com teste de regressão (as frases do revisor viraram casos nos testes do recurso).
+
+**O texto também decide o que fica fora da IA** (privacidade; contrato da fundação)
+- `recursos.fica_fora_pelo_texto(extras)` + o atributo opcional **`TIPOS_FORA_PELO_TEXTO`** de cada
+  recurso: os tipos de extra (dos que pedem 🔒) que deixam o TEXTO fora da IA mesmo sem confirmar ("Não
+  guardar" ou sem decidir). Sem o atributo, nenhum (só o confirmado conta, como antes). O ciclo lista
+  todos os dele; a área Eu, só `reparo` (um desentendimento); as perguntas, só `pergunta_feita` (o
+  `marca_privado` delas só pede 🔒 para Nós dois): uma atitude sua não confirmada ("levei café pra ela")
+  continua podendo ir para a IA.
+
+- `nucleo.texto_fica_fora_da_ia(texto, referencia, banco)` roda as regras no texto (com pessoas e o nome
+  dela, sem a leitura do diário) e guarda só sim/não por um resumo (hash) do texto (esquecido ao
+  bloquear). Na dúvida (recurso que não abriu ou não leu o texto), sim, menos ao gravar.
+- `POST /api/registros`: texto assim é gravado 🔒 com `privado: true` e o aviso
+  `AVISO_PRIVADO_GRAVADO` (o aviso da revisão já prometia). Desmarcar a caixinha depois não o manda
+  para a IA: `nucleo.fora_da_ia_pelo_texto(banco, ids)` confere o texto do que está para ir — achados do
+  ✨ busca (com nova busca sem eles, até 3 voltas, e conferência final), itens do contexto da ✨ sugestão
+  (até completar o máximo), o `fora_da_ia` do detalhe (`GET /api/registros/{id}`, a tela trava a caixinha)
+  e o `privado` de cada achado da busca comum. Ler o diário inteiro a cada pedido custaria ~9 ms por
+  registro; por isso só o que iria para a IA é lido.
+- O ✨ Analisar continua recusando (403) qualquer texto com extra `_privado` (20.10).
+
+**Ciclo: um vocabulário só**
+- `ciclo.texto_fala_do_ciclo(texto)` = o `extrair` acha algum dado (o mesmo critério da revisão e do
+  403); o `fora_da_ia`/`discretos` do ciclo usa isso, com um pré-filtro LIKE que cobre tudo o que o
+  `extrair` reconhece ("ciclo", "período", "desceu", "regra", "cólica", "fluxo"; com e sem acento composto)
+  e uma memória sim/não por texto. "A regra dela" entrou no vocabulário. "Cólica" sozinha também deixa o
+  registro discreto e fora da IA (já escondia o ✨; a decisão em aberto de 20.8.1 continua valendo: se
+  ela mudar, o `extrair` muda e tudo acompanha).
+- **Gancho `reservado(texto) -> bool`** (o ciclo: tem palavra do ciclo) e `recursos.texto_reservado`
+  (na dúvida, sim). `alertas.sem_o_reservado` (no `carregar`, que Hoje, perfil, Presentes e Lugares usam):
+  de registro discreto, item com palavra reservada no resumo/alvo sai, e humor/padrão/o que ajuda tirado
+  de uma frase com essas palavras sai — **confirmado ou não**, e também para registros antigos. O resto
+  fica, sem citar a frase (`Dados.trecho` = ""; a tela cita o resumo): "Consulta — 01/10" continua no Hoje.
+  O `_afastar_itens` do ciclo (confirmado) agora também mantém o acontecimento de resumo neutro.
+- `recursos.sem_frases_reservadas(valor, discretos)`: Presentes e Lugares (painel e cartões) e as
+  promessas (indício, momento, o que ajuda, acontecimentos no mesmo dia) não citam a frase do ciclo de um
+  registro discreto (`trecho`/`reacao` = "" e `reservado: true`; a tela diz "🔒 Frase reservada").
+- **Garantia final do Hoje** (`alertas._sem_palavras_reservadas`): cartão de recurso ligado a registro
+  discreto com palavra reservada no texto, porquê ou dados vira "🔒 Um aviso reservado (abra o registro
+  para ver)", com a mesma chave e os mesmos registros. A anotação rápida mostra "🔒 Uma anotação reservada
+  (abra para ver)." no cartão do Hoje (`discreto: true`); o texto continua na tela dela. O lembrete
+  sensível da semana leva ao registro (o resumo da semana não o mostra).
+- O "Últimos registros" já era discreto; Semana também passa a filtrar pelo `reservado` dos discretos.
+- **Período fértil**: regular ou não pelos últimos 6 intervalos de verdade, **incluindo** os fora do
+  padrão e o longo que você confirmou (só o "faltou registrar um mês?" sem resposta fica de fora). A faixa
+  continua saindo dos ciclos parecidos; com um ciclo bem diferente, aviso de irregular e nada de fértil.
+- Hábito e condição não são sintoma do dia ("sempre fica com enxaqueca quando menstrua", "quando está com
+  cólica, chá ajuda"); "terminou/acabou de menstruar" é fim, com a data.
+
+**IA**: a lista de linguagem de controle (17.3) cobre as paráfrases da revisão ("para ela perceber o que
+perdeu", "sentir a sua ausência", "até ela procurar você", "sem avisar", "sem resposta", "dar um tempo nas
+mensagens", "exigir", "outra mulher na frente dela", "para ver a reação", "o celular dela", "enquanto ela
+dorme"...), e as instruções da sugestão dizem que todo gesto é em direção a ela.
+
+**Apagar**: apagar um item tira também as chaves dispensadas de recurso com a origem dele
+(`%:data:<id>:%`, como "presentes:ocasiao:data:12:2026-10-20"), no diário e nas cópias.
+
+**Português (regras e textos)**
+- Área Eu: o aprendizado volta só quando o estado dela casa (sem negação, sem outra pessoa no meio; termo e
+  categoria sozinhos não bastam), com sinônimos ("exausta" faz voltar "cansada"); risada e verbo não são
+  gatilho; "da próxima vez que ela estiver nervosa, vou..." e "aprendi com ela que" viram aprendizado;
+  "aprendi a" só sobre ela; a revisão mostra `gatilhos_rotulos` ("ela cansada"). Admiração só por ela
+  ("admiro meu pai", "admiro a mãe dela" não). Check-in: promessa com prazo à frente pergunta "Já deu para
+  cumprir…?" com "O prazo é daqui a 2 dias"; evento sem a data repetida. Espelho sem a palavra "período".
+- Perguntas: "não lembro o que ela respondeu" e "ela respondeu." sozinho não são resposta; "desconversou",
+  "ficou quieta", "fugiu do assunto" são recusa; "acho que perguntei" deixa a resposta no máximo 🔵; o
+  porquê põe o tempo antes ("Anteontem ela falou de...") e não se contradiz com a lacuna.
+- Semana: lembrete com "perguntar sexta como foi..." é a próxima sexta; "mt", "e foi tenso" e ";" na lista
+  de assuntos; "O que ela contou" sem promessa nem desentendimento seu.
+- Marcos: "faz 2 anos hoje que", "amanhã faz 1 ano que" (âncora no dia dito); "como se fosse ontem" não é
+  data.
+- Presentes: ideia que contradiz o que ela disse sai (grupos: flores ⊃ girassóis, álcool ⊃ vinho; e
+  restrição); "já apareceu ligado a presentes" só com registro de presente (senão "costuma ser um bom
+  presente"); o cartão da ocasião deixa de fora o que talvez já foi realizado (a tela os mostra em
+  "✔️ Talvez já realizado"); "presenteei ela com", "lista de desejos dela tem", "de presente da X",
+  "flores minhas", "ingresso pro show de X".
+- Promessas: "combinei com o Pedro de..." sem ela não é promessa; "prometi... que vou" fica "prometi"; o
+  indício não casa preposição com assunto ("para" ≠ "paraty").
+- Lugares: "achou caro mas gostou" é opinião; a viagem com a precisão dita ("novembro").
+- Regras (`regras/itens.py`): "a avó que tá doente" é da avó; "triste ontem mas hoje tá ótima" e
+  "cansada e triste" dão os dois estados; "parou de beber vinho" é restrição; "mt" não é alvo de gosto.
+
+**Telas**: Presentes e Lugares salvam a reação/opinião com um botão "Salvar" (as setas do teclado num
+select fechado não gravam mais a cada tecla) e o foco volta ao mesmo select; o filtro de opinião devolve o
+foco ao botão; sem `aria-expanded` fixo; Presentes vazio ainda mostra o que foi escondido; 🌙 "O que ajuda"
+apaga todas as anotações do grupo; intenção do mês com o campo "Como está indo?" e um formulário só por
+cartão; "Nós dois" recusada sem "a resposta está no registro"; prazo das promessas no resumo da semana com
+a precisão dita; CSS: listas em grade `minmax(0, 1fr)` e citação com `overflow-wrap: anywhere`.
+
+**Testado (07/10/2026, correção final):** a suíte inteira (1.860 testes); três proteções desligadas uma a
+uma (o texto na IA, o `reservado`, o vocabulário do ciclo) fazem os testes delas falharem; o mês fictício
+pela API refeito (06/06 a 19/10, 26 registros, metade dos extras sem confirmar): Hoje de cada dia sem
+palavra do ciclo e com o anti-excesso, telas dos recursos sem o ciclo, IA falsa sem nada do ciclo, da área
+Eu, de Nós dois nem do 🔒, exportar → importar sem duplicar, apagar e bloquear/desbloquear. A página rodou
+no DOM de mentira (Electron como Node) contra o servidor em processo: todas as telas sem
+"undefined/null/NaN", sem campo sem rótulo, sem HTML montado; e os fluxos novos (Salvar da reação e da
+opinião com o foco de volta, "Talvez já realizado", "Como está indo?", um formulário só, apagar o grupo do
+"O que ajuda", Hoje sem o ciclo). Nenhum navegador, `.exe`, PyInstaller ou ISCC.
+
+**Fica para depois**
+- APOIO "X ajuda (quando ela…)" nas regras (o presentes ligaria "Para este momento" mais vezes): não
+  entrou porque, em frase do ciclo, criaria um "o que ajuda" com as palavras do ciclo quando o extra não
+  é confirmado.
+- Nome de lugar sem palavra de lugar antes ("o Ibirapuera") ainda pode virar "Pessoa nova" na revisão.
+- Data mais adiante no ano com verbo no passado (acima): fica como está, por decisão de segurança.
+- "Cólica" sozinha no ciclo (20.8.1): decisão do usuário.
+- (20.10.1) A sugestão de lugar ainda aparece todos os dias da semana ISO (o revisor pediu 1 ou 2 dias;
+  mudaria o contrato de 20.5.1 e pede uma decisão). "Um livro da Mariana" sem a Mariana reconhecida como
+  pessoa continua com "da Mariana" na descrição (com um nome com maiúscula pode ser a marca: "perfume da
+  Natura"). A pergunta "Tem algo que eu possa fazer melhor por você?" não liga a "o que ela acha que eu
+  poderia fazer melhor" (só uma raiz em comum). Algumas frases de lugar ("detestou o hotel em Santos",
+  "não quer voltar naquele bar da Augusta", "o café é o melhor da cidade") ainda não viram opinião.
+

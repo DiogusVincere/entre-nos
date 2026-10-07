@@ -191,6 +191,11 @@
     ultimaRequisicao: Date.now(),
     iaConfig: null,          // resposta de GET /api/ia/config: só enquanto a área da IA está aberta na tela
     iaAreaAte: 0,            // quando a área da IA se fecha sozinha (Date.now() + 10 min)
+    // Registrar aberto por um recurso (EntreNos.abrirRegistrar, seção 20.10): quem avisar quando ESTE
+    // rascunho for salvo (lista de funções), organizar assim que o formulário aparecer, cursor no fim.
+    aoSalvar: null,
+    organizarAoAbrir: false,
+    cursorNoFim: false,
   };
   let tokenMemoria = null;
   let contadorIds = 0;
@@ -198,6 +203,21 @@
   // Conteúdo de arquivo que precisa esperar um passo (o texto do JSON entre a prévia e o "Juntar"):
   // cada tela que guarda algo assim registra aqui como esquecer, e trocar de tela ou bloquear esquece.
   const esquecedoresArquivo = new Set();
+
+  // ---------------------------------------------------------------- recursos (seção 20.0)
+  // Cada recurso tem web/telas/<nome>.js, carregado depois deste arquivo, que se encaixa pelas
+  // funções de window.EntreNos (no fim deste arquivo). Este arquivo não muda quando um recurso entra.
+  const ROTAS_DO_NUCLEO = new Set(['hoje', 'registrar', 'ela', 'datas', 'buscar', 'registros', 'ajustes']);
+  const ABAS_DO_NUCLEO = new Set(['pessoas', 'preferencias', 'como']);
+  const RE_ID_RECURSO = /^[a-z][a-z0-9_-]{0,39}$/;
+  const cartoesHoje = new Map();      // tipo do cartão (ou NOME do recurso) -> render(cartao, ctx) -> Node
+  const abasEla = [];                 // {id, emoji, nome, render(painel, ctx)}
+  const secoesAjustes = [];           // {id, emoji, nome, render(corpo, ctx)}
+  const revisaoExtras = new Map();    // tipo do extra (ou NOME do recurso) -> render(extra, ctx) -> Node
+  const revisaoOpcionais = new Set(); // extras só informativos: salvar sem decidir não pede confirmação
+  const menusRecursos = [];           // {rota, rotulo, icone, grupo}
+  const acoesRegistrar = [];          // {id, rotulo, acao(rascunho, ctx)}: botões ao lado do Organizar
+  const modosRegistrar = [];          // {id, rotulo, aoEscolher(rascunho), dica()}: no alto do Registrar
 
   function rascunhoVazio() {
     return { texto: '', data: hojeIso(), contexto: '', humor: '', privado: false };
@@ -645,16 +665,19 @@
   }
 
   // "🔒 Não enviar este registro para a IA" (seção 17.1.5). aoMudar(marcado, caixa).
-  function caixaPrivado(id, marcado, aoMudar) {
+  // `travado` (texto): a caixinha fica marcada e sem mudar, e o texto diz por quê (seção 20.0:
+  // um recurso, como o ciclo, deixa o registro fora da IA).
+  function caixaPrivado(id, marcado, aoMudar, travado = null) {
     const idDica = `${id}-dica`;
     const caixa = h('input', {
-      id, type: 'checkbox', checked: Boolean(marcado), 'aria-describedby': idDica,
+      id, type: 'checkbox', checked: Boolean(marcado) || Boolean(travado), disabled: Boolean(travado),
+      'aria-describedby': idDica,
       onchange: (e) => aoMudar(e.target.checked, e.target),
     });
     return h('div', { class: 'opcao-privado' },
       h('label', { class: 'opcao-linha', for: id }, caixa,
         h('span', null, h('span', { 'aria-hidden': 'true' }, '🔒 '), 'Não enviar este registro para a IA')),
-      h('p', { class: 'dica', id: idDica }, 'Marcado, ele nunca sai deste computador: fica fora do que a IA analisa, busca ou usa para sugerir. As regras continuam usando o registro normalmente.'));
+      h('p', { class: 'dica', id: idDica }, travado || 'Marcado, ele nunca sai deste computador: fica fora do que a IA analisa, busca ou usa para sugerir. As regras continuam usando o registro normalmente.'));
   }
 
   // Campo de PIN que o navegador não trata como senha de site: "one-time-code" faz o
@@ -714,6 +737,50 @@
       h('h2', null, 'Algo não deu certo'),
       h('p', null, (e && e.message) || 'Tente de novo em instantes.'),
       h('button', { type: 'button', class: 'botao botao-secundario', onclick: () => rotear() }, 'Tentar de novo'));
+  }
+
+  // ---------------------------------------------------------------- pedaços desenhados pelos recursos (seção 20.0)
+
+  // O desenho que um recurso registrou para este cartão ou extra (pelo `tipo`, senão pelo NOME do
+  // recurso). Sem desenho, ou se ele falhar, null: quem chamou usa o cartão genérico.
+  function conteudoDeRecurso(mapa, obj, recurso, ctx) {
+    const render = mapa.get(obj.tipo) || mapa.get(recurso);
+    if (typeof render !== 'function') return null;
+    try {
+      const n = render(obj, ctx);
+      return n instanceof Node || Array.isArray(n) ? n : null;
+    } catch {
+      return null;      // um recurso com defeito não apaga o resto da tela
+    }
+  }
+
+  // Uma área preenchida por um recurso: `render(caixa, ctx)` desenha dentro da caixa (pode ser
+  // assíncrono); se devolver um nó, ele entra na caixa. Erro vira uma mensagem só ali dentro.
+  function montarDeRecurso(render, ctx, classe) {
+    const caixa = h('div', { class: classe });
+    const falhou = (e) => {
+      if (e && e.bloqueio) return;
+      limpar(caixa);
+      inserir(caixa, h('p', { class: 'erro-campo', role: 'alert' },
+        (e && e.message) || 'Esta parte não abriu agora. Tente de novo mais tarde.'));
+    };
+    const juntar = (n) => {
+      if (n instanceof Node || Array.isArray(n)) inserir(caixa, n);
+    };
+    try {
+      const r = render(caixa, ctx);
+      if (r && typeof r.then === 'function') r.then(juntar, falhou);
+      else juntar(r);
+    } catch (e) {
+      falhou(e);
+    }
+    return caixa;
+  }
+
+  // "🌙 Ciclo" -> ['🌙', 'Ciclo']; sem emoji no começo -> ['', texto].
+  function separarEmoji(titulo) {
+    const partes = /^([^\p{L}\p{N}]+?)\s+(\S.*)$/u.exec(String(titulo || ''));
+    return partes ? [partes[1], partes[2]] : ['', String(titulo || '')];
   }
 
   function selo(certeza) {
@@ -1117,7 +1184,8 @@
       bruto = '';
     }
     const [nome, ...partes] = bruto.split('/');
-    return ROTAS[nome] ? { nome, partes } : { nome: 'hoje', partes: [] };
+    // Só as rotas de verdade (as daqui e as dos recursos), nunca nomes herdados como "toString".
+    return Object.prototype.hasOwnProperty.call(ROTAS, nome) ? { nome, partes } : { nome: 'hoje', partes: [] };
   }
 
   function irPara(hash) {
@@ -1131,7 +1199,35 @@
       else a.removeAttribute('aria-current');
     });
     const mais = $('#botao-mais');
-    if (mais) mais.classList.toggle('ativo', ['datas', 'registros', 'ajustes'].includes(rota));
+    if (mais) {
+      mais.classList.toggle('ativo', ['datas', 'registros', 'ajustes', ...menusRecursos.map((m) => m.rota)].includes(rota));
+    }
+  }
+
+  // Os itens de menu dos recursos (seção 20.0): no menu lateral (computador), antes de Ajustes; no
+  // celular, dentro de "Mais" (a barra de baixo fica com Hoje, Ela, Registrar, Buscar e Mais).
+  // Agrupados por `grupo`, na ordem em que cada grupo apareceu.
+  function desenharMenusRecursos() {
+    document.querySelectorAll('[data-menu-recurso]').forEach((el) => el.remove());
+    const lateral = $('.nav-lateral .nav-lista');
+    const antesLateral = lateral ? (lateral.querySelector('a[data-rota="ajustes"]') || {}).parentElement || null : null;
+    const mais = $('#menu-mais');
+    const antesMais = mais ? mais.querySelector('a[data-rota="ajustes"]') : null;
+    const grupos = [...new Set(menusRecursos.map((m) => m.grupo))];
+    for (const grupo of grupos) {
+      for (const m of menusRecursos.filter((x) => x.grupo === grupo)) {
+        if (lateral) {
+          lateral.insertBefore(h('li', { 'data-menu-recurso': m.rota, 'data-grupo': grupo },
+            h('a', { href: `#${m.rota}`, 'data-rota': m.rota },
+              h('span', { class: 'nav-icone', 'aria-hidden': 'true' }, m.icone), h('span', null, m.rotulo))), antesLateral);
+        }
+        if (mais) {
+          mais.insertBefore(h('a', { href: `#${m.rota}`, 'data-rota': m.rota, 'data-menu-recurso': m.rota, 'data-grupo': grupo },
+            h('span', { 'aria-hidden': 'true' }, m.icone), ` ${m.rotulo}`), antesMais);
+        }
+      }
+    }
+    if (estado.modo === 'app') marcarNav(lerRota().nome);
   }
 
   async function rotear() {
@@ -1192,8 +1288,17 @@
   // ================================================================ portão (primeiro uso, bloqueio)
 
   function mostrarPortao(conteudo) {
+    const saindoDoApp = estado.modo === 'app';
     estado.modo = 'portao';
     estado.atalho = null;
+    // As telas dos recursos esquecem o que guardaram (seção 20.10).
+    if (saindoDoApp) {
+      try {
+        window.dispatchEvent(new CustomEvent('entrenos:bloqueado'));
+      } catch {
+        // navegador sem CustomEvent: nada a avisar
+      }
+    }
     // Só o rascunho (o que a pessoa está escrevendo agora) fica. A revisão cita trechos de
     // registros antigos e os ajustes trazem dados dela: com a tela bloqueada, nada disso
     // deve continuar na memória da página.
@@ -1894,13 +1999,16 @@
   function cartaoAlerta(a, grupo, ul) {
     const ids = lista(a.registro_ids);
     const li = h('li', { class: ['cartao', 'alerta', `alerta-${a.nivel}`] });
+    const sair = () => {
+      li.remove();
+      if (!ul.children.length) grupo.remove();
+    };
     const dispensar = async (ev) => {
       const botao = ev.currentTarget;   // depois do await, currentTarget já é null
       botao.disabled = true;
       try {
         await api('POST', '/alertas/dispensar', { chave: a.chave });
-        li.remove();
-        if (!ul.children.length) grupo.remove();
+        sair();
         avisar('Pronto, esse aviso não volta mais.');
       } catch (e) {
         if (!e.bloqueio) {
@@ -1909,7 +2017,22 @@
         }
       }
     };
-    inserir(li, 
+    // Cartão de recurso (seção 20.0) com desenho próprio: o recurso desenha o miolo; o "dispensar"
+    // é o mesmo de sempre (a chave fica guardada e o cartão não volta).
+    if (a.recurso) {
+      const proprio = conteudoDeRecurso(cartoesHoje, a, a.recurso, {
+        dispensar: async () => { await api('POST', '/alertas/dispensar', { chave: a.chave }); sair(); },
+        remover: sair,
+        recarregar: () => rotear(),
+        botaoDispensar: () => h('button', { type: 'button', class: 'botao botao-texto', onclick: dispensar }, 'Dispensar'),
+      });
+      if (proprio) {
+        if (RE_ID_RECURSO.test(String(a.recurso))) li.classList.add(`cartao-recurso-${a.recurso}`);
+        inserir(li, proprio);
+        return li;
+      }
+    }
+    inserir(li,
       h('p', { class: 'alerta-texto' }, a.texto || ''),
       a.data ? h('p', { class: 'sutil' }, `${diaComSemana(a.data)} · ${textoDias(diasAte(a.data))}`) : null,
       h('div', { class: 'alerta-acoes' },
@@ -1991,6 +2114,7 @@
     };
 
     const form = h('form', { class: 'cartao form-registro', novalidate: true, onsubmit: (e) => { e.preventDefault(); organizar(); } },
+      modosDoRegistrar(),
       campo('O que ela te contou?', texto),
       erro,
       h('div', { class: 'campo campo-data' }, h('label', { for: 'reg-data' }, 'Quando foi?'), data),
@@ -2000,9 +2124,31 @@
         campo('Onde ou como vocês conversaram', contexto),
         campo('Como ela estava', humor)),
       h('div', { class: 'acoes' }, botao,
+        acoesRegistrar.map((a) => botaoAcaoRegistrar(a, main, atual)),
         h('span', { class: 'sutil atalho' }, 'ou Ctrl+Enter')));
 
     estado.atalho = organizar;
+    // Aberto por um recurso (abrirRegistrar): organiza na hora ou deixa o cursor no fim do texto,
+    // depois de a tela focar o título (o leitor de tela anuncia onde está).
+    const organizarJa = estado.organizarAoAbrir && Boolean(r.texto.trim());
+    const cursorNoFim = estado.cursorNoFim;
+    estado.organizarAoAbrir = false;
+    estado.cursorNoFim = false;
+    if (organizarJa || cursorNoFim) {
+      setTimeout(() => {
+        if (!atual() || !texto.isConnected) return;
+        if (organizarJa) {
+          organizar();
+          return;
+        }
+        texto.focus();
+        try {
+          texto.setSelectionRange(texto.value.length, texto.value.length);
+        } catch {
+          // nem todo navegador deixa posicionar o cursor; tudo bem
+        }
+      }, 0);
+    }
     inserir(main,
       cabecalho('Registrar', 'Conte do seu jeito, como contaria a um amigo. Nada é salvo antes de você revisar.', '✍️'),
       form,
@@ -2013,6 +2159,131 @@
           h('li', null, 'O que você viu ou percebeu vira ', selo('observado'), '.'),
           h('li', null, '“Acho que…” vira ', selo('inferencia'), ', e só você pode confirmar depois.'),
           h('li', null, 'Datas como “dia 20”, “sexta que vem” ou “em novembro” viram lembretes.'))));
+  }
+
+  // ---------------------------------------------------------------- Registrar: o que os recursos acrescentam (20.10)
+
+  // Uma cópia do que está sendo escrito (os recursos nunca mexem no rascunho direto).
+  function copiaDoRascunho() {
+    const r = estado.rascunho;
+    return {
+      texto: r.texto || '', data: r.data || hojeIso(), contexto: r.contexto || '', humor: r.humor || '',
+      privado: Boolean(r.privado), emRevisao: Boolean(estado.revisao),
+    };
+  }
+
+  // "✍️ Texto livre" e os outros jeitos de registrar (registrarModoRegistrar), no alto do formulário.
+  function modosDoRegistrar() {
+    if (!modosRegistrar.length) return null;
+    const dicas = [];
+    const botoes = [h('button', { type: 'button', class: 'botao botao-secundario botao-escolha', 'aria-pressed': 'true' }, '✍️ Texto livre')];
+    for (const m of modosRegistrar) {
+      botoes.push(h('button', {
+        type: 'button', class: 'botao botao-secundario botao-escolha', 'aria-pressed': 'false',
+        onclick: () => {
+          try {
+            m.aoEscolher(copiaDoRascunho());
+          } catch (e) {
+            avisarErro(e);
+          }
+        },
+      }, m.rotulo));
+      if (m.dica) {
+        try {
+          const d = m.dica();
+          if (typeof d === 'string' && d.trim()) dicas.push(d.trim());
+        } catch {
+          // a dica é opcional: sem ela, o botão continua
+        }
+      }
+    }
+    return [h('div', { class: 'escolha-inicio', role: 'group', 'aria-label': 'Jeito de registrar', id: 'reg-modos' }, botoes),
+      dicas.map((d) => h('p', { class: 'dica' }, d))];
+  }
+
+  // Um botão de recurso ao lado do Organizar (registrarAcaoRegistrar): recebe uma cópia do rascunho e
+  // `limpar()` (esvazia o formulário depois de usar o texto, como o "Guardar para organizar depois").
+  function botaoAcaoRegistrar(a, main, atual) {
+    const botao = h('button', { type: 'button', class: 'botao botao-secundario', id: `reg-acao-${a.id}` }, a.rotulo);
+    botao.addEventListener('click', async () => {
+      if (botao.disabled) return;
+      botao.disabled = true;
+      let limpou = false;
+      const ctx = {
+        limpar: () => {
+          limpou = true;
+          estado.rascunho = rascunhoVazio();
+          estado.aoSalvar = null;
+        },
+        focar: () => {
+          const t = $('#reg-texto');
+          if (t) t.focus();
+        },
+      };
+      try {
+        await a.acao(copiaDoRascunho(), ctx);
+      } catch (e) {
+        if (!(e && e.bloqueio)) avisarErro(e);
+      } finally {
+        if (botao.isConnected) botao.disabled = false;
+      }
+      if (limpou && atual() && estado.modo === 'app' && lerRota().nome === 'registrar' && !estado.revisao) {
+        limpar(main);
+        desenharFormulario(main, atual);
+        const t = $('#reg-texto');
+        if (t) t.focus();
+      }
+    });
+    return botao;
+  }
+
+  // EntreNos.abrirRegistrar({texto, data, contexto, humor, privado, juntar, organizar, aoSalvar}): abre
+  // Registrar com o texto (juntar: embaixo do que já estava escrito, sem repetir) e, com `organizar`,
+  // já vai para a revisão. `aoSalvar(id)` é chamado quando ESTE rascunho for salvo. Com uma revisão
+  // aberta nada muda: a tela mostra a revisão e a resposta é {ok: false, motivo: 'revisao'}.
+  function abrirRegistrar(opcoes) {
+    const o = opcoes && typeof opcoes === 'object' ? opcoes : {};
+    if (estado.modo !== 'app') return { ok: false, motivo: 'bloqueado' };
+    if (estado.revisao) {
+      irPara('#registrar');
+      return { ok: false, motivo: 'revisao' };
+    }
+    const r = estado.rascunho;
+    if (typeof o.texto === 'string') {
+      if (o.juntar && r.texto.trim()) {
+        if (!normalizar(r.texto).includes(normalizar(o.texto))) r.texto = `${r.texto.replace(/\s+$/, '')}\n\n${o.texto}`;
+      } else {
+        r.texto = o.texto;
+        estado.aoSalvar = null;            // outro texto: quem esperava o anterior não espera este
+      }
+    }
+    if (typeof o.data === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(o.data)) r.data = o.data;
+    if (typeof o.contexto === 'string') r.contexto = o.contexto;
+    if (typeof o.humor === 'string') r.humor = o.humor;
+    if (typeof o.privado === 'boolean') r.privado = o.privado;
+    if (typeof o.aoSalvar === 'function') estado.aoSalvar = [...(estado.aoSalvar || []), o.aoSalvar];
+    estado.organizarAoAbrir = Boolean(o.organizar) && Boolean(r.texto.trim());
+    estado.cursorNoFim = !estado.organizarAoAbrir;
+    irPara('#registrar');
+    return { ok: true };
+  }
+
+  // Depois de salvar: quem abriu o Registrar fica sabendo (e qualquer tela, pelo evento).
+  function avisarRegistroSalvo(id, aoSalvar, privado) {
+    if (id == null) return;
+    for (const fn of lista(aoSalvar)) {
+      try {
+        const talvez = fn(id);
+        if (talvez && typeof talvez.catch === 'function') talvez.catch(() => {});
+      } catch {
+        // o registro já está salvo; o recurso cuida do resto
+      }
+    }
+    try {
+      window.dispatchEvent(new CustomEvent('entrenos:registro-salvo', { detail: { id, privado: Boolean(privado) } }));
+    } catch {
+      // navegador sem CustomEvent: só o aoSalvar vale
+    }
   }
 
   function novaRevisao(proposta, conhecidas) {
@@ -2034,10 +2305,43 @@
       ia: null,                // {usada, avisos, removidos} quando os cartões vieram da IA
       iaAvisos: null,          // avisos de uma tentativa em que nenhuma IA respondeu
       iaEsperando: false,
+      // O que os recursos acharam (seção 20.0). Ficam ao trocar regras <-> IA (a IA nunca os vê).
+      extras: extrasDaProposta(proposta),
       itens: [], relacoes: [], ambiguas: [], avisos: [], motor: 'regras',
     };
     trocarProposta(rev, proposta, null);
     return rev;
+  }
+
+  // {NOME: [extra]} da proposta -> lista plana, cada extra com o recurso e a decisão do usuário:
+  // _estado 'pendente' (ainda não decidiu: não é guardado), 'confirmado' ou 'removido'.
+  // `_privado` vem do servidor: guardar este extra deixa o registro 🔒 (fora da IA).
+  function extrasDaProposta(proposta) {
+    const brutos = proposta && proposta.extras && typeof proposta.extras === 'object' && !Array.isArray(proposta.extras)
+      ? proposta.extras : {};
+    const saida = [];
+    for (const [recurso, itens] of Object.entries(brutos)) {
+      for (const e of lista(itens)) {
+        if (!e || typeof e !== 'object' || typeof e.tipo !== 'string' || typeof e.trecho !== 'string') continue;
+        saida.push(Object.assign(clonar(e), { _recurso: recurso, _estado: 'pendente', _idx: saida.length }));
+      }
+    }
+    return saida;
+  }
+
+  // Extra só informativo (registrarRevisaoExtra(..., {opcional: true})): pelo tipo, depois pelo NOME.
+  function extraOpcional(e) {
+    return revisaoOpcionais.has(e.tipo) || (!revisaoExtras.has(e.tipo) && revisaoOpcionais.has(e._recurso));
+  }
+
+  // Algum extra confirmado deixa o registro fora da IA? (o servidor confere de novo ao gravar)
+  function privadoForcado(rev) {
+    return lista(rev.extras).some((e) => e._privado && e._estado === 'confirmado');
+  }
+
+  // O texto tem algo que nunca vai para a IA (mesmo sem guardar o extra): o ✨ não aparece.
+  function textoForaDaIA(rev) {
+    return lista(rev.extras).some((e) => e._privado);
   }
 
   // Troca os cartões da revisão pelos de outra proposta (regras ou IA). As pessoas (com os
@@ -2098,6 +2402,8 @@
           h('ul', { class: 'lista-cartoes' }, rev.itens.map((it) => cartaoRevisaoItem(it, rev)))]
         : h('p', { class: 'sutil' }, 'Não encontrei nada específico para organizar. O texto será guardado assim mesmo, e aparece na busca.')));
 
+    if (rev.extras.length) inserir(main, secaoExtras(rev));
+
     const removidos = rev.ia ? lista(rev.ia.removidos) : [];
     if (removidos.length) {
       inserir(main, secao('🧹 O que a IA tirou',
@@ -2130,12 +2436,77 @@
     estado.atalho = salvarRevisao;
   }
 
+  // ---------------------------------------------------------------- revisão: o que os recursos acharam (seção 20.0)
+
+  function secaoExtras(rev) {
+    return secao(`🧩 Mais coisas que eu notei (${rev.extras.length})`,
+      h('p', { class: 'sutil' }, 'Confirme o que quer guardar. O que não for confirmado não é salvo.'),
+      h('ul', { class: 'lista-cartoes' }, rev.extras.map((e) => cartaoRevisaoExtra(e, rev))));
+  }
+
+  // "presente_desejado" -> "Presente desejado" (quando o recurso não desenha o próprio cartão).
+  function rotuloExtra(e) {
+    return capitalizar(String(e.tipo || e._recurso || 'informação').replace(/_/g, ' '));
+  }
+
+  function corpoExtraGenerico(e) {
+    return [
+      h('div', { class: 'item-topo' },
+        h('span', { class: 'tipo' }, h('span', { 'aria-hidden': 'true' }, '🧩 '), rotuloExtra(e))),
+      e.resumo ? h('p', { class: 'extra-resumo' }, e.resumo) : null,
+      e.trecho ? citacao(e.trecho) : null,
+    ];
+  }
+
+  // Um extra na revisão: o miolo é do recurso (registrarRevisaoExtra) ou o genérico (resumo e
+  // trecho); confirmar / não guardar / desfazer são sempre daqui.
+  function cartaoRevisaoExtra(e, rev) {
+    const li = h('li', { class: 'cartao item-revisao extra-revisao' });
+    const mudar = (novo, fala) => {
+      e._estado = novo;
+      desenhar();
+      focarPrimeiro(li);
+      falar(fala);
+      if (e._privado) redesenharAreaIA(rev);       // a caixinha 🔒 trava ou destrava
+    };
+    function desenhar() {
+      limpar(li);
+      li.classList.toggle('removido', e._estado === 'removido');
+      li.classList.toggle('confirmado', e._estado === 'confirmado');
+      if (e._estado === 'removido') {
+        inserir(li,
+          h('p', { class: 'sutil' }, `“${encurtar(e.resumo || e.trecho, 90)}” não será guardado.`),
+          h('button', { type: 'button', class: 'botao botao-texto', onclick: () => mudar('pendente', 'De volta: ainda não confirmado.') }, '↩️ Desfazer'));
+        return;
+      }
+      const proprio = conteudoDeRecurso(revisaoExtras, e, e._recurso, { recurso: e._recurso, revisao: rev, redesenhar: desenhar });
+      const confirmado = e._estado === 'confirmado';
+      inserir(li,
+        proprio || corpoExtraGenerico(e),
+        e._privado ? h('p', { class: 'dica' }, h('span', { 'aria-hidden': 'true' }, '🔒 '),
+          'Guardar isto deixa o registro fora da IA.') : null,
+        extraOpcional(e) && e._estado === 'pendente'
+          ? h('p', { class: 'sutil' }, 'É só um lembrete: dá para salvar sem decidir nada aqui.') : null,
+        h('div', { class: 'acoes' },
+          confirmado
+            ? [h('span', { class: 'chip chip-confirmado' }, h('span', { 'aria-hidden': 'true' }, '✔️ '), 'Vai ser guardado'),
+              h('button', { type: 'button', class: 'botao botao-texto', onclick: () => mudar('pendente', 'Desfeito: ainda não confirmado.') }, '↩️ Desfazer')]
+            : [h('button', { type: 'button', class: 'botao botao-secundario botao-pequeno', onclick: () => mudar('confirmado', 'Confirmado: vai ser guardado.') }, '✔️ Confirmar'),
+              h('button', { type: 'button', class: 'botao botao-texto botao-perigo-texto', onclick: () => mudar('removido', 'Não vai ser guardado. Use Desfazer para trazer de volta.') }, '🗑️ Não guardar')]));
+    }
+    desenhar();
+    return li;
+  }
+
   // ---------------------------------------------------------------- revisão: ✨ Analisar a fundo com IA
 
   // Caixinha "não enviar para a IA", botão ✨ (com IA configurada e registro não privado),
   // quem respondeu e "Voltar ao que as regras entenderam".
   function desenharAreaIARevisao(caixa, rev) {
     limpar(caixa);
+    const travado = privadoForcado(rev)
+      ? 'Este registro vai ficar 🔒: ele tem informações que nunca vão para a IA. Para mudar isso, deixe de guardar essas informações.'
+      : null;
     inserir(caixa, caixaPrivado('rev-privado', rev.privado, (marcado) => {
       rev.privado = marcado;
       estado.rascunho.privado = marcado;       // "Voltar ao texto" mantém a escolha
@@ -2143,11 +2514,14 @@
       const c = caixa.querySelector('#rev-privado');
       if (c) c.focus();
       falar(marcado ? 'Marcado: este registro não vai para a IA.' : 'Desmarcado: este registro pode ir para a IA quando você pedir.');
-    }));
+    }, travado));
     if (rev.privado && rev.ia) {
       inserir(caixa, h('p', { class: 'nota-importante' }, 'Este texto já foi lido pela IA nesta revisão. Depois de salvo, ele não vai mais para a IA.'));
     }
-    if (iaConfigurada() && !rev.privado) {
+    if (iaConfigurada() && !rev.privado && textoForaDaIA(rev)) {
+      inserir(caixa, h('p', { class: 'dica' }, 'Este texto tem informações que nunca vão para a IA: quem organiza aqui são só as regras.'));
+    }
+    if (iaConfigurada() && !rev.privado && !textoForaDaIA(rev)) {
       const rotulo = rev.iaEsperando ? '✨ A IA está lendo…' : (rev.ia ? '✨ Analisar de novo com IA' : '✨ Analisar a fundo com IA');
       inserir(caixa,
         h('div', { class: 'barra-ia' },
@@ -2190,7 +2564,7 @@
   }
 
   async function analisarComIA(rev) {
-    if (rev.iaEsperando || rev.privado || estado.revisao !== rev) return;
+    if (rev.iaEsperando || rev.privado || textoForaDaIA(rev) || estado.revisao !== rev) return;
     if (assinaturaItens(rev.itens) !== rev._assinatura) {
       const ok = await confirmar({
         titulo: 'Trocar os cartões pelos da IA?',
@@ -2606,16 +2980,23 @@
         item_novo: r.item_novo == null ? null : mapa.get(r.item_novo),
         status: r._decisao === 'confirmada' || r._decisao === 'descartada' ? r._decisao : 'pendente',
       }));
+    // Só os extras confirmados, por recurso, sem as marcas internas (o servidor confere tudo de novo).
+    const extras = Object.create(null);
+    for (const e of lista(rev.extras)) {
+      if (e._estado !== 'confirmado') continue;
+      (extras[e._recurso] = extras[e._recurso] || []).push(semInternos(e));
+    }
     return {
       corpo: {
         texto: rev.texto,
         data_registro: rev.data_registro,
         contexto: String(rev.contexto || '').trim() || null,
         humor: String(rev.humor || '').trim() || null,
-        privado: Boolean(rev.privado),
+        privado: Boolean(rev.privado) || privadoForcado(rev),
         itens,
         pessoas: rev.pessoas.filter((p) => !p._ignorar).map(semInternos),
         relacoes,
+        extras,
       },
       atualizar: rev.relacoes.filter((r) => r._decisao === 'atualizar' && r.item_antigo_id != null
         && (r.item_novo == null || mapa.has(r.item_novo))),
@@ -2625,6 +3006,20 @@
   async function salvarRevisao() {
     const rev = estado.revisao;
     if (!rev || estado.salvando) return;
+    // Extras ainda sem decisão não são guardados: melhor perguntar do que perder em silêncio
+    // (menos os só informativos, como "um aprendizado seu", registrados com {opcional: true}).
+    const pendentes = lista(rev.extras).filter((e) => e._estado === 'pendente' && !extraOpcional(e)).length;
+    if (pendentes) {
+      estado.salvando = true;            // um Ctrl+Enter a mais não abre outro diálogo
+      const ok = await confirmar({
+        titulo: 'Salvar sem essas informações?',
+        texto: `${pendentes} ${plural(pendentes, 'informação', 'informações')} em “Mais coisas que eu notei” ainda não ${plural(pendentes, 'foi confirmada', 'foram confirmadas')} e não ${plural(pendentes, 'vai', 'vão')} ser ${plural(pendentes, 'guardada', 'guardadas')}.`,
+        ok: 'Salvar assim',
+        cancelar: 'Voltar e conferir',
+      });
+      estado.salvando = false;
+      if (!ok || estado.revisao !== rev) return;
+    }
     const botao = $('#rev-salvar');
     estado.salvando = true;
     if (botao) {
@@ -2633,9 +3028,10 @@
     }
     const { corpo, atualizar } = montarCorpoRegistro(rev);
     let id = null;
+    let resposta = null;
     try {
-      const r = await api('POST', '/registros', corpo);
-      id = r && r.id != null ? r.id : null;
+      resposta = await api('POST', '/registros', corpo);
+      id = resposta && resposta.id != null ? resposta.id : null;
     } catch (e) {
       estado.salvando = false;
       if (botao && botao.isConnected) {
@@ -2646,11 +3042,18 @@
       return;
     }
     // Gravado: a revisão acaba aqui, mesmo que o passo seguinte falhe.
+    const aoSalvar = estado.aoSalvar;
     estado.revisao = null;
     estado.rascunho = rascunhoVazio();
+    estado.aoSalvar = null;
     estado.salvando = false;
     if (atualizar.length && id != null) await atualizarPreferenciasAntigas(id, atualizar);
-    avisar('Guardado com carinho 💙');
+    // `privado`: um extra deixou o registro 🔒; `avisos`: a parte de um recurso que não foi guardada.
+    const forcado = Boolean(resposta && resposta.privado);
+    avisarRegistroSalvo(id, aoSalvar, forcado || corpo.privado);
+    avisar(forcado ? 'Guardado com carinho 💙 Ele ficou 🔒 fora da IA.' : 'Guardado com carinho 💙');
+    lista(resposta && resposta.avisos).filter((a) => typeof a === 'string' && a)
+      .slice(forcado ? 1 : 0).forEach((a) => avisar(a, 'erro'));
     irPara(id != null ? hrefRegistro(id) : '#registros');
   }
 
@@ -2698,6 +3101,7 @@
     if (!ok) return;
     estado.revisao = null;
     estado.rascunho = rascunhoVazio();
+    estado.aoSalvar = null;
     avisar('Descartado. Nada foi salvo.');
     rotear();
   }
@@ -2705,7 +3109,9 @@
   // ================================================================ tela: Conhecendo Ela
 
   async function telaEla(main, partes, atual) {
-    const aba = ABAS_ELA.some((a) => a.id === partes[0]) ? partes[0] : 'pessoas';
+    // As abas do núcleo e, depois, as dos recursos (registrarAbaEla, seção 20.0).
+    const abas = [...ABAS_ELA, ...abasEla];
+    const aba = abas.some((a) => a.id === partes[0]) ? partes[0] : 'pessoas';
     inserir(main, carregando());
     const [perfil, cadastro] = await Promise.all([
       api('GET', '/perfil'),
@@ -2718,16 +3124,20 @@
     const pessoas = lista(p.pessoas).map((x) => Object.assign({}, porId.get(x.id) || {}, x));
 
     const painel = h('div', { class: 'painel-aba', role: 'tabpanel', id: 'painel-ela', tabindex: '0' });
-    const botoes = ABAS_ELA.map((a) => h('button', {
+    const botoes = abas.map((a) => h('button', {
       type: 'button', role: 'tab', id: `aba-${a.id}`, 'aria-controls': 'painel-ela',
       'aria-selected': String(a.id === aba), tabindex: a.id === aba ? '0' : '-1',
       onclick: () => escolher(a.id, true),
-    }, h('span', { class: 'aba-icone', 'aria-hidden': 'true' }, a.emoji + ' '), a.nome));
+    }, a.emoji ? h('span', { class: 'aba-icone', 'aria-hidden': 'true' }, a.emoji + ' ') : null, a.nome));
     const paineis = {
       pessoas: () => painelPessoas(pessoas),
       preferencias: () => painelPreferencias(p.preferencias || {}),
       como: () => painelComoEsta(p.como_ela_esta || {}),
     };
+    // Aba de recurso: render(painel, {perfil, pessoas, atual}) desenha dentro (pode buscar na API).
+    for (const a of abasEla) {
+      paineis[a.id] = () => montarDeRecurso(a.render, { perfil: p, pessoas, atual }, 'painel-recurso');
+    }
     function escolher(id, focar) {
       botoes.forEach((b) => {
         const sel = b.id === `aba-${id}`;
@@ -2756,9 +3166,10 @@
         else if (e.key === 'End') novo = botoes.length - 1;
         if (novo == null) return;
         e.preventDefault();
-        escolher(ABAS_ELA[novo].id, true);
+        escolher(abas[novo].id, true);
       },
     }, botoes);
+    if (abas.length > ABAS_ELA.length) barra.classList.add('abas-muitas');    // quebram linha no celular
 
     inserir(main, cabecalhoEla(p.ela || {}), barra, painel, legendaSelos());
     escolher(aba, false);
@@ -3343,7 +3754,8 @@
         reg.contexto || reg.humor ? h('ul', { class: 'chips-info' },
           reg.contexto ? h('li', { class: 'chip-info' }, h('span', { 'aria-hidden': 'true' }, '📍 '), reg.contexto) : null,
           reg.humor ? h('li', { class: 'chip-info' }, h('span', { 'aria-hidden': 'true' }, '🙂 '), `Ela estava: ${reg.humor}`) : null) : null),
-      h('div', { class: 'cartao cartao-privado' }, caixaPrivado(novoId('det-privado'), Boolean(reg.privado), marcarPrivado)),
+      h('div', { class: 'cartao cartao-privado' }, caixaPrivado(novoId('det-privado'), Boolean(reg.privado), marcarPrivado,
+        reg.fora_da_ia === true ? 'Este registro fica 🔒 fora da IA: ele tem informações que nunca vão para a IA.' : null)),
       secao('O que foi organizado', itens.length
         ? h('ul', { class: 'lista-cartoes' }, itens.map((it) => cartaoItemSalvo(it, recarregar)))
         : h('p', { class: 'sutil' }, 'Nenhum item separado. O texto está guardado e aparece na busca.')),
@@ -3537,11 +3949,21 @@
       secaoSeguranca(c),
       secaoAparencia(),
       secaoDados(),
+      secoesAjustes.map((s) => secaoDeRecurso(s, atual)),
       secaoHistorico(),
       secaoPrivacidade(),
       secaoIA(),
       secaoSair(),
       h('p', { class: 'sutil centro versao' }, `Entre Nós${estado.servidor && estado.servidor.versao ? ` · versão ${estado.servidor.versao}` : ''}`));
+  }
+
+  // Seção de Ajustes de um recurso (registrarSecaoAjustes, seção 20.0): o cartão e o título são
+  // daqui; render(corpo, {config, salvarConfig, atual}) desenha dentro.
+  function secaoDeRecurso(s, atual) {
+    const id = novoId('aj-recurso');
+    return h('section', { class: 'cartao', 'aria-labelledby': id, 'data-recurso': s.id },
+      h('h2', { id }, s.emoji ? h('span', { 'aria-hidden': 'true' }, s.emoji + ' ') : null, s.nome),
+      montarDeRecurso(s.render, { config: estado.config || {}, salvarConfig, atual }, 'corpo-recurso'));
   }
 
   function secaoDadosDela(c) {
@@ -4057,7 +4479,9 @@
     const homonimos = novas.filter((x) => typeof x.parecida_com === 'string' && x.parecida_com)
       .map((x) => `${x.rotulo} vai entrar como pessoa nova, e você já tem ${x.parecida_com}. Se for a mesma pessoa, cancele, deixe a relação igual à do arquivo (em Conhecendo Ela → Pessoas) e veja a prévia de novo.`);
     const avisos = [...homonimos, ...lista(p.avisos).filter((a) => typeof a === 'string' && a.trim())];
-    const temAlgo = novos > 0 || pessoasNovas > 0 || completadas > 0 || marcados > 0;
+    // O que cada recurso junta (seção 20.0): {novos, texto} vindo do `importar` dele.
+    const { textos: textosRecursos, novos: novosRecursos } = resumoDosRecursos(p);
+    const temAlgo = novos > 0 || pessoasNovas > 0 || completadas > 0 || marcados > 0 || novosRecursos;
     const titulo = h('h4', { tabindex: '-1' }, temAlgo ? 'O que vai entrar no seu diário' : 'Nada novo para juntar');
     limpar(caixa);
     inserir(caixa, h('div', { class: 'previa-importacao' },
@@ -4079,7 +4503,8 @@
         completadas > 0
           ? linhaNumero('🧷', completadas, 'pessoa ganha informações que faltavam aqui', 'pessoas ganham informações que faltavam aqui',
             'nada do que já está aqui é trocado', nomesCompletadas)
-          : null),
+          : null,
+        textosRecursos.map((t) => h('li', null, h('span', { 'aria-hidden': 'true' }, '🧩 '), t))),
       avisos.length
         ? h('div', { class: 'avisos-previa' }, h('p', { class: 'rotulo-pequeno' }, 'Avisos'),
           h('ul', null, avisos.map((a) => h('li', null, a))))
@@ -4093,6 +4518,16 @@
     return titulo;
   }
 
+  // {textos, novos} do que os recursos juntam (ou juntariam, na prévia): seção 20.0.
+  function resumoDosRecursos(r) {
+    const deRecursos = Object.values(r && r.recursos && typeof r.recursos === 'object' ? r.recursos : {})
+      .filter((x) => x && typeof x === 'object');
+    return {
+      textos: deRecursos.map((x) => x.texto).filter((t) => typeof t === 'string' && t.trim()),
+      novos: deRecursos.some((x) => Number(x.novos) > 0),
+    };
+  }
+
   // Depois de juntar: quantos entraram, avisos, e o lembrete de que o JSON está sem criptografia.
   function desenharImportado(caixa, r) {
     const v = r.importados;
@@ -4102,7 +4537,8 @@
     const completadas = contagem(r.pessoas_completadas);
     const marcados = contagem(r.registros_marcados_privados);
     const avisos = lista(r.avisos).filter((a) => typeof a === 'string' && a.trim());
-    const mudou = registros > 0 || pessoas > 0 || completadas > 0 || marcados > 0;
+    const { textos: textosRecursos, novos: novosRecursos } = resumoDosRecursos(r);
+    const mudou = registros > 0 || pessoas > 0 || completadas > 0 || marcados > 0 || novosRecursos;
     const titulo = h('h4', { tabindex: '-1' }, mudou ? 'Pronto!' : 'Nada novo entrou');
     let frase = 'Tudo o que estava nesse arquivo já estava no seu diário.';
     if (mudou) {
@@ -4114,12 +4550,14 @@
       if (completadas > 0) extras.push(`${completadas} ${plural(completadas, 'pessoa ganhou', 'pessoas ganharam')} informações que faltavam`);
       if (marcados > 0) extras.push(`${marcados} ${plural(marcados, 'registro passou', 'registros passaram')} a ficar 🔒 fora da IA`);
       frase = [juntou, extras.length ? `${extras.join(' e ')}.` : ''].filter(Boolean).join(' ');
-      frase = frase.charAt(0).toUpperCase() + frase.slice(1);
+      frase = frase ? frase.charAt(0).toUpperCase() + frase.slice(1) : 'Juntei ao seu diário o que era novo:';
     }
     limpar(caixa);
     inserir(caixa, h('div', { class: 'previa-importacao' },
       titulo,
       h('p', null, frase),
+      textosRecursos.length ? h('ul', { class: 'numeros' },
+        textosRecursos.map((t) => h('li', null, h('span', { 'aria-hidden': 'true' }, '🧩 '), t))) : null,
       avisos.length ? h('ul', { class: 'avisos-previa' }, avisos.map((a) => h('li', null, a))) : null,
       h('p', { class: 'nota-importante' }, h('span', { 'aria-hidden': 'true' }, '⚠️ '),
         'O arquivo JSON não tem criptografia. Se não precisar mais dele, apague-o (e esvazie a lixeira).')));
@@ -5223,6 +5661,148 @@
     window.addEventListener('focus', () => verificarInatividade());
   }
 
+  // ================================================================ recursos: window.EntreNos (seção 20.0)
+  //
+  // As telas dos recursos (web/telas/<nome>.js, carregadas depois deste arquivo) se encaixam por aqui.
+  // Contrato:
+  // - registrarTela(rota, render): `#rota/...` chama render(main, partes, atual), como as telas daqui
+  //   (`atual()` diz se a tela ainda é a mesma depois de um await);
+  // - registrarCartaoHoje(tipo, render): cartão do Hoje com `tipo` (ou do recurso com esse NOME):
+  //   render(cartao, {dispensar, remover, recarregar, botaoDispensar}) -> Node (o miolo do cartão);
+  // - registrarAbaEla(id, titulo, render): aba em Conhecendo Ela; render(painel, {perfil, pessoas, atual});
+  // - registrarSecaoAjustes(id, titulo, render): cartão em Ajustes; render(corpo, {config, salvarConfig, atual});
+  // - registrarRevisaoExtra(tipo, render): miolo do cartão de um extra na revisão;
+  //   render(extra, {recurso, revisao, redesenhar}) -> Node (confirmar/não guardar são daqui);
+  // - registrarMenu(rota, rotulo, icone, grupo): item no menu lateral e, no celular, em "Mais".
+  // render que falha não derruba a tela: o cartão genérico (ou uma mensagem) fica no lugar.
+  // Desde a integração (seção 20.10):
+  // - registrarRevisaoExtra(tipo, render, {opcional: true}): extra só informativo (salvar sem decidir
+  //   não pede confirmação);
+  // - abrirRegistrar({texto, data, contexto, humor, privado, juntar, organizar, aoSalvar(id)}) ->
+  //   {ok} | {ok: false, motivo: 'revisao'|'bloqueado'}; rascunhoAtual() -> cópia do que está escrito;
+  // - registrarAcaoRegistrar(id, rotulo, acao(rascunho, {limpar, focar})): botão ao lado do Organizar;
+  // - registrarModoRegistrar(id, rotulo, aoEscolher(rascunho), dica?()): no alto do Registrar,
+  //   ao lado de "✍️ Texto livre";
+  // - eventos em window: 'entrenos:registro-salvo' {id, privado} e 'entrenos:bloqueado' (a página
+  //   bloqueou: esqueça o que a tela guardou).
+
+  function idRecurso(valor, onde) {
+    if (typeof valor !== 'string' || !RE_ID_RECURSO.test(valor)) throw new TypeError(`${onde}: identificador inválido`);
+    return valor;
+  }
+
+  function funcaoRecurso(valor, onde) {
+    if (typeof valor !== 'function') throw new TypeError(`${onde}: render precisa ser uma função`);
+    return valor;
+  }
+
+  function textoRecurso(valor, onde) {
+    if (typeof valor !== 'string' || !valor.trim()) throw new TypeError(`${onde}: texto vazio`);
+    return valor.trim();
+  }
+
+  function registrarTela(rota, render) {
+    idRecurso(rota, 'registrarTela');
+    if (ROTAS_DO_NUCLEO.has(rota)) throw new TypeError('registrarTela: rota do núcleo');
+    ROTAS[rota] = funcaoRecurso(render, 'registrarTela');
+    // A página pode ter aberto já nesta rota (antes de o recurso se registrar).
+    const pedida = location.hash.replace(/^#\/?/, '').split('/')[0];
+    if (estado.modo === 'app' && pedida === rota) rotear();
+  }
+
+  function registrarCartaoHoje(tipo, render) {
+    cartoesHoje.set(idRecurso(tipo, 'registrarCartaoHoje'), funcaoRecurso(render, 'registrarCartaoHoje'));
+  }
+
+  function registrarAbaEla(id, titulo, render) {
+    idRecurso(id, 'registrarAbaEla');
+    if (ABAS_DO_NUCLEO.has(id) || abasEla.some((a) => a.id === id)) throw new TypeError('registrarAbaEla: aba repetida');
+    const [emoji, nome] = separarEmoji(textoRecurso(titulo, 'registrarAbaEla'));
+    abasEla.push({ id, emoji, nome, render: funcaoRecurso(render, 'registrarAbaEla') });
+  }
+
+  function registrarSecaoAjustes(id, titulo, render) {
+    idRecurso(id, 'registrarSecaoAjustes');
+    if (secoesAjustes.some((s) => s.id === id)) throw new TypeError('registrarSecaoAjustes: seção repetida');
+    const [emoji, nome] = separarEmoji(textoRecurso(titulo, 'registrarSecaoAjustes'));
+    secoesAjustes.push({ id, emoji, nome, render: funcaoRecurso(render, 'registrarSecaoAjustes') });
+  }
+
+  function registrarRevisaoExtra(tipo, render, opcoes) {
+    const id = idRecurso(tipo, 'registrarRevisaoExtra');
+    revisaoExtras.set(id, funcaoRecurso(render, 'registrarRevisaoExtra'));
+    if (opcoes && typeof opcoes === 'object' && opcoes.opcional) revisaoOpcionais.add(id);
+    else revisaoOpcionais.delete(id);
+  }
+
+  function registrarAcaoRegistrar(id, rotulo, acao) {
+    idRecurso(id, 'registrarAcaoRegistrar');
+    if (acoesRegistrar.some((a) => a.id === id)) throw new TypeError('registrarAcaoRegistrar: ação repetida');
+    acoesRegistrar.push({ id, rotulo: textoRecurso(rotulo, 'registrarAcaoRegistrar'), acao: funcaoRecurso(acao, 'registrarAcaoRegistrar') });
+  }
+
+  function registrarModoRegistrar(id, rotulo, aoEscolher, dica) {
+    idRecurso(id, 'registrarModoRegistrar');
+    if (modosRegistrar.some((m) => m.id === id)) throw new TypeError('registrarModoRegistrar: modo repetido');
+    modosRegistrar.push({
+      id, rotulo: textoRecurso(rotulo, 'registrarModoRegistrar'), aoEscolher: funcaoRecurso(aoEscolher, 'registrarModoRegistrar'),
+      dica: typeof dica === 'function' ? dica : null,
+    });
+  }
+
+  function registrarMenu(rota, rotulo, icone, grupo = 'recursos') {
+    idRecurso(rota, 'registrarMenu');
+    if (ROTAS_DO_NUCLEO.has(rota) || menusRecursos.some((m) => m.rota === rota)) throw new TypeError('registrarMenu: menu repetido');
+    menusRecursos.push({
+      rota, rotulo: textoRecurso(rotulo, 'registrarMenu'), icone: typeof icone === 'string' ? icone : '',
+      grupo: typeof grupo === 'string' && grupo ? grupo : 'recursos',
+    });
+    desenharMenusRecursos();
+  }
+
+  window.EntreNos = Object.freeze({
+    api,
+    h,
+    selo,
+    navegar: irPara,
+    registrarTela,
+    registrarCartaoHoje,
+    registrarAbaEla,
+    registrarSecaoAjustes,
+    registrarRevisaoExtra,
+    registrarMenu,
+    // Integração (seção 20.10): Registrar aberto e preenchido por um recurso, sem mexer nos campos da tela.
+    abrirRegistrar,
+    rascunhoAtual: copiaDoRascunho,
+    registrarAcaoRegistrar,
+    registrarModoRegistrar,
+    // Ajudantes das telas daqui, para os recursos terem a mesma cara (e não copiarem código).
+    util: Object.freeze({
+      anexar: inserir, limpar, novoId, lista, encurtar, normalizar, capitalizar, plural,
+      cabecalho, secao, campo, carregando, estadoVazio, vazioPequeno, caixaErro, citacao, linkRegistro,
+      hrefRegistro, chipsCategorias, legendaSelos, linhaEntrada, avisar, avisarErro, falar, confirmar,
+      hojeIso, isoDe, paraData, dataBr, dataLonga, diaMes, mesAno, diaComSemana, somarDias, diasAte, textoDias,
+      salvarConfig, focarTitulo,
+    }),
+  });
+
+  // Começa quando a página inteira (com as telas dos recursos, carregadas com `defer` depois deste
+  // arquivo) já rodou: assim o primeiro desenho já tem os cartões, abas e menus de todos.
+  function quandoPronto(fazer) {
+    let feito = false;
+    const uma = () => {
+      if (feito) return;
+      feito = true;
+      fazer();
+    };
+    if (document.readyState === 'complete') {
+      uma();
+      return;
+    }
+    document.addEventListener('DOMContentLoaded', uma, { once: true });
+    window.addEventListener('load', uma, { once: true });
+  }
+
   function iniciar() {
     // O index.html mostra "Abrindo o Entre Nós… se esta mensagem não sumir, falta um arquivo":
     // se este script carregou, a mensagem sai (sem script inline, a CSP continua valendo).
@@ -5230,7 +5810,7 @@
     if (carregando) carregando.remove();
     aplicarTema(lerTema());
     ligarEventos();
-    carregarEstado();
+    quandoPronto(carregarEstado);
   }
 
   iniciar();

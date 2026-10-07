@@ -37,6 +37,11 @@ def normalizar(s: str) -> str:
     return re.sub(r"\s+", " ", sem_acento(s).lower()).strip()
 
 
+# As stopwords já normalizadas, calculadas uma vez (antes, cada chamada a `termos` normalizava as
+# ~200 de novo: era 90% do tempo da área Eu num diário de 400 registros).
+_STOP_NORMALIZADAS: frozenset[str] = frozenset(normalizar(w) for w in STOPWORDS)
+
+
 def palavras(s: str) -> list[str]:
     """Palavras do texto original, na ordem, sem pontuação."""
     return _RE_PALAVRA.findall(s)
@@ -44,8 +49,7 @@ def palavras(s: str) -> list[str]:
 
 def termos(s: str) -> list[str]:
     """Palavras normalizadas e sem stopwords, para busca e relação entre registros."""
-    stop = {normalizar(w) for w in STOPWORDS}
-    return [w for w in (normalizar(p) for p in palavras(s)) if len(w) > 1 and w not in stop]
+    return [w for w in (normalizar(p) for p in palavras(s)) if len(w) > 1 and w not in _STOP_NORMALIZADAS]
 
 
 def frases(texto: str) -> list[tuple[int, int, str]]:

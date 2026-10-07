@@ -11,6 +11,11 @@ para uso interno: `exportar()` e o histórico nunca os trazem.
 Restaurar e importar (seção 18.2): `conferir_integridade` e `resumo` servem para conferir um
 backup antes de trocar o diário; `importar_json` junta ao diário o JSON de `exportar()` sem
 duplicar, tudo numa transação (na prévia, a transação é desfeita e nada é gravado).
+
+Recursos (seção 20.0): cada recurso de `entrenos/recursos/` tem as próprias tabelas, com versão em
+`recursos_esquema` e migrações próprias, dentro do mesmo arquivo cifrado. Eles escrevem pelos
+ajudantes genéricos (`consultar`, `executar`, `inserir`, `atualizar`, `apagar`, `transacao`), que
+recusam mexer nas tabelas centrais, e são chamados em exportar, importar e apagar registro.
 """
 from __future__ import annotations
 
@@ -24,16 +29,18 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import Enum
 from types import EllipsisType
 from typing import Any, Callable, Iterable, Iterator
 
 from . import config as cfg
+from . import recursos
 from .cofre import verificador_valido
 from .modelos import (CATEGORIAS, Certeza, Item, PessoaEncontrada, Precisao, Relacao, TipoItem,
                       item_de_dict, para_json, pessoa_encontrada_de_dict, relacao_de_dict)
 from .texto import frases, normalizar, termos
 
-ESQUEMA_VERSAO = 3
+ESQUEMA_VERSAO = 4
 DADOS_DE_VERSAO_NOVA = "Estes dados foram gravados por uma versão mais nova do Entre Nós."
 STATUS_ITEM = ("ativo", "resolvido", "mudou", "descartado")
 STATUS_RELACAO = ("pendente", "confirmada", "descartada")
@@ -244,8 +251,122 @@ def _migrar_v3(con: sqlite3.Connection) -> None:
     con.execute("DELETE FROM config WHERE chave = 'motor' OR chave LIKE 'motor\\_%' ESCAPE '\\'")
 
 
+# v4 (seção 20.0): a versão das tabelas de cada recurso (entrenos/recursos/). As tabelas são do
+# próprio recurso e migram à parte (Banco._migrar_recursos), no mesmo arquivo cifrado.
+_MIGRACAO_V4 = """
+CREATE TABLE recursos_esquema (
+    nome TEXT PRIMARY KEY,
+    versao INTEGER NOT NULL
+);
+"""
+
 # _MIGRACOES[v] leva o esquema da versão v para v + 1 (texto SQL ou função que recebe a conexão).
-_MIGRACOES: list[str | Callable[[sqlite3.Connection], None]] = [_ESQUEMA_V1, _MIGRACAO_V2, _migrar_v3]
+_MIGRACOES: list[str | Callable[[sqlite3.Connection], None]] = [_ESQUEMA_V1, _MIGRACAO_V2, _migrar_v3,
+                                                                 _MIGRACAO_V4]
+
+
+# ---------------------------------------------------------------- recursos: o que podem mexer
+
+class OperacaoProibida(RuntimeError):
+    """Um recurso tentou mexer no que não é dele (tabela central, gatilho, transação...).
+    É defeito do recurso: o núcleo responde 500 e o log guarda só o tipo."""
+
+
+# Tabelas do esquema central (as do recurso são todas as outras, menos as internas do SQLite e do FTS5).
+_TABELAS_CENTRAIS = frozenset({"config", "registros", "itens", "pessoas", "registro_pessoas", "relacoes",
+                               "alertas_dispensados", "historico", "busca_fts", "recursos_esquema"})
+_RE_NOME_SQL = re.compile(r"[a-z][a-z0-9_]{0,62}")
+_PRAGMAS_DE_LEITURA = frozenset({"data_version", "table_info", "table_xinfo", "index_list", "index_info"})
+
+
+def _acao(nome: str, numero: int) -> int:
+    return getattr(sqlite3, f"SQLITE_{nome}", numero)
+
+
+_LER = frozenset({_acao("SELECT", 21), _acao("READ", 20), _acao("FUNCTION", 31), _acao("RECURSIVE", 33)})
+_GRAVAR = frozenset({_acao("INSERT", 18), _acao("UPDATE", 23), _acao("DELETE", 9)})
+_PRAGMA = _acao("PRAGMA", 19)
+_OK, _NEGAR = _acao("OK", 0), _acao("DENY", 1)
+
+
+def _tabela_central(nome: Any) -> bool:
+    """Tabela do esquema central, interna do SQLite ou do índice de busca (FTS5)."""
+    nome = str(nome or "").lower()
+    return nome in _TABELAS_CENTRAIS or nome.startswith(("sqlite_", "busca_fts"))
+
+
+def _pragma_de_leitura(acao: int, a1: Any, a2: Any) -> bool:
+    # data_version: o FTS5 consulta sozinho; os outros só leem a estrutura de uma tabela.
+    return acao == _PRAGMA and a1 in _PRAGMAS_DE_LEITURA and (a1 != "data_version" or a2 is None)
+
+
+def _autorizar_leitura(acao: int, a1: Any, a2: Any, _banco: Any, _origem: Any) -> int:
+    """`Banco.consultar`: só leitura (em qualquer tabela; o `eu` lê itens, promessas...)."""
+    return _OK if acao in _LER or _pragma_de_leitura(acao, a1, a2) else _NEGAR
+
+
+def _autorizar_escrita(acao: int, a1: Any, a2: Any, _banco: Any, _origem: Any) -> int:
+    """`Banco.executar` e companhia: ler qualquer coisa, gravar só nas tabelas dos recursos.
+    Nada de DDL, PRAGMA que muda algo, ATTACH ou transação (quem abre e fecha é o banco)."""
+    if acao in _LER or _pragma_de_leitura(acao, a1, a2):
+        return _OK
+    if acao in _GRAVAR:
+        return _NEGAR if _tabela_central(a1) else _OK
+    return _NEGAR
+
+
+_DDL_TABELA = {_acao("CREATE_TABLE", 2): 0, _acao("DROP_TABLE", 11): 0, _acao("CREATE_INDEX", 1): 1,
+               _acao("DROP_INDEX", 10): 1, _acao("ALTER_TABLE", 26): 1}
+_ESQUEMA_DO_SQLITE = frozenset({"sqlite_master", "sqlite_schema", "sqlite_sequence"})
+
+
+def _autorizar_esquema(acao: int, a1: Any, a2: Any, _banco: Any, _origem: Any) -> int:
+    """Migração de um recurso: criar, mudar e apagar tabelas e índices DELE (e mexer nos dados
+    delas). Tabela central, gatilho, visão, tabela virtual ou temporária, ATTACH, PRAGMA que
+    muda algo e controle de transação são recusados."""
+    if acao in _LER or _pragma_de_leitura(acao, a1, a2) or acao == _acao("REINDEX", 27):
+        return _OK
+    if acao in _GRAVAR:
+        # O SQLite anota cada CREATE/ALTER/DROP em sqlite_master (e sqlite_sequence).
+        return _OK if a1 in _ESQUEMA_DO_SQLITE or not _tabela_central(a1) else _NEGAR
+    if acao in _DDL_TABELA:
+        tabela = (a1, a2)[_DDL_TABELA[acao]]
+        return _NEGAR if _tabela_central(tabela) else _OK
+    return _NEGAR
+
+
+def _comandos(sql: str) -> list[str]:
+    """Os comandos de um texto SQL separados por ";" (o ";" dentro de um texto não conta)."""
+    comandos, atual = [], ""
+    for pedaco in sql.split(";"):
+        atual += pedaco + ";"
+        if sqlite3.complete_statement(atual):
+            if atual.strip(" \t\r\n;"):
+                comandos.append(atual.strip())
+            atual = ""
+    if atual.strip(" \t\r\n;"):
+        comandos.append(atual.strip())        # incompleto: o SQLite diz o que está errado
+    return comandos
+
+
+def _nao_autorizado(erro: sqlite3.DatabaseError) -> bool:
+    return getattr(erro, "sqlite_errorname", "") == "SQLITE_AUTH" or "not authorized" in str(erro)
+
+
+def _valor_sql(valor: Any) -> Any:
+    """Valor de coluna de um recurso: texto, número e None como estão; data em ISO; lista e dict
+    em JSON; verdadeiro/falso em 1/0."""
+    if valor is None or isinstance(valor, (str, int, float)) and not isinstance(valor, bool):
+        return valor
+    if isinstance(valor, bool):
+        return 1 if valor else 0
+    if isinstance(valor, Enum):
+        return _valor_sql(valor.value)
+    if isinstance(valor, (date, datetime)):
+        return para_json(valor)
+    if isinstance(valor, (dict, list, tuple, set)):
+        return json.dumps(para_json(valor), ensure_ascii=False)
+    raise TypeError("Valor que não cabe numa coluna.")
 
 
 class NaoEncontrado(KeyError):
@@ -555,26 +676,30 @@ _ESTRUTURA = {
     "alertas_dispensados": ("chave", "quando"),
     "historico": ("id", "quando", "acao", "tabela", "linha_id", "resumo"),
     "busca_fts": ("conteudo", "tipo", "ref_id"),
+    "recursos_esquema": ("nome", "versao"),
 }
 # Tabelas com AUTOINCREMENT (os ids nunca se repetem: é o que deixa apagar pelo id nos backups).
+# As dos recursos (com AUTOINCREMENT) entram também em maiores_ids/garantir_ids_acima.
 _TABELAS_COM_ID = ("registros", "itens", "pessoas", "relacoes", "historico")
 # Tabelas que o próprio SQLite pode criar (ANALYZE) e que não mudam o comportamento de nada.
 _ESTATISTICAS_SQLITE = frozenset({"sqlite_stat1", "sqlite_stat4"})
-_OBJETOS_DO_ESQUEMA: frozenset[tuple[str, str]] | None = None
+_OBJETOS_DO_ESQUEMA: tuple[int, frozenset[tuple[str, str]]] | None = None
 
 
 def _objetos_do_esquema() -> frozenset[tuple[str, str]]:
     """(tipo, nome) de tudo o que um diário novo tem em sqlite_master: tabelas, índices,
-    `sqlite_sequence` e as tabelas-sombra do FTS5. Nenhum gatilho, nenhuma visão."""
+    `sqlite_sequence`, as tabelas-sombra do FTS5 e as tabelas dos recursos carregados. Nenhum
+    gatilho, nenhuma visão. Refeito quando a lista de recursos muda."""
     global _OBJETOS_DO_ESQUEMA
-    if _OBJETOS_DO_ESQUEMA is None:
+    geracao = recursos.geracao()
+    if _OBJETOS_DO_ESQUEMA is None or _OBJETOS_DO_ESQUEMA[0] != geracao:
         modelo = Banco.novo()
         try:
-            _OBJETOS_DO_ESQUEMA = frozenset(
-                (l[0], l[1]) for l in modelo._con.execute("SELECT type, name FROM sqlite_master"))
+            _OBJETOS_DO_ESQUEMA = (geracao, frozenset(
+                (l[0], l[1]) for l in modelo._con.execute("SELECT type, name FROM sqlite_master")))
         finally:
             modelo.fechar()
-    return _OBJETOS_DO_ESQUEMA
+    return _OBJETOS_DO_ESQUEMA[1]
 
 
 def _recusar_constante_json(nome: str) -> Any:
@@ -749,6 +874,8 @@ class _Exportacao:
     pessoas: list[_PessoaImportada]
     registros: list[_RegistroImportado]
     com_ajustes: bool               # o arquivo traz ajustes ou avisos dispensados (que não entram)
+    # {NOME do recurso: o que o `exportar` dele gravou}: quem confere é o `importar` do recurso.
+    recursos: dict[str, Any] = field(default_factory=dict)
 
 
 def _ler_pessoa(dados: Any, caminho: str, do_registro: bool = False) -> _PessoaImportada | None:
@@ -869,7 +996,10 @@ def validar_exportacao(dados: Any) -> _Exportacao:
     if ajustes is not None and not isinstance(ajustes, dict):
         raise raiz._erro("config")
     com_ajustes = bool(ajustes) or bool(dados.get("alertas_dispensados"))
-    return _Exportacao(pessoas, registros, com_ajustes)
+    dos_recursos = dados.get("recursos")
+    if dos_recursos is not None and not isinstance(dos_recursos, dict):
+        raise raiz._erro("recursos")
+    return _Exportacao(pessoas, registros, com_ajustes, dict(dos_recursos or {}))
 
 
 def _chave_registro(data_registro: Any, texto: str) -> tuple[Any, str]:
@@ -944,12 +1074,13 @@ class _CadastroParaCasar:
 
 
 def _avisos_da_importacao(exp: _Exportacao, novos: int, sem_trecho: int, relacoes_fora: int,
-                          marcados: int = 0, completadas: int = 0, no_arquivo: int = 0) -> list[str]:
+                          marcados: int = 0, completadas: int = 0, no_arquivo: int = 0,
+                          dos_recursos: bool = False) -> list[str]:
     avisos = []
     if not exp.registros:
         avisos.append("O arquivo não tem registros.")
     elif not novos:
-        if marcados or completadas:
+        if marcados or completadas or dos_recursos:
             avisos.append("Todos os registros deste arquivo já estão no diário; só mudam as marcas e "
                           "informações listadas aqui.")
         else:
@@ -990,6 +1121,7 @@ class Banco:
         # Algo mudou e ainda não foi entregue a um `ao_salvar` que deu certo (ou a migração de um
         # diário antigo). Quem bloqueia só regrava o arquivo se estiver sujo (seção 19.7).
         self._sujo = False
+        self._pontos = 0                # nomes dos pontos de salvamento (escrita dentro de escrita)
 
     @property
     def sujo(self) -> bool:
@@ -1071,11 +1203,82 @@ class Banco:
                     if con.in_transaction:
                         con.execute("ROLLBACK")
                     raise
+            self._migrar_recursos()
+
+    def _migrar_recursos(self) -> None:
+        """As tabelas de cada recurso na versão que o código dele pede (seção 20.0).
+
+        `recursos_esquema` guarda a versão de cada um. Versão gravada maior que a do código = dados de
+        uma versão mais nova (ValueError, como no esquema central). Um passo que falha (inclusive por
+        mexer no que não é do recurso) é desfeito e fica no log: o recurso continua na versão em que
+        estava e o resto do diário abre normalmente (tenta de novo na próxima abertura)."""
+        con = self._con
+        for modulo in recursos.carregados():
+            passos = recursos.esquema(modulo)
+            if not passos:
+                continue
+            nome = modulo.NOME
+            linha = con.execute("SELECT versao FROM recursos_esquema WHERE nome = ?", (nome,)).fetchone()
+            atual = int(linha[0]) if linha else 0
+            if atual > len(passos):
+                raise ValueError(DADOS_DE_VERSAO_NOVA)
+            for v in range(atual, len(passos)):
+                self._sujo = True
+                con.execute("BEGIN")
+                try:
+                    # O SQLite anota CREATE/DROP de tabelas com AUTOINCREMENT em sqlite_sequence (por
+                    # isso o autorizador deixa); os contadores das tabelas centrais não podem mudar.
+                    contadores = self._contadores_centrais()
+                    with self._autorizador(_autorizar_esquema):
+                        if callable(passos[v]):
+                            passos[v](con)
+                        else:
+                            for comando in _comandos(passos[v]):
+                                con.execute(comando)
+                    if self._contadores_centrais() != contadores:
+                        raise OperacaoProibida("O recurso mexeu nos contadores das tabelas centrais.")
+                    con.execute("INSERT OR REPLACE INTO recursos_esquema (nome, versao) VALUES (?, ?)", (nome, v + 1))
+                    con.execute("COMMIT")
+                except Exception as erro:  # noqa: BLE001 - um recurso não impede o diário de abrir
+                    if con.in_transaction:
+                        con.execute("ROLLBACK")
+                    recursos.registrar_erro(erro, nome, f"esquema v{v + 1}")
+                    break
+
+    def _contadores_centrais(self) -> list[tuple]:
+        return [tuple(l) for l in self._con.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+                if _tabela_central(l[0])]
+
+    @contextmanager
+    def _autorizador(self, funcao: Callable[..., int]) -> Iterator[None]:
+        """O que um recurso pode fazer enquanto o comando dele roda (sqlite3 set_authorizer).
+        Trocar o autorizador expira os comandos guardados: nenhum escapa da conferência."""
+        self._con.set_authorizer(funcao)
+        try:
+            yield
+        finally:
+            self._con.set_authorizer(None)
 
     @contextmanager
     def _escrita(self) -> Iterator[sqlite3.Connection]:
-        """Transação de escrita; no fim, entrega os bytes novos a `ao_salvar`."""
+        """Transação de escrita; no fim, entrega os bytes novos a `ao_salvar`.
+
+        Dentro de outra (de `transacao()`, de `importar_json`, de apagar um registro) vira um ponto
+        de salvamento: um erro desfaz só esta parte, e quem abriu a de fora grava uma vez no fim."""
         with self._trava:
+            if self._con.in_transaction:
+                self._pontos += 1
+                ponto = f"ponto_{self._pontos}"
+                self._con.execute(f"SAVEPOINT {ponto}")
+                try:
+                    yield self._con
+                except BaseException:
+                    self._con.execute(f"ROLLBACK TO {ponto}")
+                    self._con.execute(f"RELEASE {ponto}")
+                    raise
+                self._con.execute(f"RELEASE {ponto}")
+                return
+            antes = self._con.total_changes
             self._con.execute("BEGIN IMMEDIATE")
             try:
                 yield self._con
@@ -1084,7 +1287,17 @@ class Banco:
                 if self._con.in_transaction:
                     self._con.execute("ROLLBACK")
                 raise
-            self._salvar_mudanca()
+            # Nada mudou (um recurso abriu uma transação e não precisou escrever, como o Hoje
+            # dizendo quais cartões apareceram): não recifra nem regrava o arquivo à toa.
+            if self._con.total_changes != antes:
+                self._salvar_mudanca()
+
+    @contextmanager
+    def transacao(self) -> Iterator[Banco]:
+        """Várias escritas como uma só: tudo ou nada, e o arquivo é gravado uma vez, no fim.
+        Dentro de outra transação, é um ponto de salvamento (um erro desfaz só o que veio aqui)."""
+        with self._escrita():
+            yield self
 
     def _salvar_mudanca(self) -> None:
         """Depois de um COMMIT: entrega os bytes a `ao_salvar`; só deu certo, deixa de estar sujo."""
@@ -1126,6 +1339,117 @@ class Banco:
     def _busca_item(self, item_id: int, v: dict[str, Any], substituir: bool = False) -> None:
         self._busca_gravar("item", item_id, _texto_busca(v["resumo"], v["trecho"], v["alvo"], v["pessoa"]),
                            substituir)
+
+    # ------------------------------------------------------------ ajudantes dos recursos (seção 20.0)
+    # Os recursos leem qualquer tabela, mas só gravam nas próprias. O SQLite confere cada comando
+    # (autorizador): escrever numa tabela central, DDL, gatilho, ATTACH, PRAGMA que muda algo ou
+    # BEGIN/COMMIT levanta OperacaoProibida. O histórico guarda só "tabela #id criado/atualizado/
+    # apagado" (e os nomes das colunas mudadas), nunca o conteúdo.
+
+    def _comando_de_recurso(self, autorizar: Callable[..., int], sql: Any, parametros: Any,
+                            buscar: bool = False) -> Any:
+        """Roda um comando de recurso com o autorizador ligado (e, com `buscar`, lê as linhas
+        ainda com ele). Devolve o cursor, ou a lista de linhas."""
+        if not isinstance(sql, str):
+            raise TypeError("O comando SQL precisa ser um texto.")
+        try:
+            with self._autorizador(autorizar):
+                cursor = self._con.execute(sql, parametros if parametros is not None else ())
+                return cursor.fetchall() if buscar else cursor
+        except sqlite3.DatabaseError as erro:
+            if _nao_autorizado(erro):
+                raise OperacaoProibida("Um recurso tentou fazer o que só o núcleo faz.") from None
+            raise
+
+    def _tabela_de_recurso(self, tabela: Any) -> str:
+        if not isinstance(tabela, str) or not _RE_NOME_SQL.fullmatch(tabela) or _tabela_central(tabela):
+            raise OperacaoProibida("Esta tabela não é de um recurso.")
+        if self._con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (tabela,)).fetchone() is None:
+            raise OperacaoProibida("Esta tabela não existe.")
+        return tabela
+
+    @staticmethod
+    def _colunas(valores: Any) -> dict[str, Any]:
+        if not isinstance(valores, dict) or not valores:
+            raise ValueError("Nada para gravar.")
+        if any(not isinstance(c, str) or not _RE_NOME_SQL.fullmatch(c) for c in valores):
+            raise OperacaoProibida("Nome de coluna inválido.")
+        if "id" in valores:
+            raise OperacaoProibida("O id é do banco.")
+        return {c: _valor_sql(v) for c, v in valores.items()}
+
+    def consultar(self, sql: str, parametros: Any = ()) -> list[dict]:
+        """Só leitura (SELECT/WITH), em qualquer tabela: [{coluna: valor}] como o SQLite guarda
+        (JSON e datas em texto)."""
+        with self._trava:
+            linhas = self._comando_de_recurso(_autorizar_leitura, sql, parametros, buscar=True)
+        return [dict(l) for l in linhas]
+
+    def executar(self, sql: str, parametros: Any = ()) -> int:
+        """Uma escrita (INSERT, UPDATE ou DELETE) nas tabelas dos recursos; devolve quantas linhas
+        mudaram. Salva o diário no fim (ou no fim da `transacao()` em volta)."""
+        with self._escrita():
+            return self._comando_de_recurso(_autorizar_escrita, sql, parametros).rowcount
+
+    def inserir(self, tabela: str, valores: dict[str, Any], historico: bool = True) -> int:
+        """Linha nova numa tabela do recurso; devolve o id. Listas e dicts viram JSON; datas, ISO."""
+        colunas = self._colunas(valores)
+        with self._escrita():
+            tabela = self._tabela_de_recurso(tabela)
+            novo = self._comando_de_recurso(
+                _autorizar_escrita, f"INSERT INTO {tabela} ({', '.join(colunas)}) VALUES ({_marcas(len(colunas))})",
+                tuple(colunas.values())).lastrowid
+            if historico:
+                self._historico_add("criar", tabela, novo, f"{tabela} #{novo} criado")
+        return novo
+
+    def atualizar(self, tabela: str, id: int, valores: dict[str, Any], historico: bool = True) -> None:
+        """Muda colunas da linha `id` de uma tabela do recurso (NaoEncontrado se não existe)."""
+        colunas = self._colunas(valores)
+        with self._escrita():
+            tabela = self._tabela_de_recurso(tabela)
+            mudou = self._comando_de_recurso(
+                _autorizar_escrita, f"UPDATE {tabela} SET {', '.join(f'{c} = ?' for c in colunas)} WHERE id = ?",
+                (*colunas.values(), _id(id))).rowcount
+            if not mudou:
+                raise NaoEncontrado("Não encontrei isso. Talvez já tenha sido apagado.")
+            if historico:
+                self._historico_add("atualizar", tabela, _id(id),
+                                    f"{tabela} #{_id(id)} atualizado: " + ", ".join(sorted(colunas)))
+
+    def apagar(self, tabela: str, id: int, historico: bool = True) -> None:
+        """Apaga a linha `id` de uma tabela do recurso (NaoEncontrado se não existe). Para tirar a
+        mesma linha das cópias automáticas, a rota usa `nucleo.limpar_copias`."""
+        with self._escrita():
+            tabela = self._tabela_de_recurso(tabela)
+            if not self._comando_de_recurso(_autorizar_escrita, f"DELETE FROM {tabela} WHERE id = ?",
+                                            (_id(id),)).rowcount:
+                raise NaoEncontrado("Não encontrei isso. Talvez já tenha sido apagado.")
+            if historico:
+                self._historico_add("apagar", tabela, _id(id), f"{tabela} #{_id(id)} apagado")
+
+    def esquecer_alertas(self, prefixo: str) -> int:
+        """Tira de `alertas_dispensados` as chaves de um recurso que começam com `prefixo`
+        ("presentes:12:"): a chave pode revelar a data do que foi apagado. Só chaves de recurso."""
+        if not isinstance(prefixo, str) or ":" not in prefixo or \
+                prefixo.split(":", 1)[0] not in recursos.nomes_carregados():
+            raise OperacaoProibida("Só as chaves do próprio recurso (\"<NOME>:...\").")
+        padrao = prefixo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._escrita() as con:
+            return con.execute("DELETE FROM alertas_dispensados WHERE chave LIKE ? ESCAPE '\\'", (padrao,)).rowcount
+
+    def _tabelas_dos_recursos(self) -> list[str]:
+        """Tabelas que não são do esquema central (as dos recursos, mesmo de um que não abriu)."""
+        return [l[0] for l in self._con.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                if not _tabela_central(l[0])]
+
+    def _apagar_dos_recursos(self, rid: int) -> None:
+        """Depois dos ganchos: linha de tabela de recurso com `registro_id` do registro apagado sai
+        (vale também para o recurso que não abriu ou cujo gancho falhou: apagar é apagar)."""
+        for tabela in self._tabelas_dos_recursos():
+            colunas = {l[1] for l in self._con.execute(f'PRAGMA table_info("{tabela}")')}
+            if "registro_id" in colunas:
+                self._con.execute(f'DELETE FROM "{tabela}" WHERE registro_id = ?', (rid,))
 
     # ------------------------------------------------------------ config
 
@@ -1418,11 +1742,16 @@ class Banco:
 
         Pessoas que só existiam por causa dele (sem outra menção, item ou dado próprio)
         também saem: o nome veio do texto apagado.
+
+        Recursos (seção 20.0): antes, o `ao_apagar_registro` de cada um (o registro ainda existe);
+        depois, as linhas das tabelas dos recursos com `registro_id` igual a este saem de todo jeito.
         """
         with self._escrita() as con:
             if self._linha("registros", id) is None:
                 raise NaoEncontrado(f"Registro #{id} não encontrado.")
             rid = _id(id)
+            recursos.ao_apagar_registro(self, rid)
+            self._apagar_dos_recursos(rid)
             ids_itens = [l[0] for l in con.execute("SELECT id FROM itens WHERE registro_id = ?", (rid,))]
             ligadas = [l[0] for l in con.execute("SELECT pessoa_id FROM registro_pessoas WHERE registro_id = ?",
                                                  (rid,))]
@@ -1493,6 +1822,10 @@ class Banco:
         for iid in item_ids:
             padroes += [f"{origem}:{iid}:%" for origem in ("data", "evento", "pendencia", "depois")]
             padroes.append(f"estado:{iid}")
+            # A mesma origem dentro da chave de um recurso ("presentes:ocasiao:data:12:2026-10-20"):
+            # ela também guarda a data do que foi apagado (seção 14).
+            padroes += [f"%:{origem}:{iid}:%" for origem in ("data", "evento", "pendencia", "depois")]
+
         if pessoa_id is not None:
             padroes.append(f"pessoa:{pessoa_id}:%")
         for padrao in padroes:
@@ -1684,8 +2017,11 @@ class Banco:
             self._apagar_dispensados(pessoa_id=pid)
             self._historico_add("apagar", "pessoas", pid, f"pessoa #{pid} apagada")
 
-    def mencoes(self, pessoa_id: int, limite: int = 5) -> list[dict]:
-        """Últimos registros que citam a pessoa: {registro_id, data_registro, trecho}."""
+    def mencoes(self, pessoa_id: int, limite: int = 5, excluir: Iterable[int] | None = None) -> list[dict]:
+        """Últimos registros que citam a pessoa: {registro_id, data_registro, trecho}.
+
+        `excluir`: registros que não podem ser citados aqui (os discretos, `recursos.discretos`)."""
+        fora = json.dumps(sorted({int(i) for i in excluir or () if isinstance(i, int) and not isinstance(i, bool)}))
         with self._trava:
             p = self._linha("pessoas", pessoa_id)
             if p is None:
@@ -1695,7 +2031,8 @@ class Banco:
                 "SELECT id, data_registro, texto FROM registros WHERE id IN ("
                 " SELECT registro_id FROM registro_pessoas WHERE pessoa_id = ?"
                 " UNION SELECT registro_id FROM itens WHERE pessoa_id = ?)"
-                " ORDER BY data_registro DESC, id DESC LIMIT ?", (pid, pid, max(1, int(limite)))).fetchall()
+                " AND id NOT IN (SELECT value FROM json_each(?))"
+                " ORDER BY data_registro DESC, id DESC LIMIT ?", (pid, pid, fora, max(1, int(limite)))).fetchall()
             chaves = [normalizar(p["nome"] or ""), normalizar(_RE_PARENTESE.sub(" ", p["relacao"] or "")),
                       *(normalizar(a) for a in json.loads(p["apelidos"] or "[]"))]
             resultado = []
@@ -1804,6 +2141,10 @@ class Banco:
                     "SELECT chave, quando FROM alertas_dispensados ORDER BY chave")],
                 "historico": self._historico(None),
             }
+            # O que cada recurso guarda ({NOME: dados}); quem falhou fica de fora, com aviso.
+            dados["recursos"], avisos = recursos.exportar_dados(self)
+            if avisos:
+                dados["avisos"] = avisos
         return para_json(dados)
 
     # ------------------------------------------------------------ restaurar (seção 18.2)
@@ -1830,9 +2171,15 @@ class Banco:
                 # ficariam para sempre, mesmo depois de trocar o PIN, e poderiam tirar o 🔒 de todo
                 # registro novo ou fingir que apagou.
                 esperados = _objetos_do_esquema()
-                for tipo, nome in self._con.execute("SELECT type, name FROM sqlite_master").fetchall():
-                    if (tipo, nome) not in esperados and not (tipo == "table" and nome in _ESTATISTICAS_SQLITE):
-                        raise ValueError(BANCO_DANIFICADO)
+                # Com algum recurso que não abriu aqui, as tabelas (e índices) dele num backup são
+                # aceitas: só não dá para conferir a forma delas. Gatilho e visão nunca.
+                sem_recurso = bool(recursos.falhas())
+                for tipo, nome, tabela in self._con.execute("SELECT type, name, tbl_name FROM sqlite_master").fetchall():
+                    if (tipo, nome) in esperados or (tipo == "table" and nome in _ESTATISTICAS_SQLITE):
+                        continue
+                    if sem_recurso and tipo in ("table", "index") and not _tabela_central(tabela):
+                        continue
+                    raise ValueError(BANCO_DANIFICADO)
                 for tabela, colunas in _ESTRUTURA.items():
                     self._con.execute(f"SELECT {', '.join(colunas)} FROM {tabela} LIMIT 1").fetchall()
                     # hidden 2 e 3: coluna calculada (GENERATED), que não guarda o que é gravado nela.
@@ -1846,11 +2193,13 @@ class Banco:
                 raise ValueError(BANCO_DANIFICADO) from None
 
     def maiores_ids(self) -> dict[str, int]:
-        """O maior id que cada tabela já usou (inclusive de linhas apagadas)."""
+        """O maior id que cada tabela já usou (inclusive de linhas apagadas): as centrais com id e
+        as dos recursos com AUTOINCREMENT."""
         with self._trava:
             try:
+                validas = set(_TABELAS_COM_ID) | set(self._tabelas_dos_recursos())
                 return {l[0]: int(l[1]) for l in self._con.execute("SELECT name, seq FROM sqlite_sequence")
-                        if l[0] in _TABELAS_COM_ID and isinstance(l[1], int)}
+                        if l[0] in validas and isinstance(l[1], int)}
             except sqlite3.Error:
                 return {}
 
@@ -1862,7 +2211,7 @@ class Banco:
         deles, e apagá-lo apagaria o outro das cópias. Não muda nenhum dado.
         """
         with self._escrita() as con:
-            for tabela in _TABELAS_COM_ID:
+            for tabela in (*_TABELAS_COM_ID, *self._tabelas_dos_recursos()):
                 minimo = maiores.get(tabela)
                 if isinstance(minimo, bool) or not isinstance(minimo, int) or minimo <= 0:
                     continue
@@ -2049,6 +2398,10 @@ class Banco:
                 if not self._inserir_relacao_importada(rid, rel, mapa_registros, mapa_itens, agora):
                     relacoes_fora += 1
 
+        # Os dados de cada recurso (seção 20.0), com os ids daqui dos registros (novos e repetidos).
+        resumos_recursos, avisos_recursos = (recursos.importar_dados(self, exp.recursos, mapa_registros)
+                                             if exp.recursos else ({}, []))
+
         self._marcar_aprendidas(criadas, completadas, {pid: list(rids) for pid, rids in citadas.items()})
         if novos or criadas or completadas or marcados:
             # Só contagens: nada de nome ou texto no histórico.
@@ -2071,8 +2424,11 @@ class Banco:
                 "detalhes_pessoas": {"novas": novas_detalhe[:MAX_NOMES_PREVIA],
                                      "existentes": existentes_detalhe[:MAX_NOMES_PREVIA],
                                      "completadas": completadas_detalhe[:MAX_NOMES_PREVIA]},
-                "avisos": _avisos_da_importacao(exp, len(novos), sem_trecho, relacoes_fora, len(marcados),
-                                                len(completadas), no_arquivo)}
+                **({"recursos": resumos_recursos} if resumos_recursos else {}),
+                "avisos": _avisos_da_importacao(
+                    exp, len(novos), sem_trecho, relacoes_fora, len(marcados), len(completadas), no_arquivo,
+                    dos_recursos=any(isinstance(r, dict) and isinstance(r.get("novos"), int) and r["novos"] > 0
+                                     for r in resumos_recursos.values())) + avisos_recursos}
 
     def _inserir_pessoa_importada(self, p: _PessoaImportada, agora: str) -> int:
         """Pessoa nova vinda do arquivo. `automatica` e de qual registro veio o nome são
@@ -2189,5 +2545,5 @@ class Banco:
 
 
 __all__ = ["Banco", "CAMPOS_IA", "CONFIG_PADRAO", "ESQUEMA_VERSAO", "IA_TEMPO_MAXIMO", "IA_TEMPO_MINIMO",
-           "IA_TEMPO_PADRAO", "MAX_CUSTO_TRECHOS", "MAX_JSON_IMPORTAR", "NaoEncontrado", "STATUS_ITEM",
+           "IA_TEMPO_PADRAO", "MAX_CUSTO_TRECHOS", "MAX_JSON_IMPORTAR", "NaoEncontrado", "OperacaoProibida", "STATUS_ITEM",
            "STATUS_RELACAO", "TIPOS_IA", "config_sem_segredos", "ler_exportacao", "validar_exportacao", "validar_ia"]

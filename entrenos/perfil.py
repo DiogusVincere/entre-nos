@@ -93,7 +93,7 @@ def _entrada(d: Dados, item: Item) -> dict:
         "registro_id": item.registro_id,
         "tipo": item.tipo.value,
         "resumo": item.resumo,
-        "trecho": item.trecho,
+        "trecho": d.trecho(item),           # frase do ciclo de um registro discreto não é citada (20.10)
         "certeza": item.certeza.value,
         "categorias": list(item.categorias or []),
         "importancia": item.importancia,
@@ -150,13 +150,18 @@ def _pessoas(banco: Banco, d: Dados) -> list[dict]:
 
     saida = []
     for pid, p in d.pessoas.items():
-        itens = _mais_recentes(d, [i for i in d.ativos if i.pessoa_id == pid])
+        # A anotação solta de um registro discreto é a própria frase (o ciclo, seção 20.8): não vira
+        # informação da pessoa aqui. Os itens com assunto (evento, gosto...) continuam.
+        itens = _mais_recentes(d, [i for i in d.ativos if i.pessoa_id == pid
+                                   and not (i.tipo == TipoItem.NOTA and i.registro_id in d.discretos)])
         datas = datas_por_pessoa.get(pid, [])
         nas_datas = {oc.item.id for oc in datas if oc.item is not None}
         mencoes = len(registros_de.get(pid, ()))
+        # Registro discreto (o ciclo, seção 20.8) não é citado aqui: "a irmã dela menstruou" fica só
+        # no cartão 🌙 (a contagem de menções continua contando, sem o trecho).
         ultimas = [{"registro_id": m["registro_id"], "data": m["data_registro"],
                     "data_registro": m["data_registro"], "trecho": m["trecho"]}
-                   for m in banco.mencoes(pid, 5)]
+                   for m in banco.mencoes(pid, 5, excluir=d.discretos)]
         saida.append({
             "id": pid,
             "nome": p["nome"],
@@ -179,7 +184,8 @@ def _pessoas(banco: Banco, d: Dados) -> list[dict]:
 def _entrada_data(d: Dados, oc) -> dict:
     e = oc.para_dict(d.referencia)
     if oc.item is not None:
-        e.update(certeza=oc.item.certeza.value, trecho=oc.item.trecho)
+        e.update(certeza=oc.item.certeza.value, trecho=d.trecho(oc.item))
+
     return e
 
 

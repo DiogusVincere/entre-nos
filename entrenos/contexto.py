@@ -9,7 +9,8 @@ Três tipos de relação, todas só com o que está no banco e citando a origem:
 - mesma_pessoa: pessoa que já apareceu nos últimos 90 dias.
 
 Os candidatos saem da busca (FTS5) com os termos do texto novo. No máximo 5 relações, as mais
-fortes; sem relação, lista vazia (nada é forçado).
+fortes; sem relação, lista vazia (nada é forçado). Registro discreto (`recursos.discretos`: o
+ciclo, seção 20.8) nunca vira ligação "mesma pessoa".
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from . import recursos
 from .banco import Banco
 from .modelos import Certeza, Item, PessoaEncontrada, Precisao, Proposta, Relacao, TipoItem
 from .regras.pessoas import RELACOES, casar_pessoa, e_dela, genero_relacao, plano, relacao_base
@@ -188,6 +190,11 @@ class _Contexto:
         self.pessoas = banco.pessoas()
         self._itens: dict[int, Item | None] = {}
         self._datas: dict[int, date | None] = {}
+        # Registros que ficam só na tela do recurso (o ciclo, seção 20.8): não viram ligação "mesma
+        # pessoa", que citaria a frase da pessoa (pode ser a do ciclo) na revisão de um registro
+        # qualquer. (As ligações por item usam o trecho do próprio item, e os itens da frase do
+        # ciclo o próprio ciclo descarta ao gravar.)
+        self.discretos = frozenset(recursos.discretos(banco))
 
     def item(self, iid: int) -> Item | None:
         if iid not in self._itens:
@@ -390,7 +397,7 @@ def _mesmas_pessoas(proposta: Proposta, ctx: _Contexto, usados: set[int]) -> lis
         if pid is None or pid in vistos:
             continue
         vistos.add(pid)
-        mencoes = [m for m in ctx.banco.mencoes(pid, limite=10)
+        mencoes = [m for m in ctx.banco.mencoes(pid, limite=10, excluir=ctx.discretos)
                    if m["data_registro"] and inicio_janela <= m["data_registro"] <= ctx.referencia
                    and m["registro_id"] not in usados]
         if not mencoes:

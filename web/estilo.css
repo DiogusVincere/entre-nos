@@ -162,7 +162,7 @@ h1:focus, main:focus, .portao:focus { outline: none; }
 
 .sutil { color: var(--secundario); font-size: .92rem; }
 .centro { text-align: center; }
-.texto-livre { white-space: pre-wrap; }
+.texto-livre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .texto-perigo { color: var(--perigo-texto); font-weight: 600; }
 
 /* ------------------------------------------------------------------ estrutura */
@@ -228,7 +228,9 @@ h1:focus, main:focus, .portao:focus { outline: none; }
   border-radius: 50%;
   background: var(--primaria);
   box-shadow: var(--sombra);
-  font-size: 1.2rem;
+  color: var(--sobre-primaria);
+  font-size: 1.7rem;
+  font-weight: 700;
 }
 
 .menu-mais {
@@ -363,6 +365,9 @@ h1:focus, main:focus, .portao:focus { outline: none; }
 }
 .cartao > :last-child { margin-bottom: 0; }
 
+/* Grades de uma coluna que encolhem abaixo da palavra mais longa (uma URL num trecho citado não
+   empurra a página para o lado em 360 px). */
+.lista-cartoes, .lista-entradas, .lista-simples { grid-template-columns: minmax(0, 1fr); }
 .lista-cartoes { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
 .lista-cartoes > .cartao { margin: 0; }
 .lista-simples, .lista-linhas, .lista-entradas, .lista-encontrados, .lista-historico {
@@ -699,8 +704,10 @@ button.selo-botao::after { content: "⇄"; margin-left: 2px; opacity: .7; }
   background: var(--destaque-suave);
   color: var(--texto);
   font-style: italic;
+  overflow-wrap: anywhere;
 }
 .citacao-linha { display: block; }
+
 
 /* ------------------------------------------------------------------ Hoje */
 
@@ -828,7 +835,8 @@ a.proximo-link:hover { border-color: var(--primaria-texto); }
   background: var(--fundo);
 }
 .entrada-topo { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.entrada-texto { font-weight: 600; }
+.entrada-texto { font-weight: 600; overflow-wrap: anywhere; }
+
 .entrada-rodape { margin: 4px 0 0; font-size: .85rem; }
 .entrada .citacao { margin: 6px 0 0; }
 .entrada .dica { margin-top: 4px; }
@@ -1204,3 +1212,31 @@ input[type="file"]:disabled { opacity: .6; cursor: progress; }
     scroll-behavior: auto !important;
   }
 }
+
+/* ------------------------------------------------------------------ Recursos (DESIGN.md, seção 20.0) */
+
+/* Com os menus dos recursos, as listas crescem: rolam por dentro, nunca a página para o lado. */
+.menu-mais {
+  max-height: calc(100vh - var(--altura-inferior) - 24px - env(safe-area-inset-bottom, 0px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+@media (min-width: 800px) {
+  .nav-lateral { overflow-y: auto; }
+}
+
+/* Mais de três abas em Conhecendo Ela: quebram linha em vez de espremer. */
+.abas.abas-muitas { flex-wrap: wrap; border-radius: var(--raio-m); }
+.abas.abas-muitas [role="tab"] { flex: 1 1 auto; }
+
+/* Revisão: o que os recursos acharam. */
+.extra-revisao.confirmado { border-left: 6px solid var(--confirmado); }
+.extra-resumo { margin: 0 0 8px; font-weight: 600; }
+.chip-confirmado {
+  display: inline-flex;
+  align-items: center;
+  background: var(--confirmado-suave);
+  border-color: var(--confirmado);
+  font-weight: 600;
+}
+.painel-recurso, .corpo-recurso { min-width: 0; }

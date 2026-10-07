@@ -44,12 +44,17 @@ trocar qualquer coisa, guarda uma cópia do diário atual e abre uma sessão nov
 backup; `/api/importar/previa` e `/api/importar` juntam o JSON de `/api/exportar` sem duplicar.
 Arquivos que somem (seção 18.6): diário danificado não gasta tentativa de PIN e pode ser trocado
 por um backup; pasta de dados apagada com o diário aberto não é recriada.
+
+Recursos (seção 20.0): as rotas de cada recurso entram em `/api/<NOME>/...` (sessão ou livre, nunca
+públicas); `POST /api/registros` aceita os `extras` confirmados na revisão; e o que os recursos
+mandam deixar fora da IA (`fora_da_ia`) se soma aos registros 🔒 em todos os botões ✨.
 """
 from __future__ import annotations
 
 import base64
 import binascii
 import copy
+import hashlib
 import hmac
 import importlib
 import ipaddress
@@ -71,7 +76,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config
+from . import config, recursos
 from .banco import DADOS_DE_VERSAO_NOVA, Banco, NaoEncontrado, ler_exportacao, validar_exportacao
 from .cofre import (Cofre, CofreCorrompido, CofreFechado, CofreMudou, CofreRecebido, PastaSumiu, PinErrado,
                     abrir_conteudo, conferir_verificador, criar_verificador, problema_do_pin, tamanho_decifrado)
@@ -118,6 +123,11 @@ REGISTRO_PRIVADO = "Este registro está marcado para não ir para a IA."
 CHAVE_DE_NOVO = "Informe a chave de novo para o novo endereço."
 AJUSTES_DA_IA = "Os ajustes da IA ficam em Ajustes → IA, protegidos pelo PIN da IA."
 PRIVADOS_DE_FORA = "Registros marcados “não enviar para a IA” ficaram de fora do que foi para a IA."
+# Seção 20.0: o que os recursos mandam deixar fora da IA.
+FORA_DA_IA_INDISPONIVEL = ("Uma parte do Entre Nós não abriu direito, e não dá para saber com segurança o que "
+                           "fica fora da IA. Por isso nada foi enviado para a IA.")
+TEXTO_FICA_FORA_DA_IA = ("Este texto tem informações que nunca vão para a IA. As regras organizaram tudo aqui "
+                         "mesmo.")
 NAO_ENCONTREI = "Não encontrei essa informação."
 JA_CONFIGURADO = "Este computador já tem um Entre Nós configurado. Use o seu PIN."
 NAO_E_BACKUP = "Este arquivo não é um backup do Entre Nós (.cofre) ou está incompleto."
@@ -422,14 +432,98 @@ def _proxima_data(d: date, referencia: date, folga: int) -> date:
     return candidata
 
 
+def fora_da_ia(banco: Banco) -> set[int]:
+    """Registros que nunca vão para a IA: os marcados 🔒 e os que os recursos mandam deixar de
+    fora (o ciclo, a área Eu; seção 20.0). Se não dá para saber com segurança (um recurso não abriu
+    ou falhou ao dizer), 503 e nada vai: na dúvida, nada sai daqui."""
+    fora = set(banco.registros_privados())
+    try:
+        fora |= recursos.fora_da_ia(banco)
+    except recursos.RecursoIndisponivel:
+        raise ErroHttp(503, FORA_DA_IA_INDISPONIVEL) from None
+    return fora
+
+
+# O texto de um registro não muda: a resposta de `texto_fica_fora_da_ia` fica guardada (só sim/não,
+# pela chave do resumo do texto) e é esquecida ao bloquear ou quando passa do tamanho.
+_MEMO_TEXTO_FORA: dict[str, bool] = {}
+_MAX_MEMO_TEXTO_FORA = 4096
+_AVISO_EXTRAIR_INICIO = recursos.AVISO_EXTRAIR.split("{", 1)[0]
+
+
+def texto_fica_fora_da_ia(texto: str, referencia: date, banco: Banco | None = None, *,
+                          na_duvida: bool = True) -> bool:
+    """O texto tem algo que um recurso deixa fora da IA, confirmado ou não na revisão (seção 20.10):
+    um extra `_privado` dos tipos de `TIPOS_FORA_PELO_TEXTO` (`recursos.fica_fora_pelo_texto`).
+    Desentendimento da área Eu, resposta de "Nós dois", o ciclo... ficam fora mesmo com "Não guardar"
+    ou sem decidir; uma atitude sua não confirmada, não (o ✨ Analisar recusa todos, com 403).
+
+
+    Com `na_duvida` (o padrão, para o que vai à IA): um recurso que não abriu ou não conseguiu ler o
+    texto conta como sim. Sem ele (ao gravar), só o que foi achado de fato."""
+    if not isinstance(texto, str) or not texto.strip():
+        return False
+    if recursos.falhas():
+        return na_duvida
+    chave = hashlib.sha256(texto.encode("utf-8", "surrogatepass")).hexdigest()
+    guardado = _MEMO_TEXTO_FORA.get(chave)
+    if guardado is not None:
+        return guardado
+    motor = _modulo("motor", "Conhecimento", "MotorRegras", "conhecimento_do_banco")
+    # Só pessoas e o nome dela: sem a leitura do diário, os avisos que leem o diário (o aprendizado, o
+    # planejamento do ciclo) ficam de fora, e eles nunca pedem 🔒.
+    conhecimento = motor.Conhecimento()
+    if banco is not None:
+        completo = motor.conhecimento_do_banco(banco)
+        conhecimento = motor.Conhecimento(pessoas=completo.pessoas, nome_dela=completo.nome_dela)
+    proposta = motor.MotorRegras().analisar(texto, referencia, conhecimento)
+    achou = recursos.fica_fora_pelo_texto(proposta.extras or {})
+    falhou = any(isinstance(a, str) and a.startswith(_AVISO_EXTRAIR_INICIO) for a in proposta.avisos or [])
+    if falhou and not achou:
+        return na_duvida                     # um recurso não leu o texto: não guarda a resposta
+    if len(_MEMO_TEXTO_FORA) >= _MAX_MEMO_TEXTO_FORA:
+        _MEMO_TEXTO_FORA.clear()
+    _MEMO_TEXTO_FORA[chave] = achou
+    return achou
+
+
+def esquecer_textos_fora_da_ia() -> None:
+    _MEMO_TEXTO_FORA.clear()
+
+
+def fora_da_ia_pelo_texto(banco: Banco, ids: Any, ja_fora: set[int] | None = None) -> set[int]:
+    """Dos registros `ids`, os que ficam fora da IA pelo próprio texto (`texto_fica_fora_da_ia`), além
+    dos que já estão em `ja_fora`. Para o que está para ir à IA (achados da busca, contexto da
+    sugestão, o detalhe de um registro): ler o diário inteiro a cada pedido custaria demais."""
+    ja_fora = ja_fora or set()
+    procurar = sorted({i for i in ids if isinstance(i, int) and not isinstance(i, bool)} - ja_fora)
+    if not procurar:
+        return set()
+    if recursos.falhas():
+        raise ErroHttp(503, FORA_DA_IA_INDISPONIVEL)
+    fora: set[int] = set()
+    for inicio in range(0, len(procurar), 500):
+        parte = procurar[inicio:inicio + 500]
+        marcas = ", ".join("?" for _ in parte)
+        for l in banco.consultar(f"SELECT id, texto, data_registro FROM registros WHERE id IN ({marcas})", parte):
+            try:
+                referencia = date.fromisoformat(str(l.get("data_registro"))[:10])
+            except ValueError:
+                referencia = date.today()
+            if texto_fica_fora_da_ia(l.get("texto") or "", referencia, banco):
+                fora.add(l["id"])
+    return fora
+
+
 def contexto_sugestao(banco: Banco, referencia: date) -> list[dict]:
     """O que a IA recebe para pensar numa sugestão (seção 17.3): itens ativos recentes, datas
-    próximas e o que ajuda ou é restrição. Registros "não enviar para a IA" ficam de fora.
+    próximas e o que ajuda ou é restrição. Registros "não enviar para a IA" (e os que os
+    recursos deixam fora da IA, `fora_da_ia`) ficam de fora.
 
     Prioridade: o que acontece agora (estado, pendência, evento próximo), depois o resto dos
     registros recentes, depois apoio e restrições. No máximo MAX_CONTEXTO_SUGESTAO itens.
     """
-    privados = banco.registros_privados()
+    privados = fora_da_ia(banco)
     datas_registro = {r["id"]: r["data_registro"] for r in banco.registros(limite=1000)}
     inicio = referencia - timedelta(days=DIAS_CONTEXTO_SUGESTAO)
     fim = referencia + timedelta(days=30)
@@ -463,6 +557,19 @@ def contexto_sugestao(banco: Banco, referencia: date) -> list[dict]:
 
     ordem = sorted(escolhidos.values(),
                    key=lambda par: (par[0], -(data_de(par[1]) or date.min).toordinal(), -(par[1].id or 0)))
+    # O texto do registro também decide (seção 20.10): um desentendimento salvo sem confirmar o extra
+    # da área Eu, uma frase do ciclo com "Não guardar"... ficam de fora. Lido só para o que entraria.
+    texto_fora: dict[Any, bool] = {}
+    aceitos: list[tuple[int, Item]] = []
+    for par in ordem:
+        rid = par[1].registro_id
+        if rid not in texto_fora:
+            texto_fora[rid] = bool(fora_da_ia_pelo_texto(banco, [rid], privados))
+        if not texto_fora[rid]:
+            aceitos.append(par)
+            if len(aceitos) >= MAX_CONTEXTO_SUGESTAO:
+                break
+    ordem = aceitos
     contexto = [para_json({
         "item_id": item.id, "registro_id": item.registro_id, "tipo": item.tipo, "resumo": item.resumo,
         "trecho": item.trecho, "certeza": item.certeza, "categorias": list(item.categorias),
@@ -766,6 +873,9 @@ class Rota:
     acesso: str
     limite_corpo: int = LIMITE_CORPO
     campos_grandes: tuple[str, ...] = ()
+    # Rotas dos recursos (seção 20.0): `manipulador(nucleo, pedido, banco)` no lugar de `funcao`.
+    manipulador: Callable[[Any, Any, Any], Any] | None = None
+    recurso: str | None = None
 
 
 def _rota(metodo: str, caminho: str, funcao: str, acesso: str = SESSAO, limite_corpo: int = LIMITE_CORPO,
@@ -831,11 +941,57 @@ ROTAS: tuple[Rota, ...] = (
 )
 
 
+_RE_CAMINHO_RECURSO = re.compile(r"(?:[a-z0-9_-]+|\{id\})(?:/(?:[a-z0-9_-]+|\{id\}))*")
+_ROTAS_DOS_RECURSOS: tuple[int, tuple[Rota, ...]] | None = None
+
+
+def _rota_de_recurso(nome: str, bruta: Any) -> Rota:
+    """RotaRecurso -> Rota em /api/<NOME>/<caminho>. Só sessão ou livre: recurso nunca tem rota
+    pública nem de primeiro uso (nada sai sem o PIN)."""
+    if not isinstance(bruta, recursos.RotaRecurso):
+        raise TypeError("use recursos.rota(...)")
+    if bruta.metodo not in recursos.METODOS or bruta.acesso not in recursos.ACESSOS or not callable(bruta.funcao):
+        raise ValueError("método, acesso ou função da rota")
+    caminho = bruta.caminho.strip("/")
+    if caminho and not _RE_CAMINHO_RECURSO.fullmatch(caminho):
+        raise ValueError("caminho da rota")
+    base = _rota(bruta.metodo, f"{nome}/{caminho}" if caminho else nome, "", bruta.acesso)
+    return Rota(base.metodo, base.padrao, "", base.acesso, manipulador=bruta.funcao, recurso=nome)
+
+
+def rotas_dos_recursos() -> tuple[Rota, ...]:
+    """As rotas de todos os recursos (refeitas quando a lista de recursos muda). Recurso cujas
+    rotas não cumprem o contrato fica sem nenhuma (e o erro vai para o log)."""
+    global _ROTAS_DOS_RECURSOS
+    geracao = recursos.geracao()
+    if _ROTAS_DOS_RECURSOS is not None and _ROTAS_DOS_RECURSOS[0] == geracao:
+        return _ROTAS_DOS_RECURSOS[1]
+    todas: list[Rota] = []
+    vistas: set[tuple[str, str]] = set()
+    for nome, funcao in recursos.com_gancho("rotas"):
+        try:
+            do_recurso = [_rota_de_recurso(nome, bruta) for bruta in (funcao() or ())]
+        except Exception as erro:  # noqa: BLE001 - o recurso fica sem rotas; o app segue
+            recursos.registrar_erro(erro, nome, "rotas")
+            continue
+        for rota in do_recurso:
+            if (rota.metodo, rota.padrao.pattern) not in vistas:
+                vistas.add((rota.metodo, rota.padrao.pattern))
+                todas.append(rota)
+    _ROTAS_DOS_RECURSOS = (geracao, tuple(todas))
+    return _ROTAS_DOS_RECURSOS[1]
+
+
+def todas_as_rotas() -> tuple[Rota, ...]:
+    """As rotas do núcleo (ROTAS) e, depois, as dos recursos (/api/<NOME>/...)."""
+    return (*ROTAS, *rotas_dos_recursos())
+
+
 def achar_rota(metodo: str, caminho: str) -> tuple[Rota, tuple[str, ...]]:
     """A rota de `metodo caminho` e os grupos do endereço ({id}). 404 sem rota; 405 (com Allow)
     quando o endereço existe com outro método."""
     permitidos: set[str] = set()
-    for rota in ROTAS:
+    for rota in todas_as_rotas():
         achado = rota.padrao.fullmatch(caminho)
         if achado:
             if rota.metodo == metodo:
@@ -945,6 +1101,8 @@ class Nucleo:
 
     def atender(self, rota: Rota, pedido: Pedido) -> Any:
         """Confere o acesso da rota e roda a função dela (o resultado ainda não está em JSON)."""
+        if rota.manipulador is not None:
+            return self._atender_recurso(rota, pedido)
         funcao = getattr(self, rota.funcao)
         if rota.acesso in (PUBLICA, PRIMEIRO_USO):
             return funcao(pedido)
@@ -963,6 +1121,38 @@ class Nucleo:
             finally:
                 if self._banco is banco:
                     self._marcar_atividade()
+
+    def _atender_recurso(self, rota: Rota, pedido: Pedido) -> Any:
+        """Rota de recurso (seção 20.0): `manipulador(nucleo, pedido, banco)`. Sessão (o padrão):
+        com a trava do app. Livre: sem a trava (para trabalho demorado); quem mexe no banco pega
+        `with nucleo.trava:` antes."""
+        if rota.acesso == LIVRE:
+            banco = self._exigir_sessao(pedido.token)
+            try:
+                return rota.manipulador(self, pedido, banco)
+            finally:
+                with self._trava:
+                    if self._banco is not None:
+                        self._marcar_atividade()
+        if rota.acesso != SESSAO:
+            raise ErroHttp(500, FALHA_INTERNA)          # nunca: _rota_de_recurso só deixa sessão e livre
+        with self._trava:
+            banco = self._exigir_sessao(pedido.token)
+            try:
+                return rota.manipulador(self, pedido, banco)
+            finally:
+                if self._banco is banco:
+                    self._marcar_atividade()
+
+    @property
+    def trava(self) -> threading.RLock:
+        """A trava do app (um pedido de sessão por vez). Para as rotas livres dos recursos."""
+        return self._trava
+
+    def limpar_copias(self, apagar: Callable[[Banco], bool | None]) -> None:
+        """Repete `apagar` nas cópias automáticas de backups/ (apagar é apagar também nelas).
+        Para as rotas dos recursos que apagam algo: `nucleo.limpar_copias(lambda b: b.apagar(t, id))`."""
+        self._limpar_backups(apagar)
 
     def limite_do_corpo(self, rota: Rota) -> int:
         """Bytes que o corpo desta rota pode ter: 1 MB, ou o limite dos arquivos (restaurar e
@@ -1027,6 +1217,8 @@ class Nucleo:
         with self._trava:
             banco, self._banco, self._token = self._banco, None, None
             self._area_ia_desde = None           # a área da IA fecha junto
+            esquecer_textos_fora_da_ia()
+
             if banco is not None:
                 try:
                     if getattr(banco, "sujo", True):
@@ -1445,6 +1637,11 @@ class Nucleo:
             return list(proposta.relacoes or [])
 
     def _criar_registro(self, p: Pedido, banco: Banco) -> dict:
+        """Grava o registro revisado e, na mesma transação, os `extras` confirmados de cada recurso
+        (seção 20.0). Extra de recurso que pede 🔒 (o ciclo) deixa o registro fora da IA, com aviso.
+
+        Resposta: {"id"} e, quando for o caso, "privado": true (virou 🔒 por causa de um extra) e
+        "avisos" (a parte de um recurso que não deu para guardar)."""
         c = p.corpo
         texto = _texto(c, "texto", "O registro está vazio.")
         data_registro = _data(c.get("data_registro"), "data_registro") or self.hoje()
@@ -1456,10 +1653,26 @@ class Nucleo:
             # Nunca inventar: todo item cita um pedaço literal do texto.
             if not isinstance(trecho, str) or not trecho.strip() or trecho not in texto:
                 raise ErroHttp(400, "Cada item precisa citar um trecho que está no texto do registro.")
-        rid = banco.criar_registro(texto, data_registro, itens, _lista_de_objetos(c, "pessoas"),
-                                   _lista_de_objetos(c, "relacoes"), _texto_opcional(c, "contexto"),
-                                   _texto_opcional(c, "humor"), privado=_privado(c))
-        return {"id": rid}
+        extras = recursos.extras_confirmados(c.get("extras"), texto)
+        forcado = recursos.recursos_que_marcam_privado(extras)
+        # O texto também decide, como no 403 do ✨ Analisar: algo que um recurso deixa fora da IA
+        # (desentendimento, resposta de "Nós dois", o ciclo) e ficou sem confirmar ou com "Não guardar"
+        # deixa o registro 🔒 do mesmo jeito (seção 20.10). O aviso da revisão já dizia isso.
+        if not forcado and texto_fica_fora_da_ia(texto, data_registro, banco, na_duvida=False):
+            forcado = ["texto"]
+        privado = _privado(c) or bool(forcado)
+        with banco.transacao():
+            rid = banco.criar_registro(texto, data_registro, itens, _lista_de_objetos(c, "pessoas"),
+                                       _lista_de_objetos(c, "relacoes"), _texto_opcional(c, "contexto"),
+                                       _texto_opcional(c, "humor"), privado=privado)
+            avisos = recursos.gravar_extras(banco, rid, extras, data_registro)
+        resposta: dict[str, Any] = {"id": rid}
+        if forcado:
+            resposta["privado"] = True
+            avisos.insert(0, recursos.AVISO_PRIVADO_GRAVADO)
+        if avisos:
+            resposta["avisos"] = avisos
+        return resposta
 
     def _marcar_privado(self, p: Pedido, banco: Banco) -> dict:
         """PATCH /api/registros/{id} {privado}: marca ou desmarca "não enviar para a IA"."""
@@ -1479,6 +1692,13 @@ class Nucleo:
         registro = banco.registro(p.id)
         if registro is None:
             raise ErroHttp(404, f"Registro #{p.id} não encontrado.")
+        # Um recurso deixa este registro fora da IA (o ciclo, a área Eu; seção 20.0), com ou sem a
+        # caixinha 🔒: a tela trava a caixinha. None = não deu para saber agora.
+        try:
+            registro["fora_da_ia"] = (registro["id"] in recursos.fora_da_ia(banco)
+                                      or bool(fora_da_ia_pelo_texto(banco, [registro["id"]])))
+        except (recursos.RecursoIndisponivel, ErroHttp):
+            registro["fora_da_ia"] = None
         return registro
 
     def _limpar_backups(self, apagar: Callable[[Banco], bool | None]) -> None:
@@ -1607,12 +1827,19 @@ class Nucleo:
         pergunta = self._pergunta(p.parametro("q") or "")
         buscar = _funcao("busca", "buscar")
         resposta = para_json(buscar(pergunta, banco, None, self.hoje()))
-        privados = banco.registros_privados()
+        # 🔒 = fica fora da IA: os marcados e os que os recursos deixam de fora (seção 20.0). Sem
+        # saber com segurança o que fica de fora, o ✨ Perguntar à IA nem aparece.
         encontrados = [e for e in (resposta.get("encontrados") or []) if isinstance(e, dict)]
+        try:
+            privados, seguro = fora_da_ia(banco), True
+            # O texto também decide (seção 20.10): o que um recurso deixaria fora sem confirmação.
+            privados |= fora_da_ia_pelo_texto(banco, [e.get("registro_id") for e in encontrados], privados)
+        except ErroHttp:
+            privados, seguro = banco.registros_privados(), False
         for e in encontrados:
             e["privado"] = e.get("registro_id") in privados
-        para_ia = any(not e["privado"] for e in encontrados)
-        if encontrados and not para_ia:
+        para_ia = seguro and any(not e["privado"] for e in encontrados)
+        if seguro and encontrados and not para_ia:
             # Os mais relevantes são todos 🔒: a busca para a IA (sem eles) acharia outra coisa?
             para_ia = bool(buscar(pergunta, banco, None, self.hoje(), privados=privados).encontrados)
         resposta["para_ia"] = para_ia
@@ -2252,7 +2479,11 @@ class Nucleo:
         return cadeia, banco
 
     def _ia_analisar(self, p: Pedido) -> dict:
-        """POST /api/ia/analisar {texto, data_registro, privado?}: regras primeiro, depois a IA."""
+        """POST /api/ia/analisar {texto, data_registro, privado?}: regras primeiro, depois a IA.
+
+        Texto em que um recurso acha algo que deixa o registro 🔒 (o ciclo, seção 20.8) não vai para
+        a IA (403), mesmo com a caixinha desmarcada; sem saber disso com segurança (um recurso não
+        abriu), 503. Os `extras` das regras nunca vão para a IA: voltam na proposta como estavam."""
         self._exigir_ia_disponivel()
         c = p.corpo
         texto = _texto(c, "texto", "Escreva alguma coisa antes de organizar.")
@@ -2265,9 +2496,16 @@ class Nucleo:
             conhecimento_do_banco = _funcao("motor", "conhecimento_do_banco")
             comparar_propostas = _funcao("motor", "comparar_propostas")
             conhecimento = conhecimento_do_banco(banco)
+        if recursos.falhas():
+            raise ErroHttp(503, FORA_DA_IA_INDISPONIVEL)
         base = motor_regras().analisar(texto, referencia, conhecimento)
+        if any(e.get("_privado") for lista in base.extras.values() for e in lista):
+            raise ErroHttp(403, TEXTO_FICA_FORA_DA_IA)
+        extras, base.extras = base.extras, {}
         # Fora da trava: a IA pode demorar, e o resto do app não precisa esperar.
         proposta, ia_usada, avisos = cadeia.analisar(texto, referencia, conhecimento, copy.deepcopy(base))
+        base.extras = extras
+        proposta.extras = copy.deepcopy(extras)
         proposta.motor = _motor_neutro(ia_usada)
         mudancas = comparar_propostas(base, proposta) if ia_usada else []
         with self._trava:
@@ -2287,11 +2525,25 @@ class Nucleo:
         buscar = _funcao("busca", "buscar")
         with self._trava:
             cadeia, banco = self._cadeia_ia(p.token)
-            privados = banco.registros_privados()
+            privados = fora_da_ia(banco)             # 🔒 e o que os recursos deixam fora (seção 20.0)
             todos = buscar(pergunta, banco, None, self.hoje())
+            # E o que o próprio texto deixa fora (seção 20.10), lido só nos achados: a busca sem eles
+            # pode achar outros, que também são lidos (poucas voltas; o filtro final garante).
+            ids = [e.get("registro_id") for e in todos.encontrados or [] if isinstance(e, dict)]
+            privados |= fora_da_ia_pelo_texto(banco, ids, privados)
             achados = buscar(pergunta, banco, None, self.hoje(), privados=privados) if privados else todos
+            for _volta in range(3):
+                ids = [e.get("registro_id") for e in achados.encontrados or [] if isinstance(e, dict)]
+                novos = fora_da_ia_pelo_texto(banco, ids, privados)
+                if not novos:
+                    break
+                privados |= novos
+                achados = buscar(pergunta, banco, None, self.hoje(), privados=privados)
+            ids = [e.get("registro_id") for e in achados.encontrados or [] if isinstance(e, dict)]
+            privados |= fora_da_ia_pelo_texto(banco, ids, privados)
             encontrados = [e for e in (achados.encontrados or [])
                            if isinstance(e, dict) and e.get("registro_id") not in privados]
+
             trechos = so_o_escrito(banco, encontrados)
         algum_privado = any(isinstance(e, dict) and e.get("registro_id") in privados for e in todos.encontrados or [])
         avisos = [PRIVADOS_DE_FORA] if algum_privado else []
@@ -2328,6 +2580,8 @@ __all__ = [
     "BACKUP_SO_BAIXANDO", "BLOQUEADO", "CHAVE_DE_NOVO", "COMPUTADOR", "DIARIO_MUDOU", "IA_SO_NO_COMPUTADOR",
     "LIMITE_CORPO_ARQUIVO_NAVEGADOR", "NAVEGADOR", "PASTA_SUMIU_NAVEGADOR", "PLATAFORMAS",
     "COMPARACOES_SEM_ESPERA", "DADO_INVALIDO", "DIARIO_DANIFICADO", "ESPERE_O_PIN", "ErroHttp", "FALHA_INTERNA",
+    "FORA_DA_IA_INDISPONIVEL", "TEXTO_FICA_FORA_DA_IA", "fora_da_ia", "fora_da_ia_pelo_texto", "rotas_dos_recursos",
+    "texto_fica_fora_da_ia", "todas_as_rotas",
     "INDISPONIVEL", "LIMITE_CORPO", "LIMITE_CORPO_ARQUIVO", "LIVRE", "MAX_CONTEXTO_SUGESTAO", "MINUTOS_AREA_IA",
     "NAO_E_BACKUP", "NAO_SALVOU_ANTES", "Nucleo", "PASTA_SUMIU", "PIN_DO_BACKUP", "PRIMEIRO_USO",
     "PRIVADOS_DE_FORA", "PUBLICA", "Pedido", "REGISTRO_PRIVADO", "ROTAS", "RespostaApi", "Rota", "SEM_IA",

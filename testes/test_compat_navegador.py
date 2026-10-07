@@ -10,6 +10,8 @@
 - A ponte: `tratar_json` (texto entra, texto sai) e um diário inteiro num Python separado em que
   iniciar thread e dormir dão erro e o servidor, o ctypes, o webbrowser, o ssl, o rapidfuzz e o
   OpenSSL do hashlib não existem.
+- Recursos (seção 20.0): tudo de entrenos/recursos/ (o registro e cada recurso, importados na hora
+  por nome) passa pela mesma varredura, e os nove abrem no Python de navegador.
 - A revisão de 07/10/2026 (seção 19.7): o bloqueio do PIN sobrevive a reabrir o app, os dois
   relógios (o monotônico do navegador para enquanto o celular dorme), a plataforma "navegador"
   (backup baixando, IA indisponível, limite menor, menos cópias, textos sem Windows), duas abas no
@@ -53,7 +55,10 @@ ESPERADOS = {"entrenos", "entrenos.nucleo", "entrenos.ponte", "entrenos.config",
              "entrenos.modelos", "entrenos.regras", "entrenos.regras.datas", "entrenos.regras.pessoas",
              "entrenos.regras.categorias", "entrenos.regras.certeza", "entrenos.regras.itens",
              "entrenos.motor", "entrenos.banco", "entrenos.cofre", "entrenos.busca", "entrenos.alertas",
-             "entrenos.perfil", "entrenos.contexto", "entrenos.provedores"}
+             "entrenos.perfil", "entrenos.contexto", "entrenos.provedores", "entrenos.recursos"}
+# Os recursos (seção 20.0) são importados pelo registro na hora do uso (importlib, por nome): a
+# varredura os acrescenta pelos arquivos de entrenos/recursos/.
+PASTA_RECURSOS = PACOTE / "recursos"
 # Módulos que não existem (ou não funcionam) no navegador, ou que só fazem sentido no computador.
 MODULOS_PROIBIDOS = ("socket", "socketserver", "http.server", "ctypes", "webbrowser", "_thread",
                      "subprocess", "multiprocessing", "winreg", "msvcrt", "tkinter")
@@ -93,6 +98,11 @@ def tearDownModule() -> None:
 
 def _arquivos() -> list[Path]:
     return sorted(p for p in PACOTE.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+def _modulos_dos_recursos() -> list[str]:
+    """entrenos.recursos e cada entrenos.recursos.<nome> (pelos arquivos da pasta)."""
+    return sorted(_nome_do_modulo(p) for p in PASTA_RECURSOS.glob("*.py"))
 
 
 def _nome_do_modulo(arquivo: Path) -> str:
@@ -262,11 +272,30 @@ class TestDependencias(unittest.TestCase):
                                   or n.startswith("entrenos.servidor.")}, importados)
 
     def test_nada_de_thread_sleep_socket_ctypes_nem_navegador(self):
-        for nome in sorted(alcancados("entrenos.nucleo", "entrenos.ponte") | ESPERADOS):
+        for nome in sorted(alcancados("entrenos.nucleo", "entrenos.ponte", *_modulos_dos_recursos()) | ESPERADOS):
             arquivo = _arquivo_do_modulo(nome)
             with self.subTest(modulo=nome):
                 self.assertIsNotNone(arquivo)
                 self.assertEqual(proibidos(_ler(arquivo)), [])
+
+    def test_recursos_entram_na_varredura(self):
+        # Seção 20.0: tudo de entrenos/recursos/ roda no navegador também; a lista fixa do registro
+        # é a dos arquivos, e o núcleo chega ao registro.
+        from entrenos import recursos
+        nomes = _modulos_dos_recursos()
+        self.assertEqual(sorted(n.rsplit(".", 1)[-1] for n in nomes if n != "entrenos.recursos"),
+                         sorted(recursos.NOMES))
+        varridos = alcancados("entrenos.nucleo", "entrenos.ponte", *nomes)
+        self.assertLessEqual(set(nomes), varridos)
+        self.assertIn("entrenos.recursos", alcancados("entrenos.nucleo"))
+        for nome in nomes:
+            with self.subTest(modulo=nome):
+                arvore = _ler(_arquivo_do_modulo(nome))
+                self.assertEqual(proibidos(arvore), [])
+                ast.parse(_arquivo_do_modulo(nome).read_text(encoding="utf-8"), feature_version=VERSAO_MINIMA)
+                if _tem_anotacao(arvore):
+                    self.assertTrue(_futuro_das_anotacoes(arvore))
+                self.assertNotIn("entrenos.servidor", _importados(arvore, nome, nome == "entrenos.recursos"))
 
     def test_a_varredura_pega_o_que_deve(self):
         codigo = textwrap.dedent("""
@@ -600,6 +629,8 @@ r = pedir("POST", "/api/sair", {}, token)
 passos["sair"] = [r["status"], r.get("encerrado")]
 passos["threads"] = threading.active_count()
 passos["espera_do_cofre"] = cofre.esperar_entre_tentativas is None
+from entrenos import recursos
+passos["recursos"] = [recursos.nomes_carregados(), recursos.falhas(), p.get("extras")]
 passos["modulos"] = sorted(m for m in BLOQUEADOS if m in sys.modules)
 print(json.dumps(passos))
 '''
@@ -641,6 +672,9 @@ class TestPythonDeNavegador(unittest.TestCase):
         self.assertEqual(passos["sair"], [200, True])
         self.assertEqual(passos["threads"], 1)                     # só a principal, do começo ao fim
         self.assertTrue(passos["espera_do_cofre"])
+        # Seção 20.0: os nove recursos abrem também ali, e a proposta já traz `extras`.
+        from entrenos import recursos
+        self.assertEqual(passos["recursos"], [list(recursos.NOMES), {}, {}])
         self.assertEqual(passos["modulos"], [])
         self.assertTrue((Path(pasta) / "entrenos.cofre").read_bytes().startswith(cofre.MAGICO))
 

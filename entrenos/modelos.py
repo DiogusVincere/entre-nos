@@ -136,6 +136,9 @@ class Proposta:
     relacoes: list[Relacao] = field(default_factory=list)
     avisos: list[str] = field(default_factory=list)   # ex.: data ambígua, pessoa nova
     motor: str = "regras"
+    # O que os recursos (entrenos/recursos/, DESIGN 20.0) acharam no texto, por recurso:
+    # {"presentes": [{tipo, resumo, trecho, ...}]}. `trecho` é sempre literal. Nunca vai para a IA.
+    extras: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 @dataclass

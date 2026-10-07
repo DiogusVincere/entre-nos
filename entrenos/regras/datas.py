@@ -80,6 +80,8 @@ _PREP_MES = frozenset("de ate desde para pra inicio comeco fim final meados dura
 # Palavra antes de "3/4" que faz dele data, e não fração.
 _PREP_DATA = frozenset("dia em ate desde para pra no".split())
 
+# Logo antes da data, um prazo ("até dia 25", "antes do dia 12"): a data não é a do aniversário.
+_RE_PRAZO_ANTES = re.compile(r"(?<!\w)(?:ate|antes\s+d[eoa]s?)\s+(?:o\s+|a\s+)?$")
 # Recorrência anual: a frase fala de aniversário ou de "todo ano".
 _RE_RECORRENTE = re.compile(
     r"(?<!\w)(?:aniversario|aniver|niver|faz\s+anos|fara\s+anos|fez\s+anos|completa\s+anos|"
@@ -115,7 +117,13 @@ deu dei demos deram viu vi vimos viram veio vim viemos vieram ontem anteontem at
 passado passada passados passadas retrasado retrasada ultimo ultima saimos jantamos
 almocamos assistimos conhecemos comemoramos passamos voltamos chegamos ficamos brigamos
 conversamos terminamos comecamos ganhamos compramos viajamos
+conheci comi bebi perdi recebi escolhi senti dormi abri assisti consegui descobri subi corri
+entendi aprendi esqueci apareci vendi devolvi nasci cresci vivi trouxe trouxemos trouxeram
+quis quisemos pude pudemos soube pus pusemos
 """.split())
+# (Integração de 07/10/2026: a 1ª pessoa do pretérito em -i não termina em -ou/-eu/-iu nem em -ei;
+# "conheci os pais dela em 12/03" era lido como 12/03 do ano que vem. "pedi", "falei" e "contei" são
+# fala, como "pediu": não dizem o tempo da data.)
 _SUFIXOS_FUTURO = ("arei", "erei", "irei", "aremos", "eremos", "iremos", "arao", "erao", "irao")
 _SUFIXOS_PASSADO = ("ou", "eu", "iu", "ava", "avam", "aram", "eram", "iram")
 _NAO_SAO_PASSADO = frozenset("""
@@ -804,6 +812,9 @@ def extrair_datas(texto: str, referencia: date) -> list[DataEncontrada]:
     for ini, fim, achado in sorted(escolhidos, key=lambda c: c[0]):
         if achado is _INVALIDA:
             continue
+        if achado.recorrente and _RE_PRAZO_ANTES.search(ctx.norm, 0, ini):
+            # "comprar o presente de aniversário dela até dia 25": o dia 25 é um prazo, não se repete.
+            achado.recorrente = False
         resultado.append(DataEncontrada(
             expressao=texto[ini:fim],
             inicio=ini,

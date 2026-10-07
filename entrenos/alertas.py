@@ -13,18 +13,29 @@ Níveis:
 
 Anti-excesso: todos os importantes, até 3 lembretes e 1 sugestão. Dispensados não voltam; a
 chave junta a origem, a data e a antecedência ("evento:12:2026-10-20:d7").
+
+Recursos (seção 20.0): os `cartoes_hoje` de cada recurso entram no mesmo anti-excesso, que continua
+central: todos os importantes, até 3 lembretes somando todo mundo, e no máximo 1 sugestão por
+fornecedor (as do Hoje e as de cada recurso) e 2 no total. Cartão de recurso vem como
+`CartaoRecurso` (um Alerta com `recurso`, `tipo` e `dados`), com a chave "<NOME>:...".
+Desde a integração (20.10): a sugestão do núcleo vem primeiro, as dos recursos com relevância ≥ 70
+pela relevância e as outras num rodízio pelo dia; cada recurso fica sabendo quais cartões dele
+apareceram (`cartoes_mostrados`); e o registro discreto (o ciclo) não mostra o começo do texto em
+"Últimos registros".
 """
 from __future__ import annotations
 
 import calendar
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import config as cfg
-from .modelos import Alerta, Certeza, Item, Precisao, Relacao, TipoItem
+from . import recursos
+from .modelos import Alerta, Certeza, Item, Precisao, Relacao, TipoItem, para_json
 from .regras.datas import extrair_datas, proxima_ocorrencia
 from .regras.pessoas import RELACOES, e_dela, genero_relacao, relacao_base
 from .texto import data_br, normalizar, tempo_atras
@@ -33,7 +44,11 @@ if TYPE_CHECKING:
     from .banco import Banco
 
 MAX_LEMBRETES = 3
-MAX_SUGESTOES = 1
+MAX_SUGESTOES = 1               # por fornecedor (o Hoje e cada recurso)
+MAX_SUGESTOES_TOTAL = 2
+SUGESTAO_URGENTE = 70           # sugestão de recurso a partir disto disputa só pela relevância (sem rodízio)
+MAX_CARTOES_POR_RECURSO = 20    # o que um recurso pode mandar (antes do anti-excesso)
+_RE_TIPO_CARTAO = re.compile(r"[a-z][a-z0-9_-]{0,39}")
 DIAS_PROXIMOS = 30
 DIAS_NAMORO = (7, 0)            # mesversário e aniversário de namoro: 7 dias antes e no dia
 DIAS_ESTADO_RECENTE = 7         # estado negativo que ainda vale uma sugestão
@@ -44,6 +59,9 @@ MAX_ULTIMOS = 5
 _PAGINA = 1000                  # limite de banco.registros()
 
 _TIPOS_COM_DATA = (TipoItem.EVENTO, TipoItem.DATA_IMPORTANTE, TipoItem.PENDENCIA)
+RESUMO_DISCRETO = "🔒 Um registro reservado (abra para ver)."
+CARTAO_RESERVADO = "🔒 Um aviso reservado (abra o registro para ver)."
+
 _ORDEM_TIPO = {"aniversario_dela": 0, "namoro": 1, "mesversario": 1, "aniversario": 2, "evento": 3,
                "data_importante": 4, "pendencia": 5}
 
@@ -217,6 +235,10 @@ class Dados:
     itens: list[Item]                   # todos, em qualquer situação, mais recentes primeiro
     pessoas: dict[int, dict]
     relacoes: list[Relacao]
+    # Registros cujo texto fica só na tela do recurso (o ciclo, `recursos.discretos`): o Hoje não
+    # mostra o começo do texto e Pessoas não cita o trecho. Os itens deles já chegam aqui sem o que é
+    # reservado (`sem_o_reservado`, seção 20.10), com ou sem o dado do ciclo confirmado.
+    discretos: frozenset[int] = frozenset()
 
     @cached_property
     def ativos(self) -> list[Item]:
@@ -256,17 +278,47 @@ class Dados:
                 r = f"{_cap(m.group(2))} {de_quem(*dono)}"
         return r or item.resumo
 
+    def trecho(self, item: Item) -> str:
+        """O trecho que as telas centrais podem citar: "" para a frase com palavras reservadas de um
+        registro discreto (o ciclo, seção 20.10); aí a tela cita o resumo."""
+        t = item.trecho or ""
+        if t and item.registro_id in self.discretos and recursos.texto_reservado(t):
+            return ""
+        return t
+
     def citacao(self, item: Item) -> str:
         """'Você registrou em 28/09: “...”' (o trecho é literal)."""
         dr = self.data_registro(item)
         quando = f" em {_dia(dr, self.referencia)}" if dr else ""
-        if item.trecho:
-            return f"Você registrou{quando}: “{item.trecho.strip()}”"
+        trecho = self.trecho(item)
+        if trecho:
+            return f"Você registrou{quando}: “{trecho.strip()}”"
         return f"Você registrou{quando}: {item.resumo.strip().rstrip('.')}."
 
 
+# Itens que explicariam humor ou comportamento: de uma frase do ciclo, nunca (seção 20.8).
+_TIPOS_DE_HUMOR = (TipoItem.ESTADO, TipoItem.PADRAO, TipoItem.APOIO)
+
+
+def sem_o_reservado(itens: list[Item], discretos: frozenset[int] | set[int]) -> list[Item]:
+    """Os itens que as telas centrais podem usar (seção 20.10). De um registro discreto (o ciclo):
+    - resumo, alvo ou pessoa com palavras reservadas (`recursos.texto_reservado`): o item sai;
+    - trecho com essas palavras: humor, padrão e o que ajuda saem (o ciclo nunca explica humor nem
+      entra em "Como ela está"); o resto fica, e as telas não citam a frase (`Dados.trecho`).
+    Vale com ou sem o dado do ciclo confirmado na revisão, e para registros antigos."""
+    saida: list[Item] = []
+    for item in itens:
+        if item.registro_id in discretos and (
+                recursos.texto_reservado(" ".join(x for x in (item.resumo, item.alvo, item.pessoa) if x))
+                or (item.tipo in _TIPOS_DE_HUMOR and recursos.texto_reservado(item.trecho or ""))):
+            continue
+        saida.append(item)
+    return saida
+
+
 def carregar(banco: Banco, referencia: date) -> Dados:
-    """Lê config, registros, itens, pessoas e relações (também usado por perfil.py)."""
+    """Lê config, registros, itens, pessoas e relações (também usado por perfil.py e pelos recursos).
+    Os itens já vêm sem o que é reservado de um registro discreto (`sem_o_reservado`)."""
     registros: dict[int, dict] = {}
     antes = None
     while True:
@@ -275,9 +327,11 @@ def carregar(banco: Banco, referencia: date) -> Dados:
         if len(pagina) < _PAGINA:
             break
         antes = pagina[-1]["id"]
+    discretos = frozenset(recursos.discretos(banco))
     return Dados(referencia=referencia, config=banco.config(), registros=registros,
-                 itens=banco.itens(status=None), pessoas={p["id"]: p for p in banco.pessoas()},
-                 relacoes=banco.relacoes(status=None))
+                 itens=sem_o_reservado(banco.itens(status=None), discretos),
+                 pessoas={p["id"]: p for p in banco.pessoas()},
+                 relacoes=banco.relacoes(status=None), discretos=discretos)
 
 
 # ------------------------------------------------------------------ preocupação e apoio
@@ -293,7 +347,7 @@ def _preocupacao(d: Dados, item: Item) -> tuple[bool, list[str], list[int]]:
     def mesmo_registro(outro: Item) -> None:
         nonlocal sim
         sim = True
-        if outro.trecho and outro.trecho not in citados:
+        if d.trecho(outro) and outro.trecho not in citados:
             citados.add(outro.trecho)
             frases.append(f"No mesmo registro: “{outro.trecho.strip()}”")
 
@@ -753,26 +807,145 @@ def _lembrar(d: Dados) -> list[dict]:
     for *_, item, quando in pendencias + estados:
         saida.append({"texto": f"{item.resumo.strip().rstrip('.')} ({tempo_atras((ref - quando).days)})",
                       "item_id": item.id, "registro_id": item.registro_id, "tipo": item.tipo.value,
-                      "data": quando, "certeza": Certeza(item.certeza).value, "trecho": item.trecho})
+                      "data": quando, "certeza": Certeza(item.certeza).value, "trecho": d.trecho(item)})
+
     return saida[:MAX_LEMBRAR]
 
 
 def _ultimos(d: Dados) -> list[dict]:
     recentes = sorted(d.registros.values(), key=lambda r: (r["data_registro"], r["id"]), reverse=True)
-    return [{"id": r["id"], "registro_id": r["id"], "data_registro": r["data_registro"],
-             "resumo": _encurtar(r["texto"], 140), "qtd_itens": r.get("qtd_itens", 0),
-             "categorias": list(r.get("categorias") or []), "pessoas": list(r.get("pessoas") or [])}
-            for r in recentes[:MAX_ULTIMOS]]
+    saida = []
+    for r in recentes[:MAX_ULTIMOS]:
+        if r["id"] in d.discretos:
+            # Seção 20.8: o Hoje nunca mostra o que fala do ciclo (nem o começo do texto, nem quem).
+            saida.append({"id": r["id"], "registro_id": r["id"], "data_registro": r["data_registro"],
+                          "resumo": RESUMO_DISCRETO, "qtd_itens": 0, "categorias": [], "pessoas": [],
+                          "discreto": True})
+            continue
+        saida.append({"id": r["id"], "registro_id": r["id"], "data_registro": r["data_registro"],
+                      "resumo": _encurtar(r["texto"], 140), "qtd_itens": r.get("qtd_itens", 0),
+                      "categorias": list(r.get("categorias") or []), "pessoas": list(r.get("pessoas") or [])})
+    return saida
+
+
+@dataclass
+class CartaoRecurso(Alerta):
+    """Um cartão do Hoje vindo de um recurso: `recurso` (NOME), `tipo` (o desenho da tela,
+    `registrarCartaoHoje`) e `dados` (JSON para a tela)."""
+
+    recurso: str = ""
+    tipo: str = ""
+    dados: dict = field(default_factory=dict)
+
+
+def _data_do_cartao(valor: Any) -> date | None:
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, date):
+        return valor
+    return date.fromisoformat(str(valor)[:10])
+
+
+def _cartao_de_recurso(nome: str, bruto: Any) -> CartaoRecurso | None:
+    """Alerta ou dict do recurso -> CartaoRecurso conferido; None (com log) se não serve."""
+    try:
+        if isinstance(bruto, Alerta):
+            bruto = {"chave": bruto.chave, "nivel": bruto.nivel, "texto": bruto.texto, "porque": bruto.porque,
+                     "relevancia": bruto.relevancia, "data": bruto.data, "registro_ids": bruto.registro_ids,
+                     "tipo": getattr(bruto, "tipo", None), "dados": getattr(bruto, "dados", None)}
+        if not isinstance(bruto, dict):
+            raise TypeError("cartão precisa ser um Alerta ou um dict")
+        chave, nivel, texto = bruto.get("chave"), bruto.get("nivel"), bruto.get("texto")
+        porque, relevancia = bruto.get("porque") or "", bruto.get("relevancia", 50)
+        if not isinstance(chave, str) or not chave.strip() or len(chave) > 200:
+            raise ValueError("chave")
+        if nivel not in recursos.NIVEIS or not isinstance(texto, str) or not texto.strip():
+            raise ValueError("nível ou texto")
+        if not isinstance(porque, str) or isinstance(relevancia, bool) or not isinstance(relevancia, (int, float)):
+            raise ValueError("porque ou relevância")
+        ids = bruto.get("registro_ids") or []
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+            raise ValueError("registro_ids")
+        tipo = bruto.get("tipo") or nome
+        dados = bruto.get("dados") or {}
+        # O tipo escolhe o desenho na tela (registrarCartaoHoje), que aceita só estes nomes.
+        if not isinstance(tipo, str) or not _RE_TIPO_CARTAO.fullmatch(tipo) or not isinstance(dados, dict):
+            raise ValueError("tipo ou dados")
+        dados = para_json(dados)
+        json.dumps(dados, ensure_ascii=False)
+        chave = chave.strip()
+        if not chave.startswith(f"{nome}:"):
+            chave = f"{nome}:{chave}"
+        return CartaoRecurso(chave=chave, nivel=nivel, texto=texto.strip(), porque=porque,
+                             relevancia=int(min(100, max(0, relevancia))), data=_data_do_cartao(bruto.get("data")),
+                             registro_ids=list(ids), recurso=nome, tipo=tipo, dados=dados)
+    except Exception as erro:  # noqa: BLE001 - cartão fora do contrato não aparece
+        recursos.registrar_erro(erro, nome, "cartoes_hoje (cartão)")
+        return None
+
+
+def cartoes_dos_recursos(banco: Banco, referencia: date, dispensados: set[str] | None = None) -> list[CartaoRecurso]:
+    """Os cartões de todos os recursos, conferidos e sem os dispensados (ainda sem o anti-excesso)."""
+    dispensados = banco.alertas_dispensados() if dispensados is None else dispensados
+    saida: list[CartaoRecurso] = []
+    for nome, brutos in recursos.cartoes_brutos(banco, referencia):
+        for bruto in brutos[:MAX_CARTOES_POR_RECURSO]:
+            cartao = _cartao_de_recurso(nome, bruto)
+            if cartao is not None and cartao.chave not in dispensados:
+                saida.append(cartao)
+    return saida
+
+
+def _escolher_sugestoes(do_nucleo: list[Alerta], dos_recursos: list[CartaoRecurso],
+                        referencia: date) -> list[Alerta]:
+    """As (no máximo) 2 sugestões do Hoje, uma por fornecedor (integração, seção 20.10).
+
+    A do núcleo vem primeiro (é sobre ela, agora: uma pendência vencida, um dia difícil). Depois as
+    dos recursos que pedem passagem (relevância ≥ SUGESTAO_URGENTE), pela relevância. As outras
+    entram num rodízio pelo dia: sem ele, quem tem a relevância um pouco maior (as ideias de presente
+    perto de uma data, por 45 dias) ocupava o Hoje todos os dias, e a pergunta da semana nunca
+    aparecia. O mesmo dia dá sempre a mesma escolha."""
+    urgentes = _ordenar([c for c in dos_recursos if c.relevancia >= SUGESTAO_URGENTE])
+    demais = sorted((c for c in dos_recursos if c.relevancia < SUGESTAO_URGENTE), key=lambda c: c.recurso)
+    if demais:
+        k = referencia.toordinal() % len(demais)
+        demais = demais[k:] + demais[:k]
+    return _ordenar((_ordenar(list(do_nucleo))[:MAX_SUGESTOES] + urgentes + demais)[:MAX_SUGESTOES_TOTAL])
+
+
+def _avisar_mostrados(banco: Banco, referencia: date, mostrados: list[CartaoRecurso]) -> None:
+    """Diz a cada recurso quais cartões dele passaram pelo anti-excesso (o gancho `cartoes_mostrados`):
+    quem grava "já sugeri" (as perguntas) grava só o que a pessoa viu de verdade."""
+    por_recurso: dict[str, list[dict]] = {}
+    for c in mostrados:
+        chave = c.chave[len(c.recurso) + 1:] if c.chave.startswith(f"{c.recurso}:") else c.chave
+        por_recurso.setdefault(c.recurso, []).append(
+            {"chave": chave, "nivel": c.nivel, "tipo": c.tipo, "dados": dict(c.dados or {})})
+    recursos.cartoes_mostrados(banco, referencia, por_recurso)
+
+
+def _sem_palavras_reservadas(alerta: Alerta, discretos: frozenset[int]) -> Alerta:
+    """Garantia final do Hoje (seção 20.10): cartão de recurso ligado a um registro discreto (o ciclo)
+    com palavras reservadas no texto, no porquê ou nos dados vira um aviso neutro, com a mesma chave e
+    os mesmos registros (abrir o registro mostra tudo). O texto do Hoje nunca usa essas palavras."""
+    if not isinstance(alerta, CartaoRecurso) or not discretos.intersection(alerta.registro_ids or ()):
+        return alerta
+    tudo = " ".join([alerta.texto or "", alerta.porque or "", json.dumps(alerta.dados or {}, ensure_ascii=False)])
+    if not recursos.texto_reservado(tudo):
+        return alerta
+    return Alerta(chave=alerta.chave, nivel=alerta.nivel, texto=CARTAO_RESERVADO, porque="",
+                  relevancia=alerta.relevancia, data=alerta.data, registro_ids=list(alerta.registro_ids))
 
 
 def hoje(banco: Banco, referencia: date) -> dict:
     """Tudo o que a página "Hoje" mostra.
 
-    {"alertas": [Alerta] (filtrados e em ordem: importantes, lembretes, sugestão),
+    {"alertas": [Alerta] (filtrados e em ordem: importantes, lembretes, sugestões),
      "proximos": [{data, texto, dias, tipo, item_id, registro_id, ...}] (próximos 30 dias),
      "lembrar": [{texto, item_id, registro_id, tipo, data}],
      "ultimos": [{id, data_registro, resumo, qtd_itens, categorias, pessoas}]}
-    Datas saem como `date` e alertas como `Alerta`: use modelos.para_json antes do json.dumps.
+    Datas saem como `date` e alertas como `Alerta` (os dos recursos, `CartaoRecurso`): use
+    modelos.para_json antes do json.dumps.
     """
     d = carregar(banco, referencia)
     antecedencias = d.config.get("antecedencias")
@@ -785,18 +958,29 @@ def hoje(banco: Banco, referencia: date) -> dict:
     apoio = _apoio(d)
 
     importantes, lembretes = _avisos_de_data(d, lista, antecedencias, apoio)
-    importantes = _ordenar([a for a in importantes if a.chave not in dispensados])
-    lembretes = _ordenar([a for a in lembretes if a.chave not in dispensados])[:MAX_LEMBRETES]
+    importantes = [a for a in importantes if a.chave not in dispensados]
     evitar = {r for a in importantes for r in a.registro_ids}
     sugestoes = _ordenar([a for a in _sugestoes(d, apoio, evitar) if a.chave not in dispensados])[:MAX_SUGESTOES]
 
+    # Anti-excesso central, com os cartões dos recursos (seção 20.0).
+    cartoes = cartoes_dos_recursos(banco, referencia, dispensados)
+    importantes = _ordenar(importantes + [c for c in cartoes if c.nivel == "importante"])
+    lembretes = _ordenar([a for a in lembretes if a.chave not in dispensados]
+                         + [c for c in cartoes if c.nivel == "lembrete"])[:MAX_LEMBRETES]
+    dos_recursos: list[CartaoRecurso] = []
+    for nome in dict.fromkeys(c.recurso for c in cartoes):
+        dos_recursos += _ordenar([c for c in cartoes if c.recurso == nome and c.nivel == "sugestao"])[:MAX_SUGESTOES]
+    sugestoes = _escolher_sugestoes(sugestoes, dos_recursos, referencia)
+
+    alertas_ = importantes + lembretes + sugestoes
+    _avisar_mostrados(banco, referencia, [a for a in alertas_ if isinstance(a, CartaoRecurso)])
     return {
-        "alertas": importantes + lembretes + sugestoes,
+        "alertas": [_sem_palavras_reservadas(a, d.discretos) for a in alertas_],
         "proximos": [oc.para_dict(referencia) for oc in lista if oc.dias(referencia) <= DIAS_PROXIMOS],
         "lembrar": _lembrar(d),
         "ultimos": _ultimos(d),
     }
 
 
-__all__ = ["Dados", "Ocorrencia", "carregar", "de_quem", "duracao", "hoje", "meses_completos",
-           "ocorrencias", "proximos_eventos", "somar_meses", "tempo_juntos"]
+__all__ = ["CartaoRecurso", "Dados", "Ocorrencia", "carregar", "cartoes_dos_recursos", "de_quem", "duracao", "hoje",
+           "meses_completos", "ocorrencias", "proximos_eventos", "sem_o_reservado", "somar_meses", "tempo_juntos"]

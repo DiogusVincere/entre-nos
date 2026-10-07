@@ -135,8 +135,9 @@ class TestMigracaoV3(unittest.TestCase):
         return {l[0] for l in banco._con.execute("SELECT chave FROM config")}
 
     def assert_na_v3(self, banco: Banco) -> None:
-        self.assertEqual(ESQUEMA_VERSAO, 3)
-        self.assertEqual(banco._con.execute("PRAGMA user_version").fetchone()[0], 3)
+        # Desde a seção 20.0 o esquema é o 4 (recursos_esquema): a v3 continua valendo por baixo.
+        self.assertGreaterEqual(ESQUEMA_VERSAO, 3)
+        self.assertEqual(banco._con.execute("PRAGMA user_version").fetchone()[0], ESQUEMA_VERSAO)
         self.assertIn("privado", {l[1] for l in banco._con.execute("PRAGMA table_info(registros)")})
         self.assertFalse(any(k.startswith("motor") for k in self.guardadas(banco)))
 

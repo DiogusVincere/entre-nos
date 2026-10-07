@@ -129,8 +129,9 @@ def verificar_inatividade() -> str:
 def autoteste() -> str:
     """Confere, antes de abrir qualquer diário, se este Python (o Pyodide deste navegador) tem o
     que o Entre Nós usa: SQLite com FTS5 (`remove_diacritics 2`, bm25, optimize), serialize e
-    deserialize, o esquema do diário inteiro indo e voltando, scrypt e AES-GCM com valores
-    conhecidos, o formato .cofre e os módulos importados na hora do uso. Nada vai para o disco.
+    deserialize, o autorizador do SQLite (que segura os recursos, seção 20.0), o esquema do diário
+    inteiro indo e voltando, scrypt e AES-GCM com valores conhecidos, o formato .cofre e os módulos
+    importados na hora do uso (inclusive o registro dos recursos). Nada vai para o disco.
 
     Devolve `{"ok", "falhas": ["passo: TipoDoErro"], "python", "sqlite"}` em JSON. Com `ok`
     falso, a página explica que este navegador não roda o Entre Nós, em vez de abrir pela metade.
@@ -175,6 +176,24 @@ def autoteste() -> str:
         finally:
             outra.close()
 
+    def autorizador() -> bool:
+        # Os ajudantes dos recursos (seção 20.0) confiam no autorizador do SQLite para não mexerem
+        # no que não é deles; set_authorizer(None) desliga (Python 3.11+).
+        con = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            con.execute("CREATE TABLE x (v TEXT)")
+            con.set_authorizer(lambda acao, *_: sqlite3.SQLITE_DENY if acao == sqlite3.SQLITE_INSERT else sqlite3.SQLITE_OK)
+            try:
+                con.execute("INSERT INTO x VALUES ('negado')")
+                return False
+            except sqlite3.DatabaseError:
+                pass
+            con.set_authorizer(None)
+            con.execute("INSERT INTO x VALUES ('liberado')")
+            return con.execute("SELECT v FROM x").fetchall() == [("liberado",)]
+        finally:
+            con.close()
+
     def diario() -> bool:
         from datetime import date
 
@@ -214,11 +233,14 @@ def autoteste() -> str:
             recebido.descartar()
 
     def modulos() -> None:
-        for nome in ("motor", "busca", "alertas", "perfil", "contexto", "provedores"):
+        for nome in ("motor", "busca", "alertas", "perfil", "contexto", "provedores", "recursos"):
             importlib.import_module(f"{__package__}.{nome}")
+        # Um recurso que não abre não impede o diário (seção 20.0): carrega, mas não reprova.
+        importlib.import_module(f"{__package__}.recursos").carregados()
 
     passo("sqlite_fts5", fts5)
     passo("sqlite_serialize", serializar)
+    passo("sqlite_autorizador", autorizador)
     passo("diario", diario)
     passo("criptografia", criptografia)
     passo("formato_cofre", formato_cofre)
