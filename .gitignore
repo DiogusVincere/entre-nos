@@ -1,0 +1,35 @@
+# Dados pessoais NUNCA vão para o Git (ficam em %LOCALAPPDATA%\EntreNos, mas por garantia):
+*.cofre
+*.cofre.*
+*.db
+*.sqlite
+*.sqlite3
+*.enc
+backups/
+dados/
+exportacao*.json
+entrenos-export*.json
+entre-nos-exportacao*.json
+*exportacao*.json
+erros.log
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Empacotamento (construir_instalador.ps1): PyInstaller em build\, instalador em dist\
+build/
+dist/
+
+# Configuração local (pode ter URL/chave de IA)
+config.local.json
+.env
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store

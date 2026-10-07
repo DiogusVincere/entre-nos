@@ -1,0 +1,42 @@
+# Gera o instalador do Entre Nós num computador Windows do próprio GitHub.
+# Como usar: no site do repositório, Actions -> "Instalador" -> Run workflow. No fim, o arquivo
+# fica em Artifacts ("EntreNos-Setup"), para baixar no computador onde vai instalar.
+# Só roda quando você pede (nada de rodar a cada envio).
+name: Instalador
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  instalador:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Bibliotecas
+        run: python -m pip install --disable-pip-version-check cryptography rapidfuzz pyinstaller
+
+      - name: Inno Setup 6
+        run: choco install innosetup --no-progress -y
+
+      - name: Testes e instalador
+        shell: powershell
+        run: |
+          $python = (Get-Command python).Source
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          .\construir_instalador.ps1 -Python $python -Iscc $iscc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EntreNos-Setup
+          path: dist/EntreNos-Setup-*.exe
+          if-no-files-found: error
+          retention-days: 14

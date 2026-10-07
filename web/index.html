@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#FBF7F2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1D2A" media="(prefers-color-scheme: dark)">
+<title>Entre Nós</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%233D5A80'/%3E%3Cpath d='M32 50C32 50 14 40 14 27.5C14 21.7 18.5 17 24 17C27.5 17 30.5 18.9 32 21.8C33.5 18.9 36.5 17 40 17C45.5 17 50 21.7 50 27.5C50 40 32 50 32 50Z' fill='%23E07A5F'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="estilo.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="pular" id="pular" href="#conteudo">Pular para o conteúdo</a>
+
+<p id="carregando" class="sem-script" role="status">Abrindo o Entre Nós… Se esta mensagem não sumir, falta um arquivo do programa (o antivírus pode tê-lo colocado em quarentena): reinstale o Entre Nós, rodando o instalador de novo por cima, ou peça à TI para restaurar o arquivo. Não desligue o antivírus. Seu diário não foi afetado.</p>
+
+<div id="portao" class="portao" tabindex="-1" hidden></div>
+
+<div id="app" class="app" hidden>
+  <nav class="nav-lateral" aria-label="Menu principal">
+    <p class="marca"><span class="marca-icone" aria-hidden="true">💙</span> Entre Nós</p>
+    <ul class="nav-lista">
+      <li><a href="#hoje" data-rota="hoje"><span class="nav-icone" aria-hidden="true">💙</span><span>Hoje</span></a></li>
+      <li><a href="#registrar" data-rota="registrar"><span class="nav-icone" aria-hidden="true">✍️</span><span>Registrar</span></a></li>
+      <li><a href="#ela" data-rota="ela"><span class="nav-icone" aria-hidden="true">🌷</span><span>Conhecendo Ela</span></a></li>
+      <li><a href="#datas" data-rota="datas"><span class="nav-icone" aria-hidden="true">📅</span><span>Datas</span></a></li>
+      <li><a href="#buscar" data-rota="buscar"><span class="nav-icone" aria-hidden="true">🔎</span><span>Buscar</span></a></li>
+      <li><a href="#registros" data-rota="registros"><span class="nav-icone" aria-hidden="true">📖</span><span>Registros</span></a></li>
+      <li><a href="#ajustes" data-rota="ajustes"><span class="nav-icone" aria-hidden="true">⚙️</span><span>Ajustes</span></a></li>
+    </ul>
+    <button type="button" class="nav-bloquear" data-acao="bloquear"><span aria-hidden="true">🔒</span> Bloquear agora</button>
+  </nav>
+
+  <main id="conteudo" class="conteudo" tabindex="-1"></main>
+
+  <nav class="nav-inferior" aria-label="Menu principal">
+    <ul>
+      <li><a href="#hoje" data-rota="hoje"><span class="nav-icone" aria-hidden="true">💙</span><span class="nav-rotulo">Hoje</span></a></li>
+      <li><a href="#ela" data-rota="ela"><span class="nav-icone" aria-hidden="true">🌷</span><span class="nav-rotulo">Ela</span></a></li>
+      <li><a href="#registrar" data-rota="registrar" class="nav-registrar"><span class="nav-icone" aria-hidden="true">✍️</span><span class="nav-rotulo">Registrar</span></a></li>
+      <li><a href="#buscar" data-rota="buscar"><span class="nav-icone" aria-hidden="true">🔎</span><span class="nav-rotulo">Buscar</span></a></li>
+      <li><button type="button" id="botao-mais" aria-expanded="false" aria-controls="menu-mais"><span class="nav-icone" aria-hidden="true">☰</span><span class="nav-rotulo">Mais</span></button></li>
+    </ul>
+    <div id="menu-mais" class="menu-mais" hidden>
+      <a href="#datas" data-rota="datas"><span aria-hidden="true">📅</span> Datas</a>
+      <a href="#registros" data-rota="registros"><span aria-hidden="true">📖</span> Registros</a>
+      <a href="#ajustes" data-rota="ajustes"><span aria-hidden="true">⚙️</span> Ajustes</a>
+      <button type="button" data-acao="bloquear"><span aria-hidden="true">🔒</span> Bloquear agora</button>
+    </div>
+  </nav>
+</div>
+
+<div id="falar" class="so-leitor" aria-live="polite"></div>
+<div id="avisos" class="avisos"></div>
+
+<dialog id="dialogo" class="dialogo" aria-labelledby="dialogo-titulo" aria-describedby="dialogo-texto">
+  <form method="dialog">
+    <h2 id="dialogo-titulo">Confirmar</h2>
+    <p id="dialogo-texto"></p>
+    <div class="dialogo-acoes">
+      <button type="submit" value="cancelar" id="dialogo-cancelar" class="botao botao-secundario">Cancelar</button>
+      <button type="submit" value="ok" id="dialogo-ok" class="botao botao-primario">Confirmar</button>
+    </div>
+  </form>
+</dialog>
+
+<noscript><p class="sem-script">O Entre Nós precisa do JavaScript ligado no navegador para funcionar.</p></noscript>
+</body>
+</html>
