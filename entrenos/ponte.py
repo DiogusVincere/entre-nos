@@ -17,6 +17,9 @@ Worker manda o IDBFS gravar no armazenamento do navegador (`FS.syncfs(false, ...
 
 Ordem no Worker: carregar o Pyodide e o `cryptography`, chamar `autoteste()` (este navegador tem
 tudo o que o app usa?), montar o IDBFS, `FS.syncfs(true, ...)` e só então `iniciar_no_navegador`.
+
+`agenda_de_avisos()` (seção 21.5): só os dias com lembretes e quantos, para o Worker guardar fora do
+cofre quando os avisos estão ligados. O Worker é web/trabalhador.mjs (seção 21.6).
 """
 from __future__ import annotations
 
@@ -111,6 +114,33 @@ def restaurar_arquivo(arquivo: Any, corpo_texto: str | None = None, token: str |
     return _saida(resposta, _assinatura(nucleo.pasta) != antes)
 
 
+_copia_pronta: bytes | None = None
+
+
+def baixar_copia(token: str | None = None) -> str:
+    """POST /api/backup/baixar sem base64 (22.2): a mesma saída de `tratar_json`, com `dados` = {nome,
+    tamanho}; os bytes do .cofre ficam guardados aqui até o Worker buscá-los com `copia_em_bytes()`
+    (e transferi-los para a página como ArrayBuffer). Nunca levanta."""
+    global _copia_pronta
+    _copia_pronta = None
+    nucleo = _nucleo
+    if nucleo is None:
+        return _saida(resposta_de_erro(ErroHttp(503, NAO_INICIADO)), False)
+    antes = _assinatura(nucleo.pasta)
+    try:
+        resposta, _copia_pronta = nucleo.baixar_copia(_texto(token) or None)
+    except Exception as erro:  # noqa: BLE001
+        resposta = resposta_de_erro(erro)
+    return _saida(resposta, _assinatura(nucleo.pasta) != antes)
+
+
+def copia_em_bytes() -> bytes:
+    """Os bytes da cópia preparada por `baixar_copia` (uma vez só: depois daqui, a referência sai)."""
+    global _copia_pronta
+    copia, _copia_pronta = _copia_pronta, None
+    return copia or b""
+
+
 def verificar_inatividade() -> str:
     """Para o Worker chamar de tempos em tempos: bloqueia se passou do tempo sem uso.
     Devolve `{"bloqueou", "gravou"}` em JSON."""
@@ -124,6 +154,24 @@ def verificar_inatividade() -> str:
         registrar_erro(erro)
         bloqueou = False
     return json.dumps({"bloqueou": bool(bloqueou), "gravou": _assinatura(nucleo.pasta) != antes})
+
+
+def agenda_de_avisos() -> str:
+    """A agenda de avisos (seção 21.5), para o Worker guardar fora do cofre depois de cada
+    gravação: `{"aberto", "dias": {"AAAA-MM-DD": n}, "gravou"}` em JSON. Só datas e contagens:
+    nada de texto, tipo, nome ou registro. Com o diário bloqueado, `aberto` é falso e `dias` vem
+    vazio (o Worker então mantém a agenda que já tinha). Não conta como uso. Nunca levanta."""
+    nucleo = _nucleo
+    if nucleo is None:
+        return json.dumps({"aberto": False, "dias": {}, "gravou": False})
+    antes = _assinatura(nucleo.pasta)
+    try:
+        dias = nucleo.agenda_de_avisos()
+    except Exception as erro:  # noqa: BLE001 - sem agenda nova, fica a que já existia
+        registrar_erro(erro)
+        dias = None
+    return json.dumps({"aberto": dias is not None, "dias": dias or {},
+                       "gravou": _assinatura(nucleo.pasta) != antes})
 
 
 def autoteste() -> str:
@@ -210,6 +258,23 @@ def autoteste() -> str:
         finally:
             copia.fechar()
 
+    def json_dos_recursos() -> bool:
+        # json_each numa conexão nova, pelo Banco.consultar (com o autorizador de leitura dos
+        # recursos), num banco novo e num aberto de bytes: no SQLite 3.39 do Pyodide ele falhava
+        # até alguém usá-lo sem autorizador antes (seção 21.7).
+        from .banco import Banco
+        novo = Banco.novo()
+        try:
+            dados = novo.para_bytes()
+            certo = [l["value"] for l in novo.consultar("SELECT value FROM json_each('[1,2]')")] == [1, 2]
+        finally:
+            novo.fechar()
+        aberto = Banco.de_bytes(dados)
+        try:
+            return certo and [l["value"] for l in aberto.consultar("SELECT value FROM json_each('[3]')")] == [3]
+        finally:
+            aberto.fechar()
+
     def criptografia() -> bool:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -242,6 +307,7 @@ def autoteste() -> str:
     passo("sqlite_serialize", serializar)
     passo("sqlite_autorizador", autorizador)
     passo("diario", diario)
+    passo("json_dos_recursos", json_dos_recursos)
     passo("criptografia", criptografia)
     passo("formato_cofre", formato_cofre)
     passo("modulos", modulos)
@@ -334,4 +400,5 @@ def _assinatura(pasta: Path) -> tuple:
     return tuple(sorted(itens))
 
 
-__all__ = ["autoteste", "iniciar_no_navegador", "restaurar_arquivo", "tratar_json", "verificar_inatividade"]
+__all__ = ["agenda_de_avisos", "autoteste", "iniciar_no_navegador", "restaurar_arquivo", "tratar_json",
+           "verificar_inatividade"]

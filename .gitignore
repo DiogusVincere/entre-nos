@@ -26,6 +26,11 @@ venv/
 build/
 dist/
 
+# Site do celular (construir_web.py, DESIGN.md seção 21): gerado a cada build
+site/
+web/entrenos-py.zip
+web/entrenos-py.zip.tmp
+
 # Configuração local (pode ter URL/chave de IA)
 config.local.json
 .env

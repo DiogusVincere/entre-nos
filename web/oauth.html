@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Entre Nós: conectando ao Google</title>
+<link rel="stylesheet" href="estilo.css">
+<!-- A volta do login do Google (sincronização, DESIGN.md seção 22.2). Página estática, SEM o app:
+     o oauth.js entrega o acesso à página do Entre Nós que abriu esta janela (mesmo endereço) e fecha. -->
+<script src="oauth.js" defer></script>
+</head>
+<body class="pagina-oauth">
+<main class="portao">
+  <div class="portao-cartao cartao">
+    <h1>Entre Nós</h1>
+    <p id="oauth-mensagem" role="status">Conectando ao Google…</p>
+  </div>
+</main>
+</body>
+</html>

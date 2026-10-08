@@ -516,16 +516,29 @@ class Cofre:
                 self._conferir_marca()
             return self._ler()
 
-    def copiar_backup(self, destino: Path) -> Path:
-        """Copia o arquivo cifrado para `destino` como entrenos-backup-AAAA-MM-DD.cofre.
+    def cifrar_dados(self, dados: bytes) -> bytes:
+        """Um .cofre com `dados` (outro banco serializado), cifrado com a chave e o sal do diário
+        aberto (abre com o mesmo PIN). Não grava nada: é para as cópias que saem do aparelho sem
+        algum segredo (a chave da sincronização, seção 22.2). CofreMudou se outra aba gravou no
+        arquivo (a cópia não seria a desta), como `conteudo`."""
+        with self._trava:
+            if self._chave is None:
+                raise CofreFechado("O cofre está bloqueado; desbloqueie antes.")
+            self._conferir_marca()
+            return _cifrar(self._chave, self._sal, self._parametros, bytes(dados))
+
+    def copiar_backup(self, destino: Path, conteudo: bytes | None = None) -> Path:
+        """Copia o arquivo cifrado (ou `conteudo`, um .cofre já pronto) para `destino` como
+        entrenos-backup-AAAA-MM-DD.cofre.
 
         Nunca sobrescreve: se já houver cópia do dia, acrescenta -2, -3...
         """
         destino = Path(destino)
         if not destino.is_dir():
             raise NotADirectoryError("A pasta de destino não existe.")
-        with self._trava:
-            conteudo = self._ler()
+        if conteudo is None:
+            with self._trava:
+                conteudo = self._ler()
         base = f"entrenos-backup-{self.hoje():%Y-%m-%d}"
         for numero in range(1, 1000):
             alvo = destino / (base + (f"-{numero}" if numero > 1 else "") + ".cofre")

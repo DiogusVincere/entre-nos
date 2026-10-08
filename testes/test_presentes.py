@@ -263,6 +263,24 @@ class TestNaoInventa(unittest.TestCase):
                   "Dei um tempo pra ela pensar.", "Dei um beijo nela.", "dei um bolo nela ontem, vacilei",
                   "Dei uma força pra ela no TCC.", "Comprei um remédio pra ela.")
 
+    def test_gesto_do_dia_a_dia_nao_e_presente(self):
+        # Correção final de 08/10 (20.2): levar café para ela é um gesto (atitude), não um presente. Sem
+        # verbo de dar/presentear/ganhar e sem marca de presente, só um objeto claramente de presente vale.
+        self.nada("Levei café para ela no trabalho.", "Levei café para ela de manhã.", "Fiz um bolo pra ela.",
+                  "Comprei pão pra ela.", "Levei um lanche pra ela no trabalho.", "Trouxe água pra ela.",
+                  "Preparei um chá pra ela quando ela chegou cansada.")
+
+    def test_gesto_com_objeto_ou_marca_de_presente_vale(self):
+        self.assertEqual(self.um_presente("Levei flores para ela.")["descricao"], "flores")
+        self.assertEqual(self.um_presente("Levei um café de presente pra ela.")["descricao"], "café")
+        self.assertEqual(self.um_presente("Trouxe um chocolate pra ela.")["descricao"], "chocolate")
+        self.assertEqual(self.um_presente("Dei café pra ela.")["descricao"], "café")          # verbo de dar
+
+    def um_presente(self, texto: str) -> dict:
+        achados = [e for e in extras(texto) if e["tipo"] == "presente"]
+        self.assertEqual(len(achados), 1, (texto, achados))
+        return achados[0]
+
     def test_ganhar_que_nao_e_presente(self):
         self.nada("Ela ganhou o jogo de tabuleiro ontem.", "Ela ganhou uma promoção no trabalho!",
                   "Ela ganhou peso nas férias.", "Ela ganhou um sobrinho!", "Ela ganhou um celular num sorteio.")

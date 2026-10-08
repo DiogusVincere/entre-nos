@@ -48,7 +48,7 @@ Em `%LOCALAPPDATA%\EntreNos` (nunca na pasta do código):
 
 - O servidor escuta só em `127.0.0.1`: outro computador da rede não enxerga nada.
   Sem CDN, sem fonte externa, sem telemetria. A internet só é usada se você configurar uma IA
-  na internet, e só quando tocar num botão ✨.
+  na internet (e só quando tocar num botão ✨) ou ligar a sincronização com o Google Drive.
 - A página só conversa com o próprio Entre Nós (proteções contra outras páginas abertas no
   navegador) e cada sessão tem uma chave própria.
 - Bloqueia sozinho depois de 10 minutos sem uso (dá para mudar em Ajustes). Ao bloquear, a
@@ -62,6 +62,10 @@ Em `%LOCALAPPDATA%\EntreNos` (nunca na pasta do código):
 - O banco é montado só na memória: nem as cópias temporárias do SQLite vão para o disco.
 - **Exportar** gera um JSON **sem criptografia**: guarde com cuidado e apague quando não
   precisar mais.
+- **Sincronização** (opcional, desligada até você ligar): os arquivos vão para o seu Google
+  Drive embaralhados com a senha de sincronização. Nenhum código do Google roda dentro do Entre
+  Nós: o login é uma janela do Google que volta para cá, e o acesso fica só na memória da tela
+  (esquecido quando o Entre Nós se bloqueia). Veja "Sincronizar entre aparelhos".
 
 ## Cópia de segurança, restaurar e importar
 
@@ -251,6 +255,139 @@ segunda senha do arquivo: quem souber o PIN principal consegue ler a chave. Chav
 só com `sk-` são de vários serviços (OpenAI, DeepSeek, Moonshot...): nesse caso escolha o serviço
 na lista.
 
+## No celular
+
+O mesmo Entre Nós abre no iPhone, no Android e em qualquer navegador como **app instalável**
+(PWA), sem servidor: o próprio código Python roda dentro do navegador (Pyodide) e o diário fica
+**no aparelho**, criptografado, no mesmo formato `.cofre` do computador. O site guarda só o código
+do app; nada do que você escreve vai para ele.
+
+**Montar o site** (na raiz do projeto):
+
+```
+python construir_web.py
+```
+
+Gera a pasta `site/` (não vai para o Git): confere o Pyodide guardado em `web/pyodide/314.0.7/`
+(SHA-256 de cada arquivo e das rodas) e as licenças, empacota o código Python em
+`web/entrenos-py.zip` (sem o `servidor.py`), grava o `sw.js` com a versão e o `_headers` com a
+política de segurança (a do computador, mais a permissão de rodar WebAssembly para o Python), uma
+vez só, em todos os endereços do site. O `404.html` faz um endereço que não existe responder
+"página não encontrada", em vez do app. Não gera `.exe`.
+
+**Publicar** (Cloudflare Pages, grátis, HTTPS): você cria a conta e liga o repositório privado do
+GitHub (os logins são seus). Comando de build `python construir_web.py`, pasta de saída `site`.
+Cada push publica a versão nova; quem estiver com o app aberto vê "Nova versão do Entre Nós
+disponível" e escolhe quando recarregar.
+
+**Usar:**
+- Na primeira vez o app inteiro (uns 16 MB) vem para o aparelho: prefira o Wi-Fi; pode levar até
+  um minuto. Depois abre rápido, mesmo sem internet. Dá para ir digitando o PIN enquanto ele
+  termina de abrir.
+- **iPhone:** abra o endereço no Safari. Antes de baixar o app, ele mostra os passos para instalar:
+  toque em Compartilhar (no iOS 26, dentro do menu ⋯) → **Adicionar à Tela de Início** (deixe
+  "Abrir como App Web" ligado, se aparecer) e crie o diário **no app instalado**. O app instalado
+  guarda os dados separado do Safari: um diário criado no Safari não aparece no app.
+- **Android e computador (Chrome, Edge):** Ajustes → Este aparelho → **Instalar o app**.
+- Só uma janela por vez é dona do diário: numa segunda aba aparece "já está aberto em outra
+  janela", e ela abre sozinha quando a primeira fechar.
+- **Cópias:** Ajustes → Levar ou trazer dados → **Baixar uma cópia** (compartilhar para o
+  Arquivos, o Drive, o e-mail, ou baixar: costuma ficar em Downloads). É o mesmo `.cofre` do
+  computador: um backup do PC restaura no celular e vice-versa, com o PIN daquele backup. A cópia
+  não leva a senha de sincronização (restaurada, ela é pedida de novo). Antes de restaurar no
+  celular, baixe uma cópia de agora (o botão está ali mesmo): a cópia interna que o app guarda
+  ainda não abre pela tela.
+- **Proteção contra limpeza:** Ajustes → Este aparelho mostra o espaço usado e pede ao navegador
+  para não apagar os dados do site. Limpar os dados do site apaga o diário deste aparelho: faça
+  cópias de vez em quando.
+- **Avisos** (Android e computador, com o app instalado no Chrome ou no Edge): Ajustes → Este
+  aparelho → Avisos. Uma vez por dia, se houver lembretes, aparece "Você tem 2 lembretes hoje no
+  Entre Nós", sem dizer quais. Para isso fica fora do diário cifrado só a lista de **dias** com
+  lembretes e quantos; desligar os avisos (ou o aparelho tirar a permissão) apaga essa lista. O
+  Entre Nós só pede a permissão de notificação depois de conferir que o aparelho consegue avisar.
+  No iPhone, ainda não.
+- A **IA** não aparece no celular por enquanto.
+
+## Sincronizar entre aparelhos
+
+Opcional e desligada até você ligar em **Ajustes → ☁️ Sincronização**. Com ela ligada, cada
+aparelho (o computador, o celular, um tablet) guarda no **seu** Google Drive, numa pasta escondida
+do app, um arquivo **embaralhado com a senha de sincronização**, e junta o que os outros
+escreveram. O Google só vê arquivos sem sentido; a senha e a chave nunca saem dos aparelhos.
+
+**O que acontece:**
+- Registros novos de cada aparelho aparecem nos outros, sem duplicar. O 🔒, os dados do ciclo, da
+  área Eu e dos outros recursos vão junto (sempre embaralhados).
+- O que você apaga num aparelho some dos outros e **não volta** (fica só uma "impressão" do que
+  foi apagado, sem conteúdo nenhum).
+- A mesma informação mudou em dois aparelhos? Vale a mudança mais recente. Mudou quase ao mesmo
+  tempo (menos de 2 minutos de diferença)? A tela pergunta qual versão fica. O 🔒 não pergunta: na
+  dúvida, fica 🔒.
+- Sincroniza sozinho **enquanto o acesso ao Google valer** (cerca de uma hora, limite do Google
+  para apps sem servidor): ao abrir, uns 30 segundos depois de salvar e quando você toca em
+  **Sincronizar agora**. Sem internet, fica na fila e vai quando a conexão voltar.
+- Quando o Entre Nós se bloqueia ou é fechado, o acesso ao Google é esquecido. Aí um selo
+  **☁️ Sincronizar** aparece no alto da tela ("Não sincronizado desde 14:20", "Salvo só neste
+  aparelho"): um toque abre a janela do Google e sincroniza. O selo também avisa quando há uma
+  pergunta da sincronização para responder.
+- Cada aparelho tem o seu diário e o seu PIN; a **senha de sincronização** é outra, a mesma em
+  todos os aparelhos. Ela precisa ser forte (pelo menos 14 caracteres e 3 palavras diferentes; a
+  tela sugere uma frase de 4 palavras ao acaso), porque quem tiver os arquivos do Drive pode testar
+  senhas fora do app. Pode ser igual ao PIN, mas a tela avisa antes (quem descobrir uma sabe a
+  outra). Não existe recuperação dela.
+
+**O que você precisa (uma vez só, uns 10 minutos): o "ID do app" do Google.** Ele diz ao Google que
+é o seu Entre Nós pedindo acesso; não é segredo, é grátis e sozinho não dá acesso a nada.
+
+1. Entre em <https://console.cloud.google.com> com a sua conta do Google e crie um projeto (por
+   exemplo, "Entre Nós").
+2. Em **APIs e serviços → Biblioteca**, procure **Google Drive API** e toque em **Ativar**.
+3. Em **Google Auth Platform** (ou "Tela de permissão OAuth"): tipo de usuário **Externo**, nome do
+   app "Entre Nós" e o seu e-mail. Em **Público** (ou "Usuários de teste"), adicione o **seu
+   próprio e-mail**. O app fica "em teste": só os e-mails da lista conseguem entrar. Nesse modo o
+   Google pode pedir a autorização de novo a cada 7 dias; se incomodar, toque em **Publicar app**
+   (o Entre Nós só pede a pasta escondida do app, e em geral o Google não exige verificação para
+   isso).
+4. Em **Clientes** (ou **Credenciais → Criar credenciais**), crie um **ID do cliente OAuth** do tipo
+   **Aplicativo da Web**.
+5. Em **Origens JavaScript autorizadas**, adicione, cada um numa linha e sem barra no fim:
+   - o endereço do site do celular (por exemplo, `https://entre-nos.pages.dev`);
+   - `http://localhost:8787` (o computador; se o seu Entre Nós abrir em outra porta, essa porta).
+   O Google não aceita `127.0.0.1`: para sincronizar no computador, abra o Entre Nós por
+   `http://localhost:8787` (a tela de Ajustes mostra o link).
+6. Em **URIs de redirecionamento autorizados** (para onde o Google volta depois do login), adicione
+   os mesmos endereços seguidos de `/oauth.html`: `https://entre-nos.pages.dev/oauth.html` e
+   `http://localhost:8787/oauth.html`. Salve.
+7. Copie o **ID do cliente** (termina em `.apps.googleusercontent.com`) e cole em Ajustes → ☁️
+   Sincronização, **em cada aparelho**.
+
+**Ligar:** cole o ID do app → **Conectar ao Google** (na primeira vez o Google avisa que o app "não
+foi verificado": é o seu próprio app, toque em Continuar; a permissão pedida é só guardar os dados
+do app numa pasta escondida do seu Drive, ele não vê seus outros arquivos) → no primeiro aparelho,
+**crie** a senha de sincronização; nos outros, **digite** a mesma. Use a **mesma conta do Google**
+em todos: se a tela pedir para criar a senha num aparelho que não é o primeiro, você entrou com
+outra conta. Para levar o ID ao celular, toque em "Copiar o ID" e mande para você mesmo.
+
+**No iPhone**, com o app instalado na Tela de Início, a janela de login do Google às vezes não abre
+ou não volta para o app. Se acontecer, use o caminho manual: **Baixar uma cópia** num aparelho e
+**restaurar** (troca tudo) ou **Importar JSON** (junta) no outro.
+
+**Desconectar do Google** esquece e revoga o acesso neste aparelho (a senha continua guardada).
+**Parar de sincronizar neste aparelho** tira a senha e a chave daqui (e das cópias automáticas) e,
+com o Google conectado, apaga o arquivo deste aparelho no Drive; os seus registros continuam. O que
+você apagar com a sincronização parada não volta se ligar de novo com a mesma senha. Para apagar
+tudo do Drive de vez (ou se esqueceu a senha): pare em todos os aparelhos e apague os dados do app
+em drive.google.com → Configurações → Gerenciar apps → Entre Nós → Opções → Excluir dados de apps
+ocultos.
+
+**Restaurar um backup** com a sincronização ligada não "volta no tempo": o que está nos outros
+aparelhos volta na próxima sincronização, e o que foi apagado neles continua apagado.
+
+**O que fica no Drive:** `entrenos-sync.json` (sal, parâmetros e um verificador da senha, nunca a
+senha nem a chave) e um `entrenos-<aparelho>.sync` por aparelho, cifrado (AES-256-GCM), com o
+tamanho arredondado em degraus (o Google não vê quanto você escreve). Cada aparelho só escreve o
+seu arquivo e apaga as versões antigas dele que o Drive guarda.
+
 ## Testes
 
 ```
@@ -260,3 +397,21 @@ python -m unittest discover -s testes -t .
 
 Os testes usam uma pasta temporária (variável `ENTRENOS_DADOS`) e nunca tocam nos seus dados.
 O contrato entre os módulos está em `DESIGN.md`.
+
+O app do celular é testado também com o **Pyodide de verdade**, no Node (o do VS Code serve), sem
+navegador: monta o site numa pasta temporária, carrega o Python, faz o fluxo inteiro, abre no
+Pyodide um `.cofre` criado pelo Python do PC (e o contrário) e mede os tempos.
+
+```
+$env:ELECTRON_RUN_AS_NODE='1'; & "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe" testes\navegador\teste_pyodide.mjs
+```
+
+A sincronização da página (`web/sincronizar.js`) é testada contra um **Google Drive de mentira**
+(um servidor local que imita os endereços da Drive API: token vencido, sem rede, erros do Google,
+revisões), com o login do Google de mentira (a janela e a volta pelo `oauth.html`), três aparelhos
+rodando o núcleo de verdade no Pyodide, e a tela de Ajustes num DOM de mentira.
+Nada vai para o Google:
+
+```
+$env:ELECTRON_RUN_AS_NODE='1'; & "$env:LOCALAPPDATA\Programs\Microsoft VS Code\Code.exe" testes\navegador\teste_sincronizar.mjs
+```

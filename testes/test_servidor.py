@@ -433,8 +433,17 @@ class TestSeguranca(unittest.TestCase):
         self.assertEqual(self.s.pedir("POST", "/index.html", {}).status, 405)
 
     def test_cabecalhos_da_api(self):
-        csp = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
-               "connect-src 'self'; frame-ancestors 'none'")
+        # Seção 21.3: 'wasm-unsafe-eval' (só WebAssembly, nunca eval de JavaScript), worker-src e
+        # manifest-src entraram para o modo navegador. Seção 22: só os endereços do Google que o login
+        # e a Drive API da sincronização usam; o resto continua como antes.
+        # Seção 22.2: nenhum código do Google na página (login por janela, sem biblioteca); no PC a
+        # página não roda WebAssembly (o 'wasm-unsafe-eval' é só do site, construir_web.csp_do_site).
+        csp = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; worker-src 'self'; "
+               "connect-src 'self' https://www.googleapis.com/drive/v3/ https://www.googleapis.com/upload/drive/v3/ "
+               "https://oauth2.googleapis.com/revoke; manifest-src 'self'; object-src 'none'; form-action 'self'; "
+               "frame-ancestors 'none'")
+        self.assertNotIn("'unsafe-eval'", servidor.CSP)
+        self.assertNotIn("unsafe-inline", servidor.CSP)
         for r in (self.s.pedir("GET", "/api/config"), self.s.pedir("GET", "/api/nada"),
                   self.s.pedir("GET", "/api/config", token=None)):
             self.assertTrue(r.cabecalhos["Content-Security-Policy"].startswith(csp))

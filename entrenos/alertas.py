@@ -26,6 +26,7 @@ apareceram (`cartoes_mostrados`); e o registro discreto (o ciclo) não mostra o 
 from __future__ import annotations
 
 import calendar
+import copy
 import json
 import re
 from dataclasses import dataclass, field
@@ -318,7 +319,28 @@ def sem_o_reservado(itens: list[Item], discretos: frozenset[int] | set[int]) -> 
 
 def carregar(banco: Banco, referencia: date) -> Dados:
     """Lê config, registros, itens, pessoas e relações (também usado por perfil.py e pelos recursos).
-    Os itens já vêm sem o que é reservado de um registro discreto (`sem_o_reservado`)."""
+    Os itens já vêm sem o que é reservado de um registro discreto (`sem_o_reservado`).
+
+    A leitura fica guardada até a próxima escrita no banco (`Banco.lembrar`, seção 22.2): uma abertura
+    do Hoje carregava tudo 3 vezes (o núcleo, lugares e presentes). Cada chamada recebe cópias (os
+    contêineres, os dicts e os itens), para ninguém mudar o que a próxima vai ler."""
+    lembrar = getattr(banco, "lembrar", None)
+    discretos = frozenset(recursos.discretos(banco))
+    if callable(lembrar):
+        # A chave muda com os ganchos que decidem o que é reservado (num teste, outro recurso no ar).
+        ganchos = [(n, id(f)) for n, f in recursos.com_gancho("reservado")]
+        bruto = lembrar(f"alertas.carregar:{id(recursos.texto_reservado)}:{ganchos}:{sorted(recursos.falhas())}:"
+                        f"{sorted(discretos)}", lambda: _ler_dados(banco, discretos))
+    else:
+        bruto = _ler_dados(banco, discretos)
+    config, registros, itens, pessoas, relacoes = bruto
+    return Dados(referencia=referencia, config=copy.deepcopy(config),
+                 registros={k: dict(v) for k, v in registros.items()},
+                 itens=[copy.copy(i) for i in itens], pessoas={k: dict(v) for k, v in pessoas.items()},
+                 relacoes=[copy.copy(r) for r in relacoes], discretos=discretos)
+
+
+def _ler_dados(banco: Banco, discretos: frozenset[int]) -> tuple:
     registros: dict[int, dict] = {}
     antes = None
     while True:
@@ -327,11 +349,8 @@ def carregar(banco: Banco, referencia: date) -> Dados:
         if len(pagina) < _PAGINA:
             break
         antes = pagina[-1]["id"]
-    discretos = frozenset(recursos.discretos(banco))
-    return Dados(referencia=referencia, config=banco.config(), registros=registros,
-                 itens=sem_o_reservado(banco.itens(status=None), discretos),
-                 pessoas={p["id"]: p for p in banco.pessoas()},
-                 relacoes=banco.relacoes(status=None), discretos=discretos)
+    return (banco.config(), registros, sem_o_reservado(banco.itens(status=None), discretos),
+            {p["id"]: p for p in banco.pessoas()}, banco.relacoes(status=None))
 
 
 # ------------------------------------------------------------------ preocupação e apoio
@@ -639,19 +658,35 @@ def _texto_data(oc: Ocorrencia, dias: int) -> str:
     return f"{_quando_futuro(dias)}: {oc.texto.rstrip('.')}."
 
 
+def _nivel_do_aviso(oc: Ocorrencia, dias: int, antecedencias: set[int]) -> str | None:
+    """"importante", "lembrete" ou None: o aviso que a data `oc` dá a `dias` dias dela. O mesmo
+    para a página Hoje e para a agenda de avisos do celular (seção 21.5)."""
+    if not oc.avisa or dias < 0:
+        return None
+    if oc.so_namoro:
+        return "lembrete" if dias in DIAS_NAMORO else None
+    if dias <= 1:
+        return "importante"
+    return "lembrete" if dias in antecedencias else None
+
+
+def _chave_do_aviso(oc: Ocorrencia, dias: int) -> str:
+    return f"{oc.origem}:{oc.data.isoformat()}:d{dias}"
+
+
+def _antecedencias(d: Dados) -> set[int]:
+    antecedencias = d.config.get("antecedencias")
+    if antecedencias is None:
+        antecedencias = cfg.ANTECEDENCIAS_PADRAO
+    return {int(x) for x in antecedencias}
+
+
 def _avisos_de_data(d: Dados, lista: list[Ocorrencia], antecedencias: set[int],
                     apoio: tuple[list[str], list[int]]) -> tuple[list[Alerta], list[Alerta]]:
     importantes, lembretes = [], []
     for oc in lista:
         dias = oc.dias(d.referencia)
-        if not oc.avisa or dias < 0:
-            continue
-        if oc.so_namoro:
-            nivel = "lembrete" if dias in DIAS_NAMORO else None
-        elif dias <= 1:
-            nivel = "importante"
-        else:
-            nivel = "lembrete" if dias in antecedencias else None
+        nivel = _nivel_do_aviso(oc, dias, antecedencias)
         if nivel is None:
             continue
         porque = list(oc.porque)
@@ -664,7 +699,7 @@ def _avisos_de_data(d: Dados, lista: list[Ocorrencia], antecedencias: set[int],
         else:
             relevancia = max(40, 80 - dias) + (5 if oc.tipo in ("aniversario_dela", "namoro", "mesversario") else 0) \
                 + (3 if oc.preocupacao or oc.importancia >= 3 else 0)
-        alerta = Alerta(chave=f"{oc.origem}:{oc.data.isoformat()}:d{dias}", nivel=nivel,
+        alerta = Alerta(chave=_chave_do_aviso(oc, dias), nivel=nivel,
                         texto=_texto_data(oc, dias), porque=" ".join(porque),
                         relevancia=min(100 if nivel == "importante" else 89, relevancia), data=oc.data,
                         registro_ids=list(dict.fromkeys(r for r in registros if r)))
@@ -948,10 +983,7 @@ def hoje(banco: Banco, referencia: date) -> dict:
     modelos.para_json antes do json.dumps.
     """
     d = carregar(banco, referencia)
-    antecedencias = d.config.get("antecedencias")
-    if antecedencias is None:
-        antecedencias = cfg.ANTECEDENCIAS_PADRAO
-    antecedencias = {int(x) for x in antecedencias}
+    antecedencias = _antecedencias(d)
     janela = max([DIAS_PROXIMOS, 1, *DIAS_NAMORO, *antecedencias])
     lista = ocorrencias(d, janela)
     dispensados = banco.alertas_dispensados()
@@ -982,5 +1014,46 @@ def hoje(banco: Banco, referencia: date) -> dict:
     }
 
 
-__all__ = ["CartaoRecurso", "Dados", "Ocorrencia", "carregar", "cartoes_dos_recursos", "de_quem", "duracao", "hoje",
-           "meses_completos", "ocorrencias", "proximos_eventos", "sem_o_reservado", "somar_meses", "tempo_juntos"]
+DIAS_AGENDA_AVISOS = 60        # quantos dias para a frente a agenda de avisos do celular cobre
+MAX_AVISOS_NO_DIA = 99
+
+
+def agenda_de_avisos(banco: Banco, referencia: date, dias: int = DIAS_AGENDA_AVISOS) -> dict[str, int]:
+    """Quantos lembretes de data a página Hoje vai ter em cada um dos próximos `dias` dias, a
+    partir de `referencia` (seção 21.5): {"AAAA-MM-DD": n}, só com os dias que têm algum.
+
+    É o que sai do cofre para o service worker avisar com o diário trancado ("Você tem 2 lembretes
+    hoje no Entre Nós"): só DATAS e contagens. Nada de texto, tipo, nome, pessoa ou registro.
+    Conta como a página Hoje daquele dia: todos os importantes (hoje e amanhã) e até
+    MAX_LEMBRETES lembretes (antecedências de Ajustes, mesversário e aniversário de namoro), sem
+    os que foram dispensados. Sugestões e cartões dos recursos dependem do dia em que a página é
+    aberta e ficam de fora. Só lê: nada é gravado.
+    """
+    dias = max(0, min(int(dias), 366))
+    d = carregar(banco, referencia)
+    antecedencias = _antecedencias(d)
+    janela = dias + max([1, *DIAS_NAMORO, *antecedencias])
+    lista = ocorrencias(d, janela)
+    dispensados = banco.alertas_dispensados()
+    agenda: dict[str, int] = {}
+    for deslocamento in range(dias):
+        dia = referencia + timedelta(days=deslocamento)
+        importantes = lembretes = 0
+        for oc in lista:
+            faltam = oc.dias(dia)
+            nivel = _nivel_do_aviso(oc, faltam, antecedencias)
+            if nivel is None or _chave_do_aviso(oc, faltam) in dispensados:
+                continue
+            if nivel == "importante":
+                importantes += 1
+            else:
+                lembretes += 1
+        total = importantes + min(lembretes, MAX_LEMBRETES)
+        if total:
+            agenda[dia.isoformat()] = min(total, MAX_AVISOS_NO_DIA)
+    return agenda
+
+
+__all__ = ["CartaoRecurso", "Dados", "Ocorrencia", "agenda_de_avisos", "carregar", "cartoes_dos_recursos", "de_quem",
+           "duracao", "hoje", "meses_completos", "ocorrencias", "proximos_eventos", "sem_o_reservado", "somar_meses",
+           "tempo_juntos"]

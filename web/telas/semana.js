@@ -197,7 +197,7 @@
     h('div', { class: 'opcao-privado' },
       h('label', { class: 'opcao-linha', for: 'conv-privado' }, privado,
         h('span', null, h('span', { 'aria-hidden': 'true' }, '🔒 '), 'Não enviar este registro para a IA')),
-      h('p', { class: 'dica', id: 'conv-privado-dica' }, 'Marcado, ele nunca sai deste computador. As regras continuam usando o registro normalmente.')),
+      h('p', { class: 'dica', id: 'conv-privado-dica' }, 'Marcado, ele nunca vai para a IA. As regras continuam usando o registro normalmente (e, com a sincronização ligada, ele vai embaralhado para os seus outros aparelhos).')),
     h('div', { class: 'acoes' }, botao,
       h('button', {
         type: 'button', class: 'botao botao-texto',

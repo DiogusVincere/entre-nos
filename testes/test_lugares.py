@@ -31,6 +31,9 @@ from testes.test_servidor import PIN, REF, Relogio
 
 DATA = REF.isoformat()
 SEMANA = "2026-W40"
+# O cartão do Hoje só aparece na quinta e na sexta (ou com uma data de vocês em até 3 dias, 20.5.1):
+# os testes do Hoje abrem numa quinta da mesma semana do REF (quarta, 30/09).
+QUINTA = date(2026, 10, 1)
 IA = {"provedor": "ollama", "url": "http://127.0.0.1:11434", "modelo": "modelo-de-teste", "tipo": "ollama",
       "chave": None}
 _PADRAO = object()
@@ -686,6 +689,10 @@ class TestAcoes(BaseNucleo):
 # ======================================================================== Hoje
 
 class TestHoje(BaseNucleo):
+    def setUp(self):
+        super().setUp()
+        self.hoje = QUINTA
+
     def test_sugestao_da_semana_cita_e_explica(self):
         rid = self.registrar("Ela disse que quer conhecer o Beco do Batman.", "2026-09-20")
         [c] = self.cartoes()
@@ -712,7 +719,7 @@ class TestHoje(BaseNucleo):
         self.assertEqual(self.pedir("POST", "/api/alertas/dispensar", {"chave": cartoes[0]["chave"]}).status, 200)
         self.assertEqual(self.cartoes(), [])                            # nenhum outro na mesma semana
         self.assertEqual(self.cartoes("2026-10-04"), [])                # domingo ainda é a semana 40
-        [c] = self.cartoes("2026-10-05")                                # semana nova: o Beco descansa
+        [c] = self.cartoes("2026-10-08")                                # semana nova (quinta): o Beco descansa
         self.assertIn("Museu do Ipiranga", c["texto"])
         self.assertTrue(c["chave"].endswith(":2026-W41"))
         s = self.painel("2026-11-02")["sugestao"]                      # 5 semanas depois ele volta, com um ponto a menos
@@ -723,7 +730,7 @@ class TestHoje(BaseNucleo):
         self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
         self.registrar("Ela está muito cansada.", "2026-09-28")
         self.assertEqual(self.cartoes(), [])
-        self.assertEqual(len(self.cartoes("2026-10-05")), 1)            # passou (e é outra semana)
+        self.assertEqual(len(self.cartoes("2026-10-08")), 1)            # passou (e é outra semana)
 
     def test_ja_sairam_esta_semana(self):
         self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
@@ -742,13 +749,13 @@ class TestHoje(BaseNucleo):
         self.assertEqual(c["texto"], "Talvez voltar ao Mangiare, que ela gostou, seja uma boa para o próximo encontro.")
         self.assertEqual(c["dados"]["modo"], "rever")
         self.assertEqual(c["dados"]["avisos"], ["Ressalvas que você registrou dela: caro."])
-        self.assertEqual(self.cartoes("2026-07-15"), [])                # só depois de 60 dias
+        self.assertEqual(self.cartoes("2026-07-16"), [])                # só depois de 60 dias (uma quinta)
 
     def test_lugar_que_ela_nao_gostou_nunca_volta_como_sugestao(self):
         self.registrar("Jantamos no Outback e ela odiou.", "2026-05-01")
         self.registrar("Ela disse que odiou o bar Pinguim, muito barulhento.", "2026-05-02")
         self.assertEqual(self.cartoes(), [])
-        self.assertEqual(self.cartoes("2027-01-04"), [])
+        self.assertEqual(self.cartoes("2027-01-07"), [])
 
     def test_ela_quer_voltar(self):
         self.registrar("Jantamos no Mangiare e ela já quer voltar.", "2026-09-01")
@@ -774,11 +781,15 @@ class TestHoje(BaseNucleo):
 class TestHojeOcasiao(BaseNucleo):
     config = {"inicio_namoro": "2025-10-20"}
 
+    def setUp(self):
+        super().setUp()
+        self.hoje = QUINTA
+
     def test_aniversario_de_namoro_chegando(self):
         self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
         [c] = self.cartoes()
         self.assertEqual(c["texto"], "Talvez o Beco do Batman, que ela quer conhecer, seja uma boa para o "
-                                     "aniversário de namoro (em 20 dias).")
+                                     "aniversário de namoro (em 19 dias).")
         self.assertIn("informado em Ajustes", c["porque"])
         self.assertEqual(c["dados"]["ocasiao"]["data"], "2026-10-20")
 
@@ -787,6 +798,45 @@ class TestHojeOcasiao(BaseNucleo):
         chave = self.cartoes()[0]["chave"]
         self.pedir("POST", "/api/alertas/dispensar", {"chave": chave})
         self.assertEqual(self.cartoes(), [])
+
+
+class TestHojeDiaDaSemana(BaseNucleo):
+    """O cartão de lugar no Hoje só na quinta e na sexta (planejar o fim de semana) ou com uma data
+    de vocês (mesversário, aniversário dela ou de namoro) em até 3 dias (20.5.1). A aba Lugares mostra
+    a sugestão em qualquer dia."""
+    config = {"inicio_namoro": "2025-03-20"}            # mesversário todo dia 20
+
+    def test_so_quinta_e_sexta(self):
+        self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
+        dias = {"2026-09-28": 0, "2026-09-29": 0, "2026-09-30": 0, "2026-10-01": 1, "2026-10-02": 1}
+        for dia, esperado in dias.items():
+            with self.subTest(dia=dia):
+                self.assertEqual(len(self.cartoes(dia)), esperado)
+        # Sábado e domingo também não (o fim de semana já chegou).
+        self.assertEqual(self.cartoes("2026-10-03"), [])
+        self.assertEqual(self.cartoes("2026-10-04"), [])
+        # A aba continua com a sugestão numa quarta.
+        self.assertEqual(self.painel("2026-09-30")["sugestao"]["nome"], "Beco do Batman")
+
+    def test_data_especial_em_ate_tres_dias(self):
+        self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
+        # Segunda 19/10: o mesversário (20/10) é amanhã.
+        [c] = self.cartoes("2026-10-19")
+        self.assertIn("Beco do Batman", c["texto"])
+        self.assertIn("mesversário", c["texto"])
+        # Segunda 16/11: o mesversário de 20/11 está a 4 dias: nada.
+        self.assertEqual(self.cartoes("2026-11-16"), [])
+        # Terça 17/11: a 3 dias, aparece.
+        self.assertEqual(len(self.cartoes("2026-11-17")), 1)
+
+
+class TestHojeAniversarioDela(BaseNucleo):
+    config = {"aniversario_dela": "1998-10-13"}
+
+    def test_aniversario_dela_em_ate_tres_dias(self):
+        self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
+        self.assertEqual(len(self.cartoes("2026-10-12")), 1)            # segunda, véspera do aniversário
+        self.assertEqual(self.cartoes("2026-10-06"), [])                # terça, a 7 dias: não
 
 
 # ======================================================================== exportar, importar, apagar
@@ -857,6 +907,7 @@ class TestLevarEApagar(BaseNucleo):
 
     def test_apagar_o_registro_esquece_a_chave_do_cartao(self):
         rid = self.registrar("Ela quer conhecer o Beco do Batman.", "2026-09-01")
+        self.hoje = QUINTA                                              # o cartão só aparece na quinta e na sexta
         chave = self.cartoes()[0]["chave"]
         self.pedir("POST", "/api/alertas/dispensar", {"chave": chave})
         self.assertIn(chave, self.banco.alertas_dispensados())

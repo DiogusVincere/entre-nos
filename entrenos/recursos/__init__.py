@@ -476,13 +476,29 @@ def gravar_extras(banco: Any, registro_id: int, extras: dict[str, list[dict]], r
 
 # ---------------------------------------------------------------- IA, exportar, importar, apagar
 
+def _lembrado(banco: Any, gancho: str, calcular: Callable[[list], set[int]]) -> set[int]:
+    """`calcular(ganchos)` guardado até a próxima escrita no banco (`Banco.lembrar`, seção 22.2): o Hoje
+    pedia a mesma lista dezenas de vezes. A chave inclui quais funções responderam e os recursos que
+    falharam (trocar um gancho, num teste, não aproveita o resultado de antes). Sempre uma cópia."""
+    ganchos = com_gancho(gancho)
+    lembrar = getattr(banco, "lembrar", None)
+    if not callable(lembrar):
+        return calcular(ganchos)
+    chave = f"recursos.{gancho}:{[(n, id(f)) for n, f in ganchos]}:{sorted(falhas())}"
+    return set(lembrar(chave, lambda: frozenset(calcular(ganchos))))
+
+
 def fora_da_ia(banco: Any) -> set[int]:
     """Registros que os recursos mandam deixar fora da IA. RecursoIndisponivel quando não dá para
     saber com segurança: algum recurso da lista não abriu, ou o gancho falhou (aí nada vai)."""
     if falhas():
         raise RecursoIndisponivel("um recurso não abriu")
+    return _lembrado(banco, "fora_da_ia", lambda ganchos: _fora_da_ia(banco, ganchos))
+
+
+def _fora_da_ia(banco: Any, ganchos: list) -> set[int]:
     fora: set[int] = set()
-    for nome, funcao in com_gancho("fora_da_ia"):
+    for nome, funcao in ganchos:
         try:
             ids = funcao(banco)
             if ids is None:
@@ -502,9 +518,13 @@ def discretos(banco: Any) -> set[int]:
     "🔒 Um registro reservado" no lugar do começo do texto, Pessoas não cita a frase e as ligações
     "mesma pessoa" não os usam. Na dúvida (um recurso não abriu ou o gancho falhou), todos os 🔒
     também ficam assim. Nunca levanta."""
+    return _lembrado(banco, "discretos", lambda ganchos: _discretos(banco, ganchos))
+
+
+def _discretos(banco: Any, ganchos: list) -> set[int]:
     saida: set[int] = set()
     duvida = bool(falhas())
-    for nome, funcao in com_gancho("discretos"):
+    for nome, funcao in ganchos:
         try:
             ids = funcao(banco)
             for i in ids or ():

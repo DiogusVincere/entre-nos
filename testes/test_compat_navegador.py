@@ -55,7 +55,8 @@ ESPERADOS = {"entrenos", "entrenos.nucleo", "entrenos.ponte", "entrenos.config",
              "entrenos.modelos", "entrenos.regras", "entrenos.regras.datas", "entrenos.regras.pessoas",
              "entrenos.regras.categorias", "entrenos.regras.certeza", "entrenos.regras.itens",
              "entrenos.motor", "entrenos.banco", "entrenos.cofre", "entrenos.busca", "entrenos.alertas",
-             "entrenos.perfil", "entrenos.contexto", "entrenos.provedores", "entrenos.recursos"}
+             "entrenos.perfil", "entrenos.contexto", "entrenos.provedores", "entrenos.recursos",
+             "entrenos.sincronizacao"}      # seção 22: a mescla roda igual no celular
 # Os recursos (seção 20.0) são importados pelo registro na hora do uso (importlib, por nome): a
 # varredura os acrescenta pelos arquivos de entrenos/recursos/.
 PASTA_RECURSOS = PACOTE / "recursos"
@@ -621,6 +622,27 @@ r = pedir("POST", "/api/desbloquear", {"pin": PIN})
 token = r["dados"]["token"]
 passos["certo"] = r["status"]
 passos["registros"] = len(pedir("GET", "/api/registros", token=token)["dados"])
+# Sincronização (seção 22): a senha, o arquivo deste "celular" e outro aparelho que o junta.
+from entrenos import sincronizacao
+from entrenos.nucleo import Nucleo
+import os as _os
+sincronizacao.SCRYPT_N = 2 ** 12
+r = pedir("POST", "/api/sync/senha", {"senha": "biscoito de polvilho"}, token)
+passos["sync_senha"] = [r["status"], bool(r["dados"].get("sync_json"))]
+config_sync = r["dados"]["sync_json"]
+r = pedir("POST", "/api/sync/preparar", {}, token)
+passos["sync_preparar"] = [r["status"], r["dados"].get("tamanho", 0) > 0, r["gravou"]]
+meu = r["dados"]
+outro = Nucleo(_os.path.join(sys.argv[2], "outro"), atraso_pin=0, plataforma="navegador",
+               relogio=lambda: relogio[0], hoje=lambda: date(2026, 9, 30))
+def pedir_outro(metodo, caminho, corpo=None, tk=None):
+    rr = outro.tratar(metodo, caminho, corpo=None if corpo is None else json.dumps(corpo).encode(), token=tk)
+    return rr.status, rr.dados
+tk2 = pedir_outro("POST", "/api/configurar", {"pin": PIN})[1]["token"]
+pedir_outro("POST", "/api/sync/senha", {"senha": "biscoito de polvilho", "sync_json": config_sync}, tk2)
+_st, _d = pedir_outro("POST", "/api/sync/receber", {"nome": meu["nome"], "conteudo_b64": meu["conteudo_b64"]}, tk2)
+passos["sync_receber"] = [_st, _d.get("registros_novos")]
+outro.encerrar()
 relogio[0] += 11 * 60
 passos["inatividade"] = json.loads(ponte.verificar_inatividade())
 passos["depois"] = pedir("GET", "/api/registros", token=token)["status"]
@@ -666,6 +688,10 @@ class TestPythonDeNavegador(unittest.TestCase):
         self.assertEqual(passos["cedo"], [429, "1"])
         self.assertEqual(passos["reaberto"], [429, "1"])
         self.assertEqual(passos["certo"], 200)
+        # Seção 22: a sincronização também roda sem thread, sem _hashlib e sem ssl.
+        self.assertEqual(passos["sync_senha"], [200, True])
+        self.assertEqual(passos["sync_preparar"], [200, True, True])
+        self.assertEqual(passos["sync_receber"], [200, 1])
         self.assertEqual(passos["registros"], 1)                   # o diário voltou do arquivo cifrado
         self.assertEqual(passos["inatividade"], {"bloqueou": True, "gravou": False})
         self.assertEqual(passos["depois"], 423)

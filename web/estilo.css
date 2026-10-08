@@ -1042,6 +1042,55 @@ a.encontrado-link:hover { border-color: var(--primaria-texto); }
 .resultado-erro { color: var(--perigo-texto); }
 input[readonly] { background: var(--superficie-2); color: var(--secundario); }
 
+/* Ajustes → ☁️ Sincronização (seção 22): o mesmo jeito da área da IA */
+.sync-status { margin: 8px 0; min-width: 0; }
+.sync-status > p { margin: 6px 0; overflow-wrap: anywhere; }
+.sync-botoes { margin: 8px 0 12px; }
+.sync-aparelhos li { overflow-wrap: anywhere; }
+.sync-perguntas { margin: 12px 0; }
+.sync-versoes { margin: 6px 0 10px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; }
+.sync-versoes dt { margin-top: 6px; font-weight: 700; }
+.sync-versoes dd { margin: 0; overflow-wrap: anywhere; }
+.sync-parar { margin-top: 18px; }
+.sync-status:focus { outline: 2px solid var(--primaria); outline-offset: 4px; border-radius: 4px; }
+.sync-sugestao { margin: 10px 0; padding: 10px 12px; border: 1px dashed var(--borda-forte); border-radius: var(--raio-m); }
+.sync-sugestao p { margin: 4px 0; }
+.sync-frase { font-size: 1.05rem; font-weight: 700; overflow-wrap: anywhere; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+
+/* O selo ☁️ fora de Ajustes (seção 22.2): sem acesso ao Google, algo a mandar, um erro ou uma pergunta. */
+.selo-sync {
+  position: fixed;
+  top: calc(8px + env(safe-area-inset-top, 0px));
+  right: 12px;
+  z-index: 40;
+  max-width: min(78vw, 420px);
+}
+.selo-sync-botao, .selo-sync-texto {
+  display: inline-block;
+  max-width: 100%;
+  padding: 7px 14px;
+  border: 1px solid var(--borda-forte);
+  border-radius: 999px;
+  background: var(--superficie);
+  color: var(--texto);
+  box-shadow: var(--sombra);
+  font: inherit;
+  font-size: .9rem;
+  line-height: 1.3;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.selo-sync-botao { cursor: pointer; min-height: 40px; }
+.selo-sync-botao:hover { background: var(--primaria-suave); }
+.selo-sync-botao:focus-visible { outline: 2px solid var(--primaria); outline-offset: 2px; }
+.selo-sync-botao:disabled { cursor: progress; opacity: .8; }
+body.com-selo-sync .conteudo { padding-top: 64px; }    /* o selo não cobre o título da tela */
+
+.lista-passos { margin: 8px 0; padding-left: 1.3em; }
+.lista-passos li { margin: 6px 0; overflow-wrap: anywhere; }
+.lista-passos ul { margin: 6px 0; padding-left: 1.1em; }
+.lista-passos code { overflow-wrap: anywhere; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+
 /* ------------------------------------------------------------------ levar ou trazer dados (seção 18) */
 
 /* Primeiro uso: "Criar meu diário" ou "Já tenho um backup" */
@@ -1240,3 +1289,40 @@ input[type="file"]:disabled { opacity: .6; cursor: progress; }
   font-weight: 600;
 }
 .painel-recurso, .corpo-recurso { min-width: 0; }
+
+/* ------------------------------------------------------------------ Celular e navegador (DESIGN.md, seção 21) */
+
+/* "Preparando o Entre Nós… 40%": a carga do Python, no portão. */
+.carga-app { margin: 12px 0 4px; }
+.carga-app[hidden] { display: none; }
+.carga-app .estado-arquivo { font-weight: 600; }
+
+/* "Nova versão disponível": fica até a pessoa decidir (não some sozinha como os avisos). */
+.faixa-versao {
+  position: fixed;
+  left: 50%;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  z-index: 60;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  width: min(92vw, 480px);
+  padding: 12px 14px;
+  border-radius: var(--raio-m);
+  background: var(--superficie);
+  color: var(--texto);
+  border: 1px solid var(--borda-forte);
+  box-shadow: var(--sombra);
+  transform: translateX(-50%);
+}
+.faixa-versao-texto { flex: 1 1 200px; margin: 0; font-weight: 600; }
+
+/* Instalar o app, o espaço usado e os avisos (Ajustes → Este aparelho). */
+.bloco-aparelho { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--borda); }
+.bloco-aparelho:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.bloco-aparelho > h3 { margin-bottom: 8px; }
+.passos-iphone { margin: 6px 0 10px; padding-left: 1.3em; }
+.passos-iphone li { margin-bottom: 4px; }
+.copia-pronta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+.lista-falhas { margin: 8px 0 0; padding-left: 1.2em; color: var(--secundario); font-size: .85rem; overflow-wrap: anywhere; }

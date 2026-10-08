@@ -56,19 +56,31 @@ INTERVALO_VIGIA = 30.0               # de quanto em quanto tempo a thread confer
 MUTEX_ABERTO = "EntreNos-Aberto-A5F79238-49BF-4FE8-8496-7CD3D084F9B4"
 _MUTEX: Any = None                   # guardado enquanto o processo vive
 
-CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
-       "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+# A política do computador. O site do celular usa esta mesma com 'wasm-unsafe-eval' no script-src
+# (construir_web.csp_do_site: o Worker compila o Pyodide; deixa compilar WebAssembly, sem liberar
+# eval de JavaScript). worker-src para o Web Worker e o service worker; manifest-src para o
+# manifest.webmanifest; object-src e form-action fechados (seção 22.2).
+# Sincronização (seção 22.2): NENHUM código do Google roda na página (o login é uma janela do
+# Google que volta para o oauth.html daqui, sem biblioteca). Só as conexões com a Drive API (arquivos
+# e envio) em www.googleapis.com e a revogação do acesso em oauth2.googleapis.com/revoke.
+CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; worker-src 'self'; "
+       "connect-src 'self' https://www.googleapis.com/drive/v3/ https://www.googleapis.com/upload/drive/v3/ "
+       "https://oauth2.googleapis.com/revoke; "
+       "manifest-src 'self'; object-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 CABECALHOS_SEGURANCA = (
     ("Content-Security-Policy", CSP),
     ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "no-referrer"),
     ("X-Content-Type-Options", "nosniff"),
-    ("Cross-Origin-Opener-Policy", "same-origin"),
+    # same-origin-allow-popups (seção 22): a página abre a janela de login do Google. Continua
+    # isolando a página de qualquer janela que ELA não abriu.
+    ("Cross-Origin-Opener-Policy", "same-origin-allow-popups"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
 )
 TIPOS_MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",          # módulos: o Worker e o Pyodide (seção 21)
     ".css": "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
@@ -77,6 +89,9 @@ TIPOS_MIME = {
     ".ico": "image/x-icon",
     ".webmanifest": "application/manifest+json",
     ".woff2": "font/woff2",
+    ".wasm": "application/wasm",                       # o WebAssembly.compileStreaming exige este tipo
+    ".zip": "application/zip",                         # a biblioteca do Python e o entrenos-py.zip
+    ".whl": "application/zip",                         # as rodas do Pyodide (uma roda é um zip)
 }
 TIPO_JSON = "application/json; charset=utf-8"
 ARQUIVO_OCUPADO = "Outro arquivo grande está sendo recebido agora. Espere terminar e tente de novo."

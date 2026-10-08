@@ -8,7 +8,12 @@
 <meta name="theme-color" content="#FBF7F2" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1B1D2A" media="(prefers-color-scheme: dark)">
 <title>Entre Nós</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%233D5A80'/%3E%3Cpath d='M32 50C32 50 14 40 14 27.5C14 21.7 18.5 17 24 17C27.5 17 30.5 18.9 32 21.8C33.5 18.9 36.5 17 40 17C45.5 17 50 21.7 50 27.5C50 40 32 50 32 50Z' fill='%23E07A5F'/%3E%3C/svg%3E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Entre Nós">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icones/apple-touch-icon.png">
+<link rel="icon"type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%233D5A80'/%3E%3Cpath d='M32 50C32 50 14 40 14 27.5C14 21.7 18.5 17 24 17C27.5 17 30.5 18.9 32 21.8C33.5 18.9 36.5 17 40 17C45.5 17 50 21.7 50 27.5C50 40 32 50 32 50Z' fill='%23E07A5F'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="estilo.css">
 <link rel="stylesheet" href="telas/perguntas.css">
 <link rel="stylesheet" href="telas/presentes.css">
@@ -20,6 +25,8 @@
 <link rel="stylesheet" href="telas/ciclo.css">
 <link rel="stylesheet" href="telas/eu.css">
 <script src="app.js" defer></script>
+<!-- Sincronização entre aparelhos (DESIGN.md, seção 22): Ajustes → ☁️ Sincronização. -->
+<script src="sincronizar.js" defer></script>
 <!-- Recursos (DESIGN.md, seção 20.0): cada um se encaixa por window.EntreNos, depois do app.js. -->
 <script src="telas/perguntas.js" defer></script>
 <script src="telas/presentes.js" defer></script>
@@ -34,7 +41,7 @@
 <body>
 <a class="pular" id="pular" href="#conteudo">Pular para o conteúdo</a>
 
-<p id="carregando" class="sem-script" role="status">Abrindo o Entre Nós… Se esta mensagem não sumir, falta um arquivo do programa (o antivírus pode tê-lo colocado em quarentena): reinstale o Entre Nós, rodando o instalador de novo por cima, ou peça à TI para restaurar o arquivo. Não desligue o antivírus. Seu diário não foi afetado.</p>
+<p id="carregando" class="sem-script" role="status">Abrindo o Entre Nós… Se esta mensagem não sumir: no celular, confira a internet e abra de novo (só a primeira vez precisa dela). No computador, falta um arquivo do programa (o antivírus pode tê-lo colocado em quarentena): rode o instalador de novo por cima ou peça à TI para restaurar o arquivo, sem desligar o antivírus. Seu diário não foi afetado.</p>
 
 <div id="portao" class="portao" tabindex="-1" hidden></div>
 

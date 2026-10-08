@@ -913,8 +913,9 @@ class TestImportar(BaseImportar):
         self.assertEqual(self.s.pedir("POST", "/api/analisar", {"texto": texto}).status, 413)
         grandes = {(rota.metodo, rota.padrao.pattern.replace("\\", "")) for rota in servidor.ROTAS
                    if rota.limite_corpo > servidor.LIMITE_CORPO}
+        # Seção 22: o arquivo de sincronização de outro aparelho também vem no corpo.
         self.assertEqual(grandes, {("POST", "/api/restaurar"), ("POST", "/api/importar/previa"),
-                                   ("POST", "/api/importar")})
+                                   ("POST", "/api/importar"), ("POST", "/api/sync/receber")})
         self.assertEqual(servidor.LIMITE_CORPO_ARQUIVO, 64 * 1024 * 1024)
 
     def anunciar(self, rota: str, tamanho: int, token: str | None) -> int:

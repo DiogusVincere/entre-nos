@@ -72,12 +72,13 @@ import urllib.error
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from . import config, recursos
-from .banco import DADOS_DE_VERSAO_NOVA, Banco, NaoEncontrado, ler_exportacao, validar_exportacao
+from .banco import (DADOS_DE_VERSAO_NOVA, Banco, NaoEncontrado, chave_da_sincronizacao, ler_exportacao,
+                    validar_exportacao)
 from .cofre import (Cofre, CofreCorrompido, CofreFechado, CofreMudou, CofreRecebido, PastaSumiu, PinErrado,
                     abrir_conteudo, conferir_verificador, criar_verificador, problema_do_pin, tamanho_decifrado)
 from .modelos import Certeza, Item, Resposta, TipoItem, para_json
@@ -145,7 +146,7 @@ NAO_SALVOU_ANTES = ("Não consegui gravar o diário de agora antes da troca, ent
 # Duas abas (ou janelas) com o mesmo diário: a outra gravou depois que esta abriu (seção 19.7).
 DIARIO_MUDOU = ("O diário foi alterado em outro lugar (outra aba ou janela do Entre Nós) enquanto estava aberto "
                 "aqui. Para não apagar o que foi gravado lá, o que você fez agora não foi salvo e o Entre Nós se "
-                "bloqueou. Feche as outras abas, recarregue a página e digite o PIN.")
+                "bloqueou. Feche as outras abas ou janelas do Entre Nós e digite o PIN de novo.")
 # No navegador (seção 19.7).
 PASTA_SUMIU_NAVEGADOR = ("Os dados do Entre Nós foram apagados deste navegador enquanto ele estava aberto. Para não "
                          "recriar o que foi apagado, o Entre Nós se bloqueou sem salvar.")
@@ -153,6 +154,12 @@ IA_SO_NO_COMPUTADOR = ("A IA ainda não funciona no celular: use o Entre Nós do
                        "ajustes da IA continuam guardados.")
 BACKUP_SO_BAIXANDO = ("No celular não dá para escolher uma pasta: use “Baixar uma cópia” e guarde o arquivo onde "
                       "quiser (fora deste aparelho também).")
+# Sincronização (seção 22).
+AJUSTES_DA_SINCRONIZACAO = "Os ajustes da sincronização ficam em Ajustes → ☁️ Sincronização."
+ARQUIVO_SYNC_VAZIO = "O arquivo de sincronização não chegou (veio vazio ou fora do formato esperado)."
+MAX_ARQUIVO_SYNC_CELULAR = 11 * 1024 * 1024     # em base64 ainda cabe nos 16 MB do celular
+ARQUIVO_SYNC_GRANDE = ("O arquivo de sincronização deste aparelho ficou grande ({mb} MB): um celular pode não "
+                       "conseguir abri-lo. Os outros computadores abrem normalmente.")
 
 _log = logging.getLogger("entrenos")
 _log.addHandler(logging.NullHandler())
@@ -344,8 +351,9 @@ def _chave_da_ia(chave: str) -> bool:
 
 
 def _config_publica(config_atual: dict) -> dict:
-    """Ajustes para a tela e para a exportação: nada da IA (nem chave, nem PIN, nem qual IA)."""
-    return {k: v for k, v in config_atual.items() if not _chave_da_ia(k)}
+    """Ajustes para a tela e para a exportação: nada da IA (nem chave, nem PIN, nem qual IA) e nada
+    da sincronização (a chave dela abre os arquivos do Google Drive; seção 22)."""
+    return {k: v for k, v in config_atual.items() if not _chave_da_ia(k) and not chave_da_sincronizacao(k)}
 
 
 def _ias_configuradas(ajustes: dict) -> list[dict]:
@@ -876,12 +884,15 @@ class Rota:
     # Rotas dos recursos (seção 20.0): `manipulador(nucleo, pedido, banco)` no lugar de `funcao`.
     manipulador: Callable[[Any, Any, Any], Any] | None = None
     recurso: str | None = None
+    # False: o pedido não conta como uso (não adia o bloqueio por inatividade). As rotas que a
+    # sincronização chama sozinha, de minuto em minuto quando falta rede (seção 22.2).
+    conta_uso: bool = True
 
 
 def _rota(metodo: str, caminho: str, funcao: str, acesso: str = SESSAO, limite_corpo: int = LIMITE_CORPO,
-          campos_grandes: tuple[str, ...] = ()) -> Rota:
+          campos_grandes: tuple[str, ...] = (), conta_uso: bool = True) -> Rota:
     padrao = re.escape("/api/" + caminho).replace(re.escape("{id}"), r"([0-9]{1,12})")
-    return Rota(metodo, re.compile(padrao), funcao, acesso, limite_corpo, campos_grandes)
+    return Rota(metodo, re.compile(padrao), funcao, acesso, limite_corpo, campos_grandes, conta_uso=conta_uso)
 
 
 ROTAS: tuple[Rota, ...] = (
@@ -938,6 +949,21 @@ ROTAS: tuple[Rota, ...] = (
     _rota("POST", "restaurar", "_restaurar", PRIMEIRO_USO, LIMITE_CORPO_ARQUIVO, ("arquivo_b64",)),
     _rota("POST", "importar/previa", "_importar_previa", LIVRE, LIMITE_CORPO_ARQUIVO, ("json",)),
     _rota("POST", "importar", "_importar", LIVRE, LIMITE_CORPO_ARQUIVO, ("json",)),
+    # Sincronização (seção 22): a página fala com o Google Drive e entrega aqui os arquivos dos outros
+    # aparelhos (receber, até o limite dos arquivos) e pede o deste (preparar). A senha é LIVRE: o
+    # scrypt roda sem prender o resto do app.
+    # As que o motor chama sozinho (estado, iniciar, receber, preparar, enviado, conflitos) não contam
+    # como uso: as novas tentativas sem rede não podem impedir o bloqueio por inatividade (22.2).
+    _rota("GET", "sync/estado", "_sync_estado", conta_uso=False),
+    _rota("PATCH", "sync/ajustes", "_sync_ajustes"),
+    _rota("POST", "sync/senha", "_sync_senha", LIVRE),
+    _rota("POST", "sync/iniciar", "_sync_iniciar", conta_uso=False),
+    _rota("POST", "sync/receber", "_sync_receber", SESSAO, LIMITE_CORPO_ARQUIVO, ("conteudo_b64",), conta_uso=False),
+    _rota("POST", "sync/preparar", "_sync_preparar", conta_uso=False),
+    _rota("POST", "sync/enviado", "_sync_enviado", conta_uso=False),
+    _rota("GET", "sync/conflitos", "_sync_conflitos", conta_uso=False),
+    _rota("POST", "sync/conflitos/{id}", "_sync_resolver"),
+    _rota("POST", "sync/desligar", "_sync_desligar"),
 )
 
 
@@ -1065,6 +1091,11 @@ class Nucleo:
         self._trava_pin_ia = threading.RLock()
         self._falhas_pin_ia = 0
         self._espera_pin_ia = _Espera(lambda: self.relogio())
+        # Senha de sincronização errada (seção 22): o mesmo bloqueio crescente, contador próprio (só em
+        # memória: quem tem o entrenos-sync.json do Drive testa senhas fora do app de qualquer jeito).
+        self._trava_senha_sync = threading.RLock()
+        self._falhas_senha_sync = 0
+        self._espera_senha_sync = _Espera(lambda: self.relogio())
         self._encerrando = False
         # O bloqueio do PIN que valia quando o app fechou (pin_espera.json).
         self._arquivo_espera = self.pasta / ARQUIVO_ESPERA_PIN
@@ -1115,11 +1146,11 @@ class Nucleo:
                     if self._banco is not None:
                         self._marcar_atividade()
         with self._trava:
-            banco = self._exigir_sessao(pedido.token)
+            banco = self._exigir_sessao(pedido.token, marcar=rota.conta_uso)
             try:
                 return funcao(pedido, banco)
             finally:
-                if self._banco is banco:
+                if self._banco is banco and rota.conta_uso:
                     self._marcar_atividade()
 
     def _atender_recurso(self, rota: Rota, pedido: Pedido) -> Any:
@@ -1187,6 +1218,19 @@ class Nucleo:
                 return False
             self.bloquear()
             return True
+
+    def agenda_de_avisos(self, dias: int | None = None) -> dict[str, int] | None:
+        """Os dias com lembretes de data e quantos ({"AAAA-MM-DD": n}), para a agenda de avisos que
+        fica fora do cofre no navegador (seção 21.5): só datas e contagens. None com o diário
+        bloqueado. Não conta como uso (não adia o bloqueio por inatividade) e não grava nada."""
+        with self._trava:
+            self.verificar_inatividade()
+            banco = self._banco
+            if banco is None:
+                return None
+            alertas = _importar("alertas")
+            return alertas.agenda_de_avisos(banco, self.hoje(),
+                                            alertas.DIAS_AGENDA_AVISOS if dias is None else dias)
 
     def _tempo_desde(self, monotonico: float, parede: float) -> float:
         """Segundos desde um instante marcado nos dois relógios: o que tiver andado mais.
@@ -1264,8 +1308,9 @@ class Nucleo:
         self._ultima_atividade = self.relogio()
         self._ultima_atividade_parede = self.relogio_parede()
 
-    def _exigir_sessao(self, token: str | None) -> Banco:
-        """O banco aberto, se o token confere. Bloqueado: 423; token errado ou ausente: 401."""
+    def _exigir_sessao(self, token: str | None, *, marcar: bool = True) -> Banco:
+        """O banco aberto, se o token confere. Bloqueado: 423; token errado ou ausente: 401.
+        `marcar`: conta como uso (adia o bloqueio por inatividade)."""
         with self._trava:
             self.verificar_inatividade()
             if self._banco is None or self._token is None:
@@ -1273,7 +1318,8 @@ class Nucleo:
             if not token or not hmac.compare_digest(token.encode("utf-8", "replace"),
                                                     self._token.encode("utf-8")):
                 raise ErroHttp(401, SESSAO_INVALIDA)
-            self._marcar_atividade()
+            if marcar:
+                self._marcar_atividade()
             return self._banco
 
     def _abrir_sessao(self, banco: Banco) -> str:
@@ -1331,6 +1377,28 @@ class Nucleo:
             self._espera_pin.conferir()
             self._comparacoes_pin += 1
             igual = any(self.cofre.confere_pin(v) for v in _variacoes_do_pin(pin))
+            atraso = atraso_do_pin(self._comparacoes_pin - COMPARACOES_SEM_ESPERA + 1,
+                                   self.atraso_pin, self.atraso_pin_maximo)
+            if atraso > 0:
+                self._espera_pin.adiar(atraso)
+                self._gravar_espera()
+            return igual
+
+    def _senha_igual_ao_pin(self, senha: str) -> bool:
+        """A senha de sincronização nova é o PIN principal (como foi digitada, ou sem espaços nas
+        pontas e repetidos)? Um ou dois scrypt, só ao CRIAR a senha. É um oráculo do PIN como o
+        "PIN da IA igual ao principal": conta nas mesmas comparações e, com o PIN principal em
+        bloqueio, não compara (não avisa) em vez de responder 429."""
+        base = _nfc(senha)
+        formas = [f for f in dict.fromkeys((base, re.sub(r"\s+", " ", base).strip())) if f]
+        with self._trava_pin:
+            if self._espera_pin.restante() > 0:
+                return False
+            self._comparacoes_pin += 1
+            try:
+                igual = any(self.cofre.confere_pin(f) for f in formas)
+            except CofreFechado:
+                return False
             atraso = atraso_do_pin(self._comparacoes_pin - COMPARACOES_SEM_ESPERA + 1,
                                    self.atraso_pin, self.atraso_pin_maximo)
             if atraso > 0:
@@ -1509,7 +1577,7 @@ class Nucleo:
         navegador não há antivírus nem pasta para mostrar: quem apaga é o próprio navegador."""
         if self.plataforma != COMPUTADOR:
             return ("O diário não está mais guardado neste navegador: ele pode ter apagado os dados do Entre Nós "
-                    "(para liberar espaço, ou ao limpar os dados do site). Recarregue a página para restaurar um "
+                    "(para liberar espaço, ou ao limpar os dados do site). Toque em “Ver as opções” para restaurar um "
                     "backup (uma cópia que você baixou) ou começar um diário novo.")
         mensagem = (f"O arquivo do diário (entrenos.cofre) não está na pasta {self.pasta}. Se você não o "
                     "apagou, o antivírus pode tê-lo colocado em quarentena: peça para restaurá-lo (não "
@@ -1517,9 +1585,9 @@ class Nucleo:
         copias = self.cofre.resumo_das_copias()
         if copias:
             mensagem += (f" Há {copias['quantas']} {'cópia' if copias['quantas'] == 1 else 'cópias'} em "
-                         f"{copias['pasta']}: para usar uma, recarregue a página e escolha “Já tenho um backup”.")
+                         f"{copias['pasta']}: para usar uma, toque em “Ver as opções” e escolha “Já tenho um backup”.")
         else:
-            mensagem += " Ou recarregue a página para criar um diário ou restaurar um backup."
+            mensagem += " Ou toque em “Ver as opções” para criar um diário ou restaurar um backup."
         return mensagem
 
     # ------------------------------------------------------------ rotas públicas
@@ -1892,6 +1960,8 @@ class Nucleo:
     def _editar_config(self, p: Pedido, banco: Banco) -> dict:
         if any(_chave_da_ia(k) for k in p.corpo):
             raise ErroHttp(400, AJUSTES_DA_IA)
+        if any(chave_da_sincronizacao(k) for k in p.corpo):
+            raise ErroHttp(400, AJUSTES_DA_SINCRONIZACAO)
         campos = {k: (_nfc(v) if isinstance(v, str) else v) for k, v in p.corpo.items()}
         banco.salvar_config(**campos)
         return _config_publica(banco.config())
@@ -1921,7 +1991,9 @@ class Nucleo:
             raise ErroHttp(400, "Informe o caminho completo da pasta, como E:\\ ou D:\\Backups.")
         self._garantir_salvo(banco)             # a cópia sai com o que está na tela agora
         try:
-            arquivo = self.cofre.copiar_backup(destino)
+            arquivo = self.cofre.copiar_backup(destino, self._conteudo_para_fora(banco))
+        except CofreMudou:
+            raise
         except NotADirectoryError:
             raise ErroHttp(400, "Essa pasta não existe.") from None
         except PermissionError:
@@ -1939,11 +2011,47 @@ class Nucleo:
         nome, conteudo = self.copia_do_diario(banco)
         return {"nome": nome, "tamanho": len(conteudo), "arquivo_b64": base64.b64encode(conteudo).decode("ascii")}
 
+    def baixar_copia(self, token: str | None) -> tuple[RespostaApi, bytes | None]:
+        """POST /api/backup/baixar com o arquivo em bytes, fora do JSON (a ponte do navegador): no
+        celular o base64 dentro do JSON fazia o .cofre inteiro virar texto 33% maior no Python, na
+        string JSON, no JSON.parse do Worker e no postMessage (22.2; o wasm não devolve memória).
+        Devolve (resposta {nome, tamanho}, bytes do .cofre) ou (erro, None). Nunca levanta."""
+        try:
+            self.verificar_inatividade()
+            with self._trava:
+                banco = self._exigir_sessao(token)
+                try:
+                    nome, conteudo = self.copia_do_diario(banco)
+                finally:
+                    if self._banco is banco:
+                        self._marcar_atividade()
+            dados = {"nome": nome, "tamanho": len(conteudo)}
+            return RespostaApi(200, dados, {}, _json_bytes(dados)), conteudo
+        except Exception as erro:  # noqa: BLE001 - todo erro vira resposta JSON
+            return resposta_de_erro(erro), None
+
     def copia_do_diario(self, banco: Banco) -> tuple[str, bytes]:
         """(nome sugerido, bytes do .cofre) com o que está aberto agora, salvo antes. Chame com a
-        trava do app e o banco da sessão. O arquivo é o mesmo que /api/restaurar aceita."""
+        trava do app e o banco da sessão. O arquivo é o mesmo que /api/restaurar aceita (e abre com o
+        mesmo PIN); sai sem a chave da sincronização (`_conteudo_para_fora`)."""
         self._garantir_salvo(banco)
-        return f"entrenos-backup-{self.hoje():%Y-%m-%d}.cofre", self.cofre.conteudo()
+        return f"entrenos-backup-{self.hoje():%Y-%m-%d}.cofre", self._conteudo_para_fora(banco)
+
+    def _conteudo_para_fora(self, banco: Banco) -> bytes | None:
+        """O .cofre de uma cópia que SAI do aparelho (baixar, compartilhar, pendrive): sem a chave da
+        sincronização, que antes ia junto, protegida só pelo PIN; quem quebrasse o PIN de uma cópia
+        mandada por WhatsApp leria também os .sync do Drive (22.2). Restaurada, a cópia pede a senha
+        de sincronização de novo. Sem sincronização ligada: o arquivo como está no disco."""
+        sync = _importar("sincronizacao")
+        aj = sync.ajustes(banco)
+        if not aj.get("chave"):
+            return self.cofre.conteudo()
+        copia = Banco.de_bytes(banco.para_bytes())
+        try:
+            copia.salvar_config(sync=sync.para_fora(aj))
+            return self.cofre.cifrar_dados(copia.para_bytes())
+        finally:
+            copia.fechar()
 
     def _garantir_salvo(self, banco: Banco) -> None:
         """O arquivo do diário com tudo o que está aberto: grava só se faltou salvar algo (ou se o
@@ -2140,6 +2248,14 @@ class Nucleo:
             with self._trava_pin:
                 self._comparacoes_pin = 0
             token = self._abrir_sessao(novo)
+            # A sincronização do backup era do aparelho de onde ele veio: aqui ela ganha identidade
+            # própria (senão dois aparelhos escreveriam o mesmo arquivo no Drive; seção 22).
+            try:
+                _importar("sincronizacao").depois_de_restaurar(novo, self.plataforma)
+            except ErroHttp:
+                raise
+            except Exception as erro:  # noqa: BLE001 - a troca já valeu; sincronizar pede a senha de novo
+                registrar_erro(erro)
             if antigo is not None:
                 antigo.ao_salvar = None          # nada mais do diário antigo vai para o arquivo
                 try:
@@ -2181,6 +2297,203 @@ class Nucleo:
         exportacao = self._exportacao_do_pedido(p)
         with self._trava:
             return self._exigir_sessao(p.token).importar_json(exportacao, previa=False)
+
+    # ------------------------------------------------------------ sincronização (seção 22)
+    #
+    # A página (web/sincronizar.js) fala com o Google Drive; aqui só entram e saem arquivos já
+    # cifrados com a chave de sincronização (que fica no diário e nunca sai dele). Fluxo de uma
+    # sincronização: iniciar (confere o entrenos-sync.json do Drive) -> receber (cada arquivo de outro
+    # aparelho que mudou) -> preparar (o arquivo deste) -> enviado (depois que o Drive aceitou).
+
+    def _agora_utc(self) -> str:
+        # Com microssegundos: é o instante dos carimbos da sincronização (sincronizacao.agora_utc).
+        return datetime.fromtimestamp(self.relogio_parede(), timezone.utc).isoformat(timespec="microseconds")
+
+    @staticmethod
+    def _sync() -> Any:
+        return _modulo("sincronizacao", "estado", "mesclar", "preparar", "ligar", "chaves_guardadas")
+
+    @staticmethod
+    def _erro_sync(sync: Any, erro: BaseException) -> ErroHttp:
+        """Arquivo de outra versão: 409 {versao_nova}; arquivo que não abre ou estranho: 400
+        {arquivo_invalido}; o resto como sempre."""
+        if isinstance(erro, sync.ArquivoSyncNovo):
+            return ErroHttp(409, str(erro), extras={"versao_nova": True})
+        if isinstance(erro, sync.ArquivoSyncInvalido):
+            return ErroHttp(400, str(erro), extras={"arquivo_invalido": True})
+        return traduzir_erro(erro)
+
+    def _sync_chaves(self, sync: Any, banco: Banco) -> tuple[dict, Any]:
+        aj = sync.ajustes(banco)
+        chaves = sync.chaves_guardadas(aj) if sync.configurada(aj) else None
+        if chaves is None:
+            raise ErroHttp(409, sync.SEM_SENHA, extras={"sem_senha": True})
+        return aj, chaves
+
+    def _sync_configuracao(self, sync: Any, texto: Any) -> dict:
+        if not isinstance(texto, str) or not texto.strip():
+            raise ErroHttp(400, sync.CONFIG_INVALIDA, extras={"arquivo_invalido": True})
+        try:
+            return sync.ler_configuracao(texto)
+        except ValueError as erro:
+            raise self._erro_sync(sync, erro) from None
+
+    def _conferir_senha_sync(self, sync: Any, acao: Callable[[], Any]) -> Any:
+        """Como o PIN: senha errada = 401 já dizendo quanto esperar; antes da hora, 429 sem scrypt."""
+        with self._trava_senha_sync:
+            self._espera_senha_sync.conferir()
+            try:
+                resultado = acao()
+            except sync.SenhaSyncErrada:
+                self._falhas_senha_sync += 1
+                raise self._pin_errado(self._espera_senha_sync, self._falhas_senha_sync, sync.SENHA_ERRADA) from None
+            self._falhas_senha_sync = 0
+            self._espera_senha_sync.liberar()
+            return resultado
+
+    def _sync_estado(self, p: Pedido, banco: Banco) -> dict:
+        """GET /api/sync/estado: ligada?, este aparelho, os outros, perguntas, ID do app e o conteúdo do
+        entrenos-sync.json desta chave (sem segredo: para recriar o arquivo se ele sumir do Drive)."""
+        sync = self._sync()
+        return {**sync.estado(banco, self.plataforma), "plataforma": self.plataforma,
+                # O maior arquivo de outro aparelho que este núcleo aceita em /sync/receber (ele vai em
+                # base64 no corpo): a página nem baixa um maior (22.2).
+                "limite_arquivo": max(0, self.limite_corpo_arquivo * 3 // 4 - 64 * 1024)}
+
+    def _sync_ajustes(self, p: Pedido, banco: Banco) -> dict:
+        """PATCH /api/sync/ajustes {id_app?, nome?, automatica?, conta?}."""
+        sync = self._sync()
+        corpo = {k: (_nfc(v) if isinstance(v, str) else v) for k, v in p.corpo.items()}
+        sync.mudar_ajustes(banco, corpo, self.plataforma)
+        return {**sync.estado(banco, self.plataforma), "plataforma": self.plataforma}
+
+    def _sync_senha(self, p: Pedido) -> dict:
+        """POST /api/sync/senha {senha, sync_json?, substituir?}: liga a sincronização neste aparelho.
+
+        Sem `sync_json` (ainda não há entrenos-sync.json no Drive): cria a configuração com a senha
+        (mesmas regras do PIN) e devolve o texto dele para a página enviar. Com `sync_json`: confere a
+        senha contra o verificador (errada: 401 e bloqueio crescente). A chave fica no diário."""
+        sync = self._sync()
+        c = p.corpo
+        senha = c.get("senha")
+        if not isinstance(senha, str) or not senha:
+            raise ErroHttp(400, "Digite a senha de sincronização.")
+        senha = _nfc(senha)
+        texto = c.get("sync_json")
+        substituir = c.get("substituir") is True
+        with self._trava:
+            banco = self._exigir_sessao(p.token)
+            if sync.configurada(sync.ajustes(banco)) and not substituir:
+                raise ErroHttp(409, sync.JA_CONFIGURADA)
+        criado = None
+        if texto is None:
+            problema = sync.problema_da_senha(senha)
+            if problema:
+                raise ErroHttp(400, problema)
+            # Pode ser igual ao PIN (decisão do usuário), mas a tela avisa antes e pede confirmação:
+            # quebrar uma (nos arquivos do Drive) entregaria a outra (22.2).
+            if c.get("mesmo_que_o_pin") is not True and self._senha_igual_ao_pin(senha):
+                raise ErroHttp(409, sync.SENHA_IGUAL_AO_PIN, extras={"igual_ao_pin": True})
+            configuracao, chaves = sync.nova_configuracao(senha)      # scrypt fora da trava do app
+            criado = sync.texto_da_configuracao(configuracao)
+        else:
+            configuracao = self._sync_configuracao(sync, texto)
+            chaves = self._conferir_senha_sync(sync, lambda: sync.chaves_da_senha(senha, configuracao))
+        with self._trava:
+            banco = self._exigir_sessao(p.token)
+            if sync.configurada(sync.ajustes(banco)) and not substituir:
+                raise ErroHttp(409, sync.JA_CONFIGURADA)
+            info = sync.ligar(banco, chaves, configuracao, self.plataforma, self._agora_utc())
+        return {**info, "sync_json": criado, "criado": criado is not None}
+
+    def _sync_iniciar(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/iniciar {sync_json}: o entrenos-sync.json do Drive ainda é o desta chave? (Senha
+        trocada em outro aparelho: 409 {senha_mudou}.) Devolve o arquivo deste aparelho e a etiqueta
+        do último arquivo de cada aparelho já juntado aqui (a página só baixa o que mudou)."""
+        sync = self._sync()
+        aj, _chaves = self._sync_chaves(sync, banco)
+        try:
+            configuracao = self._sync_configuracao(sync, p.corpo.get("sync_json"))
+        except ErroHttp as erro:
+            # Num aparelho já ligado, um entrenos-sync.json diferente do seu é "a senha mudou" (ou
+            # um arquivo estranho), nunca "versão nova": o arquivo não é autenticado, e qualquer um
+            # com acesso ao Drive poria um "formato": 2 nele (22.2).
+            if erro.status == 409:
+                raise ErroHttp(409, sync.CONFIG_MUDOU, extras={"senha_mudou": True}) from None
+            raise
+        if not sync.mesma_configuracao(aj, configuracao):
+            raise ErroHttp(409, sync.CONFIG_MUDOU, extras={"senha_mudou": True})
+        est = sync.estado(banco, self.plataforma)
+        return {"aparelho": est["aparelho"], "arquivo": est["arquivo"],
+                "etiquetas": {a["aparelho"]: a["etiqueta"] for a in est["aparelhos"] if a.get("etiqueta")}}
+
+    def _sync_receber(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/receber {nome, etiqueta?, conteudo_b64}: junta o arquivo de outro aparelho.
+        Arquivo que não abre com a chave (mexido, de outra senha): 400 e nada muda."""
+        sync = self._sync()
+        aj, chaves = self._sync_chaves(sync, banco)
+        c = p.corpo
+        nome, etiqueta = c.get("nome"), c.get("etiqueta")
+        if sync.aparelho_do_arquivo(nome) is None:
+            raise ErroHttp(400, "Nome de arquivo de sincronização inválido.")
+        if etiqueta is not None and (not isinstance(etiqueta, str) or not 0 < len(etiqueta) <= 200):
+            raise ErroHttp(400, "Etiqueta do arquivo inválida.")
+        bruto = c.get("conteudo_b64")
+        c["conteudo_b64"] = None
+        try:
+            conteudo = base64.b64decode(re.sub(r"\s+", "", bruto), validate=True) if isinstance(bruto, str) else b""
+        except (binascii.Error, ValueError):
+            conteudo = b""
+        del bruto
+        if not conteudo:
+            raise ErroHttp(400, ARQUIVO_SYNC_VAZIO, extras={"arquivo_invalido": True})
+        try:
+            resumo = sync.mesclar(banco, chaves, conteudo, proprio=aj["aparelho"], agora=self._agora_utc(),
+                                  nome_arquivo=nome, etiqueta=etiqueta)
+        except ValueError as erro:
+            raise self._erro_sync(sync, erro) from None
+        apagados = resumo.pop("_apagados", None)
+        if apagados and any(apagados.values()):
+            # Apagar é apagar também nas cópias automáticas (como quando se apaga pela tela).
+            self._limpar_backups(lambda copia: sync.apagar_nas_copias(copia, apagados))
+        return resumo
+
+    def _sync_preparar(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/preparar: o arquivo deste aparelho, cifrado, para a página enviar ao Drive."""
+        sync = self._sync()
+        aj, chaves = self._sync_chaves(sync, banco)
+        nome, conteudo = sync.preparar(banco, chaves, aj, self._agora_utc())
+        resposta: dict[str, Any] = {"nome": nome, "tamanho": len(conteudo),
+                                    "conteudo_b64": base64.b64encode(conteudo).decode("ascii")}
+        if len(conteudo) > MAX_ARQUIVO_SYNC_CELULAR:
+            resposta["aviso"] = ARQUIVO_SYNC_GRANDE.format(mb=round(len(conteudo) / (1024 * 1024)))
+        return resposta
+
+    def _sync_enviado(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/enviado {etiqueta}: o Drive aceitou o arquivo deste aparelho."""
+        sync = self._sync()
+        aj = sync.marcar_enviado(banco, p.corpo.get("etiqueta"), self._agora_utc(), p.corpo.get("apagados"))
+        return {"ultima": aj.get("ultima")}
+
+    def _sync_conflitos(self, p: Pedido, banco: Banco) -> list:
+        """GET /api/sync/conflitos: o que mudou nos dois aparelhos quase ao mesmo tempo (a tela pergunta)."""
+        return self._sync().conflitos(banco)
+
+    def _sync_resolver(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/conflitos/{id} {fica: "este"|"outro"}."""
+        sync = self._sync()
+        _aj, chaves = self._sync_chaves(sync, banco)
+        sync.resolver_conflito(banco, chaves, p.id, p.corpo.get("fica"), self._agora_utc())
+        return {}
+
+    def _sync_desligar(self, p: Pedido, banco: Banco) -> dict:
+        """POST /api/sync/desligar: para de sincronizar neste aparelho. A chave sai do diário e das
+        cópias automáticas; os arquivos no Drive ficam (cada aparelho só mexe no seu)."""
+        sync = self._sync()
+        sync.desligar(banco)
+        self._limpar_backups(lambda copia: isinstance(copia.config().get("sync"), dict)
+                             and self._backup_sem(copia, sync=None))
+        return {**sync.estado(banco, self.plataforma), "plataforma": self.plataforma}
 
     # ------------------------------------------------------------ IA: PIN e área
 

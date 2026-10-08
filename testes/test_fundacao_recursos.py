@@ -315,15 +315,20 @@ def banco_na_versao(versao: int) -> sqlite3.Connection:
 
 
 class TestEsquema(unittest.TestCase):
-    def test_esquema_central_e_4(self):
-        self.assertEqual(banco_mod.ESQUEMA_VERSAO, 4)
-        self.assertEqual(len(banco_mod._MIGRACOES), 4)
+    def test_esquema_central_e_5(self):
+        # v4 = recursos_esquema (seção 20.0); v5 = as tabelas da sincronização (seção 22).
+        self.assertEqual(banco_mod.ESQUEMA_VERSAO, 5)
+        self.assertEqual(len(banco_mod._MIGRACOES), 5)
         b = Banco.novo()
         self.addCleanup(b.fechar)
-        self.assertEqual(b._con.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(b._con.execute("PRAGMA user_version").fetchone()[0], 5)
         self.assertEqual({l[1] for l in b._con.execute("PRAGMA table_info(recursos_esquema)")}, {"nome", "versao"})
+        tabelas = {l[0] for l in b._con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertLessEqual({"sync_ids", "sync_linhas", "sync_lapides", "sync_aparelhos", "sync_conflitos"}, tabelas)
+        # São do núcleo: nenhum recurso grava nelas.
+        self.assertTrue(all(banco_mod._tabela_central(t) for t in tabelas if t.startswith("sync_")))
 
-    def test_cadeia_de_1_a_4_com_bancos_das_versoes_antigas(self):
+    def test_cadeia_de_1_a_5_com_bancos_das_versoes_antigas(self):
         falso = recurso_falso()
         for versao in (1, 2, 3):
             with self.subTest(versao=versao):
@@ -347,7 +352,7 @@ class TestEsquema(unittest.TestCase):
                     b = Banco.de_bytes(dados)
                     self.addCleanup(b.fechar)
                     self.assertTrue(b.sujo)                                   # migrou: falta salvar
-                    self.assertEqual(b._con.execute("PRAGMA user_version").fetchone()[0], 4)
+                    self.assertEqual(b._con.execute("PRAGMA user_version").fetchone()[0], 5)
                     self.assertEqual(versao_do_recurso(b, "falso"), 2)       # o recurso entrou junto
                     self.assertIn("feito", {l[1] for l in b._con.execute("PRAGMA table_info(falso_coisas)")})
                     registro = b.registro(1)
@@ -1079,7 +1084,8 @@ class TestPagina(unittest.TestCase):
         scripts = re.findall(r"<script\b([^>]*)>(.*?)</script>", html, re.S)
         self.assertTrue(all(corpo.strip() == "" for _, corpo in scripts))         # nada inline (CSP)
         fontes = [re.search(r'src="([^"]+)"', attrs).group(1) for attrs, _ in scripts]
-        self.assertEqual(fontes, ["app.js", *(f"telas/{n}.js" for n in recursos.NOMES)])
+        # Seção 22: a sincronização (Ajustes → ☁️) entra logo depois do app.js, antes das telas.
+        self.assertEqual(fontes, ["app.js", "sincronizar.js", *(f"telas/{n}.js" for n in recursos.NOMES)])
         self.assertTrue(all(re.search(r"\bdefer\b", attrs) for attrs, _ in scripts))
         estilos = re.findall(r'<link rel="stylesheet" href="([^"]+)">', html)
         self.assertEqual(estilos, ["estilo.css", *(f"telas/{n}.css" for n in recursos.NOMES)])

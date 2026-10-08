@@ -12,6 +12,13 @@
  * Levar ou trazer dados (seção 18): restaurar um backup (.cofre) no primeiro uso ou em Ajustes, e
  * importar um JSON exportado (só junta). O arquivo é lido no navegador (FileReader) e vai no corpo
  * do pedido (base64 ou texto); a página não guarda o conteúdo além do necessário.
+ *
+ * Dois modos, uma tela só (seção 21): a página descobre uma vez onde está. Com o servidor do
+ * computador (GET api/ping → {"app": "entre-nos"}) tudo segue como sempre. Sem ele (o site do
+ * celular), o mesmo núcleo Python roda no Pyodide dentro de um Web Worker (trabalhador.mjs) e api()
+ * manda os pedidos para lá por mensagem, com as mesmas respostas. Só no modo navegador: o service
+ * worker (sw.js), instalar o app, "Baixar uma cópia", o espaço do aparelho e os avisos; a IA fica
+ * escondida (a rede da IA no navegador fica para depois).
  */
 'use strict';
 
@@ -170,6 +177,9 @@
   const MAIOR_JSON = LIMITE_ENVIO_ARQUIVO;         // o tamanho exato do pedido é conferido em api()
   const MENSAGEM_COFRE_GRANDE = 'Esse arquivo é grande demais para ser um backup do Entre Nós (o limite é de 47 MB). Confira se escolheu o arquivo .cofre certo.';
   const MENSAGEM_JSON_GRANDE = 'Esse arquivo é grande demais para importar de uma vez (o limite é de 64 MB).';
+  // No navegador (seção 19.7) o limite é menor (16 MB, o que /api/estado manda em limite_arquivo), e o
+  // .cofre vai em bytes, sem base64: o arquivo inteiro pode ter o limite todo.
+  const LIMITE_NAVEGADOR_PADRAO = 16 * 1024 * 1024;
   const MENSAGEM_NAO_E_COFRE = 'Esse arquivo não é um backup do Entre Nós que dê para abrir. Confira se escolheu o arquivo .cofre certo.';
   const MENSAGEM_NAO_E_EXPORTACAO = 'Esse arquivo não é uma exportação do Entre Nós que dê para juntar. Use o arquivo gerado em “Exportar (JSON)”.';
   const MENSAGEM_PIN_DO_BACKUP = 'Esse PIN não abre este backup.';      // a mesma de servidor.PIN_DO_BACKUP
@@ -178,6 +188,8 @@
 
   const estado = {
     modo: 'inicio',          // inicio | portao | app
+    modoApp: null,           // 'servidor' (o computador) | 'navegador' (Pyodide no Worker), seção 21
+    tela: null,              // a tela do portão desenhada agora ('bloqueio', 'preparando'...)
     servidor: null,          // resposta de GET /api/estado
     config: null,            // resposta de GET /api/config
     vez: 0,                  // cada desenho de tela ganha um número; respostas atrasadas são ignoradas
@@ -528,8 +540,35 @@
   }
 
   const METODOS_COM_CORPO = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
+  // Pedidos que não mudam o que vai para os outros aparelhos (só leem, ou são da própria sincronização,
+  // do PIN, da IA, de abrir e fechar): não pedem uma sincronização (seção 22).
+  const NAO_MUDAM_O_DIARIO = /^\/(?:analisar|busca|ia\/|sync\/|bloquear|desbloquear|configurar|restaurar|sair|pin$|backup|importar\/previa|alertas\/dispensar|semana\/conversa|promessas\/(?:parecidas|candidatas)|marcos\/parecidos)/;
+
+  // Depois de um pedido que gravou no diário: a sincronização (web/sincronizar.js) agrupa e manda.
+  function avisarQueGravou(metodo, rota) {
+    if (!METODOS_COM_CORPO.has(metodo) || NAO_MUDAM_O_DIARIO.test(String(rota || ''))) return;
+    try {
+      window.dispatchEvent(new CustomEvent('entrenos:gravou'));
+    } catch {
+      // navegador sem CustomEvent: a sincronização fica para o próximo "Sincronizar agora"
+    }
+  }
 
   async function api(metodo, rota, corpo, opcoes = {}) {
+    if (estado.modoApp === 'navegador') {
+      // Sem servidor: o mesmo pedido vai para o núcleo no Worker (seção 21.2), com as mesmas respostas.
+      let texto;
+      if (METODOS_COM_CORPO.has(metodo)) {
+        texto = JSON.stringify(corpo === undefined ? {} : corpo);
+        if (opcoes.limiteBytes && new Blob([texto]).size > opcoes.limiteBytes) throw new ErroApi(MENSAGENS_HTTP[413], 413);
+      }
+      estado.ultimaRequisicao = Date.now();
+      const token = lerToken();
+      const r = await pedirAoTrabalhador({ tipo: 'api', metodo, caminho: '/api' + rota, corpo: texto, token: token || undefined });
+      const resultado = resultadoDaApi(r.status, r.dados, opcoes);
+      avisarQueGravou(metodo, rota);
+      return resultado;
+    }
     const cabecalhos = { Accept: 'application/json' };
     const token = lerToken();
     if (token) cabecalhos['X-EntreNos-Token'] = token;
@@ -563,17 +602,231 @@
         dados = null;
       }
     }
-    if (resposta.ok) return dados;
+    const resultado = resultadoDaApi(resposta.status, dados, opcoes);
+    avisarQueGravou(metodo, rota);
+    return resultado;
+  }
+
+  // A resposta (do servidor ou do Worker) vira o resultado ou um ErroApi, igual nos dois modos.
+  function resultadoDaApi(status, dados, opcoes = {}) {
+    if (status >= 200 && status < 300) return dados;
     const doServidor = Boolean(dados && typeof dados.erro === 'string' && dados.erro);
     const mensagem = doServidor ? dados.erro
-      : (MENSAGENS_HTTP[resposta.status] || 'Algo não deu certo. Tente de novo.');
+      : (MENSAGENS_HTTP[status] || 'Algo não deu certo. Tente de novo.');
     const extras = dados && typeof dados === 'object' ? dados : null;
-    if ((resposta.status === 401 || resposta.status === 423) && !opcoes.semBloqueio) {
-      irParaBloqueio(resposta.status === 423
+    if ((status === 401 || status === 423) && !opcoes.semBloqueio) {
+      irParaBloqueio(status === 423
         ? 'O Entre Nós se bloqueou sozinho para proteger seus registros.' : null);
-      throw new ErroApi(mensagem, resposta.status, true, doServidor, extras);
+      throw new ErroApi(mensagem, status, true, doServidor, extras);
     }
-    throw new ErroApi(mensagem, resposta.status, false, doServidor, extras);
+    throw new ErroApi(mensagem, status, false, doServidor, extras);
+  }
+
+  // ================================================================ modo navegador: o Worker (seção 21)
+
+  const MENSAGEM_TRABALHADOR = 'O Entre Nós parou de responder neste aparelho. Toque em “Tentar de novo” (ou feche e abra o app): seu diário está guardado.';
+  // Um pedido ao Worker que não volta (o celular encerrou o Worker por falta de memória, por exemplo)
+  // vira a tela de falha com "Tentar de novo", em vez de um botão preso em "Salvando…" (22.2). O
+  // tempo só conta depois que o Python está pronto (o PIN pode esperar outra janela soltar o diário).
+  const LIMITE_PEDIDO_MS = 90000;
+  const LIMITE_PEDIDO_LONGO_MS = 300000;    // restaurar, importar, baixar a cópia e a sincronização
+  const trabalhador = {
+    worker: null,
+    situacao: 'parado',       // parado | carregando | ocupado | pronto | falhou
+    fracao: 0,
+    falha: null,              // {motivo, falhas}: sem conteúdo nenhum
+    pendentes: new Map(),
+    proximoId: 1,
+    ouvintes: new Set(),      // funções chamadas quando o progresso ou a situação mudam
+    pronto: null,
+    medidas: null,
+  };
+
+  function avisarOuvintesDoTrabalhador() {
+    for (const ouvir of [...trabalhador.ouvintes]) {
+      try {
+        ouvir(trabalhador);
+      } catch {
+        // um ouvinte que falha não atrapalha os outros
+      }
+    }
+  }
+
+  function falhaDoTrabalhador(motivo, falhas) {
+    if (trabalhador.situacao === 'falhou') return;
+    trabalhador.situacao = 'falhou';
+    trabalhador.falha = { motivo, falhas: Array.isArray(falhas) ? falhas.filter((f) => typeof f === 'string') : [] };
+    for (const [, pendente] of trabalhador.pendentes) pendente.rejeitar(new ErroApi(MENSAGEM_TRABALHADOR, 0));
+    trabalhador.pendentes.clear();
+    if (trabalhador.rejeitarPronto) trabalhador.rejeitarPronto(new Error(motivo));
+    avisarOuvintesDoTrabalhador();
+  }
+
+  function ligarTrabalhador() {
+    if (trabalhador.worker || trabalhador.situacao === 'falhou') return;
+    trabalhador.pronto = new Promise((resolve, reject) => {
+      trabalhador.resolverPronto = resolve;
+      trabalhador.rejeitarPronto = reject;
+    });
+    trabalhador.pronto.catch(() => {});
+    if (typeof Worker !== 'function' || typeof WebAssembly !== 'object' || typeof indexedDB === 'undefined') {
+      falhaDoTrabalhador('sem-suporte');
+      return;
+    }
+    let w;
+    try {
+      w = new Worker('trabalhador.mjs', { type: 'module', name: 'entrenos' });
+    } catch {
+      falhaDoTrabalhador('sem-suporte');
+      return;
+    }
+    trabalhador.worker = w;
+    trabalhador.situacao = 'carregando';
+    w.addEventListener('message', (evento) => tratarMensagemDoTrabalhador(evento.data));
+    // Worker de módulo sem suporte (navegador antigo) ou um arquivo que não veio: erro sem mensagem.
+    w.addEventListener('error', (evento) => {
+      if (evento && typeof evento.preventDefault === 'function') evento.preventDefault();
+      const depoisDePronto = trabalhador.situacao === 'pronto';
+      falhaDoTrabalhador(depoisDePronto ? 'fatal' : 'carga');
+      // Morreu com o app aberto: a tela de falha (com "Tentar de novo") no lugar de avisos soltos.
+      if (depoisDePronto && estado.modo !== 'inicio') telaFalhaNavegador();
+    });
+    avisarOuvintesDoTrabalhador();
+  }
+
+  function tratarMensagemDoTrabalhador(m) {
+    if (!m || typeof m !== 'object') return;
+    if (m.id != null) {
+      const pendente = trabalhador.pendentes.get(m.id);
+      if (!pendente) return;
+      trabalhador.pendentes.delete(m.id);
+      if (m.ok) pendente.resolver(m.resposta);
+      else pendente.rejeitar(new ErroApi(typeof m.erro === 'string' && m.erro ? m.erro : MENSAGEM_TRABALHADOR, 0));
+      return;
+    }
+    if (m.tipo === 'progresso' && typeof m.fracao === 'number') {
+      trabalhador.fracao = Math.max(trabalhador.fracao, Math.min(1, m.fracao));
+      if (m.fase === 'trava' && trabalhador.situacao === 'ocupado') trabalhador.situacao = 'carregando';
+      avisarOuvintesDoTrabalhador();
+    } else if (m.tipo === 'ocupado') {
+      trabalhador.situacao = 'ocupado';
+      avisarOuvintesDoTrabalhador();
+    } else if (m.tipo === 'pronto') {
+      trabalhador.situacao = 'pronto';
+      trabalhador.fracao = 1;
+      trabalhador.medidas = m.medidas && typeof m.medidas === 'object' ? m.medidas : null;
+      if (trabalhador.resolverPronto) trabalhador.resolverPronto();
+      avisarOuvintesDoTrabalhador();
+    } else if (m.tipo === 'falhou') {
+      falhaDoTrabalhador(typeof m.motivo === 'string' ? m.motivo : 'carga', m.falhas);
+      if (estado.modo !== 'inicio') telaFalhaNavegador();
+    } else if (m.tipo === 'bloqueou') {
+      // O núcleo bloqueou por inatividade sem pedido nenhum (o temporizador do Worker, seção 19.4).
+      if (estado.modo === 'app') {
+        esquecerToken();
+        telaBloqueio('Bloqueei depois de um tempo sem uso, para proteger seus registros.');
+      }
+    }
+  }
+
+  // Manda uma mensagem ao Worker e espera a resposta dela (a que volta com o mesmo id).
+  function pedirAoTrabalhador(mensagem, transferir) {
+    if (trabalhador.situacao === 'falhou' || !trabalhador.worker) return Promise.reject(new ErroApi(MENSAGEM_TRABALHADOR, 0));
+    const id = trabalhador.proximoId++;
+    const longo = mensagem.tipo === 'restaurar' || mensagem.tipo === 'baixar'
+      || /^\/api\/(?:sync\/|importar|restaurar)/.test(String(mensagem.caminho || ''));
+    return new Promise((resolver, rejeitar) => {
+      let tempo = null;
+      const limpar = () => {
+        if (tempo !== null) clearTimeout(tempo);
+        tempo = null;
+      };
+      const armar = () => {
+        if (!trabalhador.pendentes.has(id)) return;
+        tempo = setTimeout(() => {
+          if (!trabalhador.pendentes.has(id)) return;
+          falhaDoTrabalhador('parou');
+          if (estado.modo !== 'inicio') telaFalhaNavegador();
+        }, longo ? LIMITE_PEDIDO_LONGO_MS : LIMITE_PEDIDO_MS);
+      };
+      trabalhador.pendentes.set(id, {
+        resolver: (v) => { limpar(); resolver(v); },
+        rejeitar: (e) => { limpar(); rejeitar(e); },
+      });
+      try {
+        trabalhador.worker.postMessage({ ...mensagem, id }, transferir || []);
+      } catch {
+        trabalhador.pendentes.delete(id);
+        rejeitar(new ErroApi(MENSAGEM_TRABALHADOR, 0));
+        return;
+      }
+      if (trabalhador.situacao === 'pronto') armar();
+      else trabalhador.pronto.then(armar, () => {});
+    });
+  }
+
+  function noNavegador() {
+    return estado.modoApp === 'navegador';
+  }
+
+  // "neste computador" / "neste aparelho", para os textos que valem nos dois modos.
+  function aqui() {
+    return noNavegador() ? 'neste aparelho' : 'neste computador';
+  }
+
+  // O endereço do Entre Nós do computador (127.0.0.1:8787 a 8799): aí nunca vira modo navegador, nem
+  // se o servidor não responder agora (seria outro diário, no armazenamento do navegador do PC).
+  function enderecoDoComputador() {
+    const porta = Number(location.port);
+    return ['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname) && porta >= 8787 && porta <= 8799;
+  }
+
+  async function descobrirModo() {
+    const doComputador = enderecoDoComputador();
+    // Com o service worker do site no controle, é o site do celular (no PC ele nunca é registrado).
+    if (!doComputador && navigator.serviceWorker && navigator.serviceWorker.controller) return 'navegador';
+    const controle = typeof AbortController === 'function' ? new AbortController() : null;
+    const relogio = controle ? setTimeout(() => controle.abort(), 4000) : null;
+    try {
+      const r = await fetch('api/ping', {
+        cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' },
+        signal: controle ? controle.signal : undefined,
+      });
+      const tipo = r.headers.get('Content-Type') || '';
+      if (r.ok && tipo.includes('application/json')) {
+        const dados = await r.json();
+        if (dados && dados.app === 'entre-nos') return 'servidor';
+      }
+    } catch {
+      // sem servidor: o site do celular (ou o computador com o Entre Nós fechado)
+    } finally {
+      if (relogio) clearTimeout(relogio);
+    }
+    return doComputador ? 'servidor' : 'navegador';
+  }
+
+  async function prepararModo() {
+    // Descobrir o modo é instantâneo no computador; numa rede lenta pode levar uns segundos.
+    const aviso = setTimeout(() => {
+      if (estado.modo === 'inicio') {
+        mostrarPortao(h('div', { class: 'portao-cartao cartao' }, marca(), h('h1', null, 'Entre Nós'), carregando('Abrindo…')), 'abrindo');
+      }
+    }, 400);
+    estado.modoApp = await descobrirModo();
+    clearTimeout(aviso);
+    document.documentElement.setAttribute('data-modo', estado.modoApp);
+    if (noNavegador()) {
+      // iPhone no Safari, sem diário aqui: o app instalado guarda tudo separado do Safari, e baixar o
+      // Python (uns 16 MB) aqui seria baixar duas vezes. Os passos de instalar vêm ANTES da carga.
+      if (sugerirInstalarAntes()) await telaInstalarAntes();
+      registrarServiceWorker();
+      ligarTrabalhador();
+    } else if (navigator.serviceWorker && typeof navigator.serviceWorker.getRegistrations === 'function') {
+      // No computador não há service worker (o instalador atualiza o app); se sobrou um, sai.
+      navigator.serviceWorker.getRegistrations()
+        .then((registros) => registros.forEach((r) => r.unregister()))
+        .catch(() => {});
+    }
   }
 
   // ================================================================ avisos e diálogo
@@ -667,6 +920,15 @@
   // "🔒 Não enviar este registro para a IA" (seção 17.1.5). aoMudar(marcado, caixa).
   // `travado` (texto): a caixinha fica marcada e sem mudar, e o texto diz por quê (seção 20.0:
   // um recurso, como o ciclo, deixa o registro fora da IA).
+  // O seletor de arquivos do backup. Só ".cofre" pode deixar o arquivo cinza no iPhone (o iOS converte
+  // a extensão num tipo do sistema e não conhece .cofre); "application/octet-stream" deixa escolher
+  // qualquer arquivo, e o problemaDoArquivo confere a extensão depois.
+  const ACEITA_COFRE = '.cofre,application/octet-stream';
+
+  // Vale nos dois modos e com a sincronização: o 🔒 tira o registro da IA; com a sincronização
+  // ligada ele vai, embaralhado, para os seus outros aparelhos (e continua fora da IA lá).
+  const TEXTO_PRIVADO = 'Marcado, ele nunca vai para a IA: fica fora do que ela analisa, busca ou usa para sugerir. As regras continuam usando o registro normalmente. (Com a sincronização ligada, ele vai embaralhado para os seus outros aparelhos e continua fora da IA lá.)';
+
   function caixaPrivado(id, marcado, aoMudar, travado = null) {
     const idDica = `${id}-dica`;
     const caixa = h('input', {
@@ -677,7 +939,7 @@
     return h('div', { class: 'opcao-privado' },
       h('label', { class: 'opcao-linha', for: id }, caixa,
         h('span', null, h('span', { 'aria-hidden': 'true' }, '🔒 '), 'Não enviar este registro para a IA')),
-      h('p', { class: 'dica', id: idDica }, travado || 'Marcado, ele nunca sai deste computador: fica fora do que a IA analisa, busca ou usa para sugerir. As regras continuam usando o registro normalmente.'));
+      h('p', { class: 'dica', id: idDica }, travado || TEXTO_PRIVADO));
   }
 
   // Campo de PIN que o navegador não trata como senha de site: "one-time-code" faz o
@@ -956,6 +1218,7 @@
   // Os botões ✨ só aparecem com uma IA configurada que dá para usar (uma IA salva numa versão
   // antiga sem a chave, por exemplo, fica configurada mas não utilizável: aviso em Ajustes → IA).
   function iaConfigurada() {
+    if (noNavegador()) return false;      // no celular a IA fica de fora por enquanto (seção 21.2)
     const ia = infoIA();
     return Boolean(ia && ia.configurada === true && ia.utilizavel !== false);
   }
@@ -1082,13 +1345,13 @@
       return 'Esse é um backup (.cofre), não um JSON exportado. Para trazer um backup, use “Restaurar um backup”, logo acima.';
     }
     if (!arquivo.size) return 'Esse arquivo está vazio.';
-    if (tipo === 'cofre' && arquivo.size > MAIOR_COFRE) return MENSAGEM_COFRE_GRANDE;
-    if (tipo === 'json' && arquivo.size > MAIOR_JSON) return MENSAGEM_JSON_GRANDE;
+    if (tipo === 'cofre' && arquivo.size > maiorCofre()) return mensagemCofreGrande();
+    if (tipo === 'json' && arquivo.size > (noNavegador() ? limiteDeEnvio() : MAIOR_JSON)) return mensagemJsonGrande();
     return null;
   }
 
-  // Lê um arquivo escolhido pela pessoa: como 'base64' (o .cofre, para restaurar) ou 'texto' (o
-  // JSON, para importar). aoAndar(fração) acompanha a leitura. Nada fica guardado aqui: quem chama
+  // Lê um arquivo escolhido pela pessoa: como 'base64' (o .cofre, para restaurar no computador),
+  // 'bytes' (o .cofre no navegador: um ArrayBuffer) ou 'texto' (o JSON, para importar). aoAndar(fração) acompanha a leitura. Nada fica guardado aqui: quem chama
   // segura o resultado só enquanto precisa e depois solta (limpa a referência).
   function lerArquivo(arquivo, como, aoAndar) {
     return new Promise((resolve, reject) => {
@@ -1101,6 +1364,11 @@
       leitor.addEventListener('abort', falhou);
       leitor.addEventListener('load', () => {
         const resultado = leitor.result;
+        if (como === 'bytes') {
+          if (resultado instanceof ArrayBuffer) resolve(resultado);
+          else falhou();
+          return;
+        }
         if (typeof resultado !== 'string') {
           falhou();
           return;
@@ -1116,6 +1384,7 @@
       });
       try {
         if (como === 'base64') leitor.readAsDataURL(arquivo);
+        else if (como === 'bytes') leitor.readAsArrayBuffer(arquivo);
         else leitor.readAsText(arquivo, 'utf-8');
       } catch {
         falhou();
@@ -1153,6 +1422,7 @@
   // Devolve {token, resumo}. O conteúdo do arquivo só existe durante o pedido.
   async function restaurarBackup(arquivo, pins, progresso) {
     progresso.fase('Lendo o arquivo…', 0);
+    if (noNavegador()) return restaurarNoNavegador(arquivo, pins, progresso);
     const corpo = Object.assign({ arquivo_b64: null }, pins);
     try {
       corpo.arquivo_b64 = await lerArquivo(arquivo, 'base64', (f) => progresso.fase(null, f));
@@ -1162,6 +1432,47 @@
       for (const chave of Object.keys(corpo)) corpo[chave] = null;
       progresso.limpar();
     }
+  }
+
+  // No navegador o .cofre vai em bytes para o Worker (ponte.restaurar_arquivo), sem base64: o
+  // ArrayBuffer é transferido (não fica cópia na página) e o corpo leva só os PINs (seção 19.7).
+  async function restaurarNoNavegador(arquivo, pins, progresso) {
+    let bytes = null;
+    try {
+      bytes = await lerArquivo(arquivo, 'bytes', (f) => progresso.fase(null, f));
+      progresso.fase('Conferindo o backup com o PIN… Isso pode levar alguns segundos.', 'espera');
+      const token = lerToken();
+      const r = await pedirAoTrabalhador({ tipo: 'restaurar', arquivo: bytes, corpo: JSON.stringify(pins), token: token || undefined }, [bytes]);
+      bytes = null;
+      return resultadoDaApi(r.status, r.dados, { semBloqueio: true });
+    } finally {
+      bytes = null;
+      progresso.limpar();
+    }
+  }
+
+  // Limite dos arquivos enviados (restaurar e importar): 64 MB no computador, o que o núcleo do
+  // navegador disser (16 MB) no celular.
+  function limiteDeEnvio() {
+    if (!noNavegador()) return LIMITE_ENVIO_ARQUIVO;
+    const limite = Number(estado.servidor && estado.servidor.limite_arquivo);
+    return Number.isFinite(limite) && limite > 0 ? limite : LIMITE_NAVEGADOR_PADRAO;
+  }
+
+  function maiorCofre() {
+    return noNavegador() ? limiteDeEnvio() : MAIOR_COFRE;
+  }
+
+  function mensagemCofreGrande() {
+    return noNavegador()
+      ? `Esse arquivo é grande demais para ser um backup do Entre Nós neste aparelho (o limite é de ${tamanhoLegivel(limiteDeEnvio())}). Confira se escolheu o arquivo .cofre certo.`
+      : MENSAGEM_COFRE_GRANDE;
+  }
+
+  function mensagemJsonGrande() {
+    return noNavegador()
+      ? `Esse arquivo é grande demais para importar de uma vez neste aparelho (o limite é de ${tamanhoLegivel(limiteDeEnvio())}).`
+      : MENSAGEM_JSON_GRANDE;
   }
 
   // ================================================================ navegação
@@ -1287,9 +1598,12 @@
 
   // ================================================================ portão (primeiro uso, bloqueio)
 
-  function mostrarPortao(conteudo) {
+  // tela: um nome para a tela do portão ('bloqueio', 'preparando', 'falha'...), para quem precisa
+  // saber se ela já está à mostra (a do PIN não é redesenhada quando o Python termina de abrir).
+  function mostrarPortao(conteudo, tela = null) {
     const saindoDoApp = estado.modo === 'app';
     estado.modo = 'portao';
+    estado.tela = tela;
     estado.atalho = null;
     // As telas dos recursos esquecem o que guardaram (seção 20.10).
     if (saindoDoApp) {
@@ -1333,7 +1647,9 @@
   }
 
   function mostrarApp() {
+    const entrando = estado.modo !== 'app';
     estado.modo = 'app';
+    estado.tela = null;
     const portao = $('#portao');
     limpar(portao);
     portao.hidden = true;
@@ -1341,6 +1657,15 @@
     document.body.classList.remove('em-portao');
     estado.ultimaAtividade = Date.now();
     rotear();
+    // O diário acabou de abrir (PIN, diário novo, backup restaurado): a sincronização (seção 22)
+    // aproveita, se o acesso ao Google ainda vale.
+    if (entrando) {
+      try {
+        window.dispatchEvent(new CustomEvent('entrenos:desbloqueado'));
+      } catch {
+        // navegador sem CustomEvent: sincroniza no próximo "Sincronizar agora"
+      }
+    }
   }
 
   function marca() {
@@ -1354,18 +1679,154 @@
   }
 
   async function carregarEstado() {
+    if (!estado.modoApp) await prepararModo();
+    if (noNavegador() && trabalhador.situacao !== 'pronto') {
+      // O Python ainda está abrindo (5 a 15 s na primeira vez): a tela já aparece, com o andamento.
+      if (!(await esperarTrabalhador())) return;
+    }
     let est;
     try {
       est = await api('GET', '/estado', undefined, { semBloqueio: true });
-    } catch {
-      telaSemConexao();
+    } catch (e) {
+      telaSemNucleo(e);
       return;
     }
+    if (estado.modo === 'app') return;      // o PIN digitado enquanto o Python abria já entrou
     estado.servidor = est || {};
+    if (noNavegador()) lembrarQueTemDiario(Boolean(estado.servidor.configurado));
     if (!estado.servidor.configurado) telaPrimeiroUso();
     else if (estado.servidor.danificado) telaDanificado();
-    else if (!estado.servidor.desbloqueado || !lerToken()) telaBloqueio();
-    else await entrar();
+    else if (!estado.servidor.desbloqueado || !lerToken()) {
+      // A tela do PIN já está aqui (desenhada enquanto o Python abria): não apaga o que foi digitado.
+      if (estado.tela !== 'bloqueio' || estado.modo !== 'portao') telaBloqueio();
+    } else await entrar();
+  }
+
+  // ---------------------------------------------------------------- abrir no navegador (seção 21.2)
+
+  const CHAVE_TEM_DIARIO = 'entrenos.temDiario';
+
+  // Só um "sim" ou "não" (nada do diário): para mostrar a tela do PIN enquanto o Python abre. O
+  // próprio armazenamento do site já mostra que há um diário aqui; isto não revela mais nada.
+  function lembrarQueTemDiario(tem) {
+    try {
+      if (tem) localStorage.setItem(CHAVE_TEM_DIARIO, '1');
+      else localStorage.removeItem(CHAVE_TEM_DIARIO);
+    } catch {
+      // sem localStorage: a primeira tela é a de "preparando"
+    }
+  }
+
+  function temDiarioAqui() {
+    try {
+      return localStorage.getItem(CHAVE_TEM_DIARIO) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  // "Preparando o Entre Nós… 40%" (ou "já está aberto em outra janela"), atualizado pelo Worker.
+  // Some sozinha quando o Python fica pronto.
+  function linhaDeCarga() {
+    const texto = h('p', { class: 'estado-arquivo', role: 'status' });
+    const barra = h('progress', { class: 'barra-arquivo', max: '100', value: '0', 'aria-label': 'Andamento da abertura' });
+    const demora = h('p', { class: 'sutil', 'aria-live': 'polite' });
+    const caixa = h('div', { class: 'carga-app' }, texto, barra, demora);
+    let ocupadoAntes = null;
+    // O download do Python (uns 16 MB na primeira vez) acontece todo antes da fase "python": até lá
+    // a barra fica "andando" (sem número), em vez de parada em 3% (22.2).
+    let relogioDemora = setTimeout(() => {
+      if (!caixa.hidden && trabalhador.situacao === 'carregando' && trabalhador.fracao < 0.5) {
+        demora.textContent = 'Ainda baixando… Confira a conexão (no Wi-Fi é mais rápido). Se não andar, feche e abra de novo: o que já veio fica guardado.';
+      }
+    }, 60000);
+    const desenhar = (t) => {
+      if (t.situacao === 'pronto' || t.situacao === 'falhou') {
+        caixa.hidden = true;
+        trabalhador.ouvintes.delete(desenhar);
+        clearTimeout(relogioDemora);
+        relogioDemora = null;
+        return;
+      }
+      if (t.fracao < 0.5) barra.removeAttribute('value');      // indeterminada: o navegador anima
+      else {
+        barra.value = Math.round(t.fracao * 100);
+        demora.textContent = '';
+      }
+      const ocupado = t.situacao === 'ocupado';
+      if (ocupado !== ocupadoAntes) {
+        // Uma frase nova só quando a situação muda (o leitor de tela não repete porcentagens).
+        texto.textContent = ocupado
+          ? 'O Entre Nós já está aberto em outra janela ou aba (às vezes uma aba do Chrome ou do Safari esquecida no fundo, depois de instalar o app). Feche a outra pelo seletor de abas ou de apps; quando ela fechar, ele abre aqui sozinho.'
+          : 'Preparando o Entre Nós…';
+        ocupadoAntes = ocupado;
+      }
+    };
+    trabalhador.ouvintes.add(desenhar);
+    desenhar(trabalhador);
+    return caixa;
+  }
+
+  async function esperarTrabalhador() {
+    if (trabalhador.situacao === 'falhou') {
+      telaFalhaNavegador();
+      return false;
+    }
+    if (temDiarioAqui()) telaBloqueio();
+    else telaPreparando();
+    try {
+      await trabalhador.pronto;
+      return true;
+    } catch {
+      telaFalhaNavegador();
+      return false;
+    }
+  }
+
+  function telaPreparando() {
+    mostrarPortao(h('div', { class: 'portao-cartao cartao' },
+      marca(),
+      h('h1', null, 'Entre Nós'),
+      h('p', null, 'Abrindo o seu cantinho. Na primeira vez o Entre Nós inteiro vem para este aparelho: cerca de 16 MB (prefira o Wi-Fi), o que pode levar até um minuto. Depois ele abre rápido, mesmo sem internet.'),
+      linhaDeCarga()), 'preparando');
+  }
+
+  function telaFalhaNavegador() {
+    const falha = trabalhador.falha || { motivo: 'carga', falhas: [] };
+    // No iPhone todos os navegadores usam o mesmo motor (o do Safari): trocar de navegador não
+    // resolve; atualizar o iOS, sim.
+    const atualizar = eIPhone()
+      ? 'Atualize o iOS (Ajustes → Geral → Atualização de Software) e tente de novo.'
+      : 'Atualize o navegador ou use outro (Chrome, Edge, Firefox ou Safari).';
+    const textos = {
+      'sem-suporte': ['Este navegador não roda o Entre Nós',
+        `Ele precisa de recursos que este navegador não tem (ou que estão desligados, como numa janela anônima). ${atualizar}`],
+      autoteste: ['Este navegador não passou na conferência',
+        `Antes de abrir qualquer diário, o Entre Nós confere se este navegador guarda tudo com segurança (criptografia e banco de dados). Alguma coisa não funcionou como deveria, então nada foi aberto nem gravado. ${atualizar}`],
+      carga: ['Não consegui abrir o Entre Nós',
+        'Os arquivos do app não chegaram inteiros. Só a primeira abertura precisa de internet: confira a conexão e tente de novo.'],
+      dados: ['Não consegui abrir o armazenamento deste navegador',
+        'O Entre Nós guarda o diário no armazenamento do navegador, e ele não abriu (janela anônima, armazenamento bloqueado ou cheio). Nada foi apagado.'],
+      fatal: ['O Entre Nós precisa ser aberto de novo',
+        'Algo deu errado por aqui. O que já estava salvo continua guardado neste aparelho.'],
+      parou: ['O Entre Nós parou de responder',
+        'Ele demorou demais para responder (o aparelho pode ter fechado uma parte dele por falta de memória). O que já estava salvo continua guardado neste aparelho. Toque em “Tentar de novo” (ou feche e abra o app).'],
+    };
+    const [titulo, texto] = textos[falha.motivo] || textos.carga;
+    // Quem já tinha um diário aqui precisa saber que ele não foi tocado.
+    const tranquilo = ['sem-suporte', 'autoteste', 'carga'].includes(falha.motivo) && temDiarioAqui()
+      ? h('p', null, 'Se você já tinha um diário aqui, ele continua guardado: nada foi aberto nem mudado.') : null;
+    mostrarPortao(h('div', { class: 'portao-cartao cartao' },
+      h('div', { class: 'marca-grande', 'aria-hidden': 'true' }, '🩹'),
+      h('h1', null, titulo),
+      h('p', null, texto),
+      tranquilo,
+      falha.falhas && falha.falhas.length
+        ? h('details', { class: 'detalhes-ajuda' }, h('summary', null, 'Detalhes técnicos'),
+          h('ul', { class: 'lista-falhas' }, falha.falhas.map((f) => h('li', null, f))))
+        : null,
+      h('button', { type: 'button', class: 'botao botao-primario botao-largo', onclick: () => location.reload() }, 'Tentar de novo')),
+    'falha');
   }
 
   // Depois do PIN: ajustes e o estado (que diz se há IA configurada, para os botões ✨).
@@ -1377,11 +1838,27 @@
         api('GET', '/estado', undefined, { semBloqueio: true }).catch(() => null),
       ]);
     } catch (e) {
-      if (!e.bloqueio) telaSemConexao();
+      if (!e.bloqueio) telaSemNucleo(e);
       return;
     }
     if (est && typeof est === 'object') estado.servidor = est;
     mostrarApp();
+  }
+
+  // O núcleo não respondeu: no computador, "o programa não está aberto"; no celular nunca (lá não há
+  // programa nem atalho): a tela de falha do navegador, ou o PIN de novo com a mensagem quando outra
+  // aba gravou no diário (409).
+  function telaSemNucleo(erro) {
+    if (!noNavegador()) {
+      telaSemConexao();
+      return;
+    }
+    if (erro && erro.status === 409 && erro.message) {
+      telaBloqueio(erro.message);
+      return;
+    }
+    if (!trabalhador.falha) trabalhador.falha = { motivo: trabalhador.situacao === 'falhou' ? 'carga' : 'fatal', falhas: [] };
+    telaFalhaNavegador();
   }
 
   // Seção 18.6: "Encontrei N cópias de um diário que já esteve neste computador": sem o
@@ -1391,6 +1868,14 @@
     const n = copias && typeof copias === 'object' ? contagem(copias.quantas) : 0;
     if (!n) return null;
     const quando = dataDoResumo(copias.mais_recente);
+    if (noNavegador()) {
+      // No celular as cópias ficam dentro do armazenamento do navegador, sem pasta para mostrar.
+      return h('div', { class: 'aviso-copias', role: 'note' },
+        h('p', null, h('span', { 'aria-hidden': 'true' }, '📦 '),
+          h('strong', null, `Este navegador ainda guarda ${n} ${plural(n, 'cópia', 'cópias')} de um diário que esteve aqui`),
+          quando ? ` (a mais recente é de ${dataBr(quando)}).` : '.'),
+        h('p', null, 'Se você tem um backup (.cofre) salvo no Arquivos, no Drive ou em outro lugar, escolha “Já tenho um backup”. Criar um diário novo não apaga essas cópias.'));
+    }
     const pasta = typeof copias.pasta === 'string' && copias.pasta ? copias.pasta : '%LOCALAPPDATA%\\EntreNos\\backups';
     return h('div', { class: 'aviso-copias', role: 'note' },
       h('p', null, h('span', { 'aria-hidden': 'true' }, '📦 '),
@@ -1468,7 +1953,9 @@
       if (qtdCopias > 0) {
         const seguir = await confirmar({
           titulo: 'Criar um diário novo?',
-          texto: `Este computador já teve um diário do Entre Nós: há ${qtdCopias} ${plural(qtdCopias, 'cópia', 'cópias')} dele em ${copias.pasta || 'backups'}.\n\nSe o seu diário sumiu, volte e escolha “Já tenho um backup” com a cópia mais recente.\n\nCriar um diário novo não apaga essas cópias.`,
+          texto: noNavegador()
+            ? `Este navegador já teve um diário do Entre Nós: ainda há ${qtdCopias} ${plural(qtdCopias, 'cópia', 'cópias')} dele guardadas aqui.\n\nSe você tem um backup (.cofre), volte e escolha “Já tenho um backup”.\n\nCriar um diário novo não apaga essas cópias.`
+            : `Este computador já teve um diário do Entre Nós: há ${qtdCopias} ${plural(qtdCopias, 'cópia', 'cópias')} dele em ${copias.pasta || 'backups'}.\n\nSe o seu diário sumiu, volte e escolha “Já tenho um backup” com a cópia mais recente.\n\nCriar um diário novo não apaga essas cópias.`,
           ok: 'Criar um diário novo',
           cancelar: 'Voltar',
         });
@@ -1486,11 +1973,15 @@
         pin.value = '';
         pin2.value = '';
         guardarToken(r.token);
+        if (noNavegador()) {
+          lembrarQueTemDiario(true);
+          pedirArmazenamentoPersistente();      // que o navegador não apague o diário para liberar espaço
+        }
         await entrar();
         avisar('Tudo pronto. Bem-vindo ao Entre Nós 💙');
       } catch (erroApi) {
         if (erroApi.status === 409) {
-          telaBloqueio('Este computador já tem um Entre Nós configurado. Use o seu PIN.');
+          telaBloqueio(`${capitalizar(aqui())} já tem um Entre Nós configurado. Use o seu PIN.`);
           return;
         }
         erro.textContent = erroApi.message;
@@ -1533,11 +2024,20 @@
       h('h1', null, 'Bem-vindo ao Entre Nós'),
       h('p', null, 'Um cantinho para guardar o que importa para ela: o que ela conta, do que gosta, as pessoas e as datas da vida dela. Para você lembrar e cuidar melhor.'),
       h('ul', { class: 'garantias' },
-        h('li', null, h('span', { 'aria-hidden': 'true' }, '🔒 '), 'Tudo fica neste computador, criptografado.'),
-        h('li', null, h('span', { 'aria-hidden': 'true' }, '🙈 '), 'Sem IA ligada, nada sai daqui.'),
+        h('li', null, h('span', { 'aria-hidden': 'true' }, '🔒 '), `Tudo fica ${aqui()}, criptografado.`),
+        h('li', null, h('span', { 'aria-hidden': 'true' }, '🙈 '), noNavegador()
+          ? 'Nada do que você escreve sai daqui, a não ser que você ligue a sincronização (e aí vai embaralhado).'
+          : 'Sem IA ligada, nada sai daqui.'),
         h('li', null, h('span', { 'aria-hidden': 'true' }, '✋ '), 'Nada é guardado sem você revisar antes.')),
+      // iPhone fora do app instalado: o app instalado tem outro armazenamento (seção 21.2).
+      avisoInstalarAntes(),
+      ofertaDeInstalacao(),
       avisoDeCopias(copias),
       h('div', { class: 'escolha-inicio', role: 'group', 'aria-label': 'Como você quer começar?' }, botaoNovo, botaoBackup),
+      h('p', { class: 'sutil' }, 'Usava a sincronização em outro aparelho? Crie um diário aqui e ligue a sincronização em Ajustes → ☁️ Sincronização, com a mesma conta do Google e a mesma senha de sincronização: seus registros chegam.'),
+      noNavegador() && navegadorDeComputador()
+        ? h('p', { class: 'nota-cuidado' }, 'Este é um diário só deste navegador. Se você usa o Entre Nós instalado no computador (o programa), ele continua separado deste.')
+        : null,
       painelNovo,
       painelBackup));
   }
@@ -1549,11 +2049,16 @@
     mostrarPortao(h('div', { class: 'portao-cartao cartao' },
       h('div', { class: 'marca-grande', 'aria-hidden': 'true' }, '🩹'),
       h('h1', null, 'O arquivo do diário está danificado'),
-      h('p', null, mensagem || 'O arquivo do diário (entrenos.cofre) parece cortado no meio, e nenhum PIN consegue abri-lo. Seu PIN não foi testado.'),
-      h('p', null, 'Você pode restaurar um backup no lugar dele. O arquivo danificado não é apagado: fica guardado na pasta “backups” dos dados do Entre Nós, com o nome “entrenos-danificado-…”.'),
+      h('p', null, mensagem || (noNavegador()
+        ? 'O diário guardado neste aparelho parece cortado no meio, e nenhum PIN consegue abri-lo. Seu PIN não foi testado.'
+        : 'O arquivo do diário (entrenos.cofre) parece cortado no meio, e nenhum PIN consegue abri-lo. Seu PIN não foi testado.')),
+      h('p', null, noNavegador()
+        ? 'Você pode restaurar um backup (uma cópia .cofre que você baixou) no lugar dele. O diário danificado não é apagado: fica guardado à parte neste aparelho.'
+        : 'Você pode restaurar um backup no lugar dele. O arquivo danificado não é apagado: fica guardado na pasta “backups” dos dados do Entre Nós, com o nome “entrenos-danificado-…”.'),
       avisoDeCopias(copias),
       formRestaurarInicio({ danificado: true }),
-      h('button', { type: 'button', class: 'botao botao-texto', onclick: () => carregarEstado() }, 'Conferir de novo (se o arquivo já foi recuperado)')));
+      noNavegador() ? null
+        : h('button', { type: 'button', class: 'botao botao-texto', onclick: () => carregarEstado() }, 'Conferir de novo (se o arquivo já foi recuperado)')));
   }
 
   // Primeiro uso → "Já tenho um backup": arquivo .cofre + o PIN daquele backup (POST /api/restaurar
@@ -1561,7 +2066,7 @@
   // `danificado`: o mesmo no lugar de um diário danificado (manda `substituir_danificado: true`).
   function formRestaurarInicio({ danificado = false } = {}) {
     const erro = h('p', { class: 'erro-campo', id: 'pu-bk-erro', role: 'alert' });
-    const arquivo = h('input', { id: 'pu-bk-arquivo', type: 'file', accept: '.cofre', 'aria-describedby': 'pu-bk-erro' });
+    const arquivo = h('input', { id: 'pu-bk-arquivo', type: 'file', accept: ACEITA_COFRE, 'aria-describedby': 'pu-bk-erro' });
     const pin = campoPin('pu-bk-pin', { 'aria-describedby': 'pu-bk-erro' });
     const mostrar = h('input', {
       id: 'pu-bk-mostrar', type: 'checkbox',
@@ -1572,11 +2077,13 @@
     const botao = h('button', { type: 'submit', class: 'botao botao-primario botao-grande botao-largo' }, TEXTO_BOTAO);
     const form = h('form', { class: 'form-portao', novalidate: true },
       h('fieldset', null, h('legend', null, danificado ? 'Restaurar um backup no lugar do arquivo danificado' : 'Restaurar um backup'),
-        h('p', null, 'Escolha o arquivo .cofre (uma cópia de segurança do Entre Nós, feita neste ou em outro computador) e digite o PIN que valia quando ela foi feita.'),
-        campo('Arquivo do backup (.cofre)', arquivo, 'Pode estar num pendrive, ou na pasta “backups” dos dados do Entre Nós do outro computador.'),
+        h('p', null, `Escolha o arquivo .cofre (uma cópia de segurança do Entre Nós, feita neste ou em outro ${noNavegador() ? 'aparelho' : 'computador'}) e digite o PIN que valia quando ela foi feita.`),
+        campo('Arquivo do backup (.cofre)', arquivo, noNavegador()
+          ? 'É o arquivo que termina em .cofre. Pode estar no Arquivos (iPhone), nos Downloads, no Drive ou onde você salvou a cópia. Pode ter vindo do computador.'
+          : 'Pode estar num pendrive, ou na pasta “backups” dos dados do Entre Nós do outro computador.'),
         campo('PIN desse backup', pin),
         h('label', { class: 'opcao-linha', for: 'pu-bk-mostrar' }, mostrar, ' Mostrar o que estou digitando'),
-        h('p', { class: 'nota-cuidado' }, 'Depois de restaurar, o PIN do Entre Nós neste computador passa a ser o desse backup.'),
+        h('p', { class: 'nota-cuidado' }, `Depois de restaurar, o PIN do Entre Nós ${aqui()} passa a ser o desse backup.`),
         h('p', { class: 'sutil' }, AVISO_NAO_SALVAR_PIN)),
       progresso.el, erro, botao);
 
@@ -1614,7 +2121,7 @@
       try {
         esquecerToken();        // primeiro uso: sem sessão (um token velho desta aba não vale aqui)
         const r = await restaurarBackup(escolhido, pins, progresso);
-        if (!r || !r.token) throw new ErroApi('O backup foi restaurado, mas não recebi a chave de acesso. Recarregue a página e digite o PIN do backup.');
+        if (!r || !r.token) throw new ErroApi('O backup foi restaurado, mas não recebi a chave de acesso. Feche e abra o Entre Nós e digite o PIN do backup.');
         arquivo.value = '';
         guardarToken(r.token);
         telaRestaurado(r.resumo, false, r.copia, Boolean(r.danificado));
@@ -1631,7 +2138,7 @@
         }
         if (!pinDoBackup && (erroApi.status === 409
           || ((erroApi.status === 401 || erroApi.status === 423) && (await jaTemDiario())))) {
-          telaBloqueio('Este computador já tem um Entre Nós configurado. Use o seu PIN.');
+          telaBloqueio(`${capitalizar(aqui())} já tem um Entre Nós configurado. Use o seu PIN.`);
           return;
         }
         espera = segundosDeEspera(erroApi);
@@ -1639,7 +2146,7 @@
           erro.textContent = 'Esse PIN não abre este backup. Use o PIN que valia quando ele foi feito.';
           foco = pin;
         } else if (erroApi.status === 413) {
-          erro.textContent = MENSAGEM_COFRE_GRANDE;
+          erro.textContent = mensagemCofreGrande();
           foco = arquivo;
         } else if (erroApi.status === 400) {
           erro.textContent = erroApi.doServidor ? erroApi.message : MENSAGEM_NAO_E_COFRE;
@@ -1674,6 +2181,10 @@
   // copia: o caminho da cópia do diário anterior que o servidor guardou (ao restaurar em Ajustes),
   // ou do arquivo danificado guardado (`danificado`, seção 18.6).
   function telaRestaurado(resumo, deAjustes, copia = null, danificado = false) {
+    if (noNavegador()) {
+      lembrarQueTemDiario(true);
+      pedirArmazenamentoPersistente();
+    }
     const r = resumo && typeof resumo === 'object' ? resumo : {};
     const registros = contagem(r.registros);
     const pessoas = contagem(r.pessoas);
@@ -1687,8 +2198,8 @@
       h('div', { class: 'marca-grande', 'aria-hidden': 'true' }, '📦'),
       h('h1', null, 'Backup restaurado'),
       h('p', null, registros > 0
-        ? 'O diário desse backup agora está neste computador. Voltaram:'
-        : 'O diário desse backup agora está neste computador, mas ele ainda não tinha nenhum registro.'),
+        ? `O diário desse backup agora está ${aqui()}. Voltaram:`
+        : `O diário desse backup agora está ${aqui()}, mas ele ainda não tinha nenhum registro.`),
       registros > 0 || pessoas > 0
         ? h('ul', { class: 'garantias resumo-restauracao' },
           h('li', null, h('span', { 'aria-hidden': 'true' }, '📖 '), `${registros} ${plural(registros, 'registro', 'registros')}`),
@@ -1697,14 +2208,19 @@
             ? `${pessoas} ${plural(pessoas, 'pessoa', 'pessoas')} da vida dela`
             : 'nenhuma pessoa cadastrada'))
         : null,
-      h('p', { class: 'nota-cuidado' }, 'A partir de agora, o PIN do Entre Nós neste computador é o desse backup. A IA e o PIN da IA também são os que estavam nele.'),
-      deAjustes
+      h('p', { class: 'nota-cuidado' }, noNavegador()
+        ? 'A partir de agora, o PIN do Entre Nós neste aparelho é o desse backup.'
+        : 'A partir de agora, o PIN do Entre Nós neste computador é o desse backup. A IA e o PIN da IA também são os que estavam nele.'),
+      deAjustes && noNavegador()
+        ? h('p', { class: 'sutil' }, 'O diário que estava aqui antes ficou guardado dentro do armazenamento deste navegador, com o PIN de antes. Abrir essas cópias pela tela ainda não dá no celular: antes de restaurar, o caminho seguro é “Baixar uma cópia”.')
+        : null,
+      deAjustes && !noNavegador()
         ? h('div', { class: 'copia-anterior' },
           h('p', { class: 'sutil' }, 'O diário que estava aqui antes ficou guardado neste arquivo. Ele abre com o PIN que valia antes da restauração:'),
           linhaCaminho(typeof copia === 'string' && copia ? copia : 'backups\entrenos-antes-da-restauracao-…'),
           h('p', { class: 'sutil' }, 'Para desfazer: Ajustes → Levar ou trazer dados → Restaurar um backup, cole este caminho no seletor de arquivos e use o PIN de antes. A pasta dos dados fica escondida no Windows; colar o caminho é o jeito mais fácil de chegar nela.'))
         : null,
-      danificado && typeof copia === 'string' && copia
+      danificado && typeof copia === 'string' && copia && !noNavegador()
         ? h('div', { class: 'copia-anterior' },
           h('p', { class: 'sutil' }, 'O arquivo danificado não foi apagado; ficou guardado aqui:'),
           linhaCaminho(copia))
@@ -1749,7 +2265,10 @@
         return;
       }
       botao.disabled = true;
-      botao.textContent = 'Conferindo…';
+      // Outra janela é dona do diário: o PIN espera ela fechar (o botão diz isso, em vez de
+      // "Conferindo…" por tempo indeterminado).
+      botao.textContent = noNavegador() && trabalhador.situacao === 'ocupado'
+        ? 'Esperando a outra janela fechar…' : 'Conferindo…';
       let espera = 0;
       try {
         const r = await api('POST', '/desbloquear', { pin: pin.value }, { semBloqueio: true });
@@ -1782,6 +2301,8 @@
       h('div', { class: 'marca-grande', 'aria-hidden': 'true' }, '🔒'),
       h('h1', null, 'Entre Nós'),
       h('p', null, mensagem || 'Digite seu PIN para abrir.'),
+      // No celular o Python pode ainda estar abrindo: dá para ir digitando (o PIN espera por ele).
+      noNavegador() && trabalhador.situacao !== 'pronto' ? linhaDeCarga() : null,
       form,
       h('p', { class: 'sutil' }, minutos
         ? `Por segurança, ele se bloqueia sozinho depois de ${minutos} minutos sem uso.`
@@ -1789,7 +2310,8 @@
       h('p', { class: 'sutil' }, AVISO_NAO_SALVAR_PIN),
       h('details', { class: 'detalhes-ajuda' },
         h('summary', null, 'Esqueci o PIN'),
-        h('p', null, 'O PIN não fica guardado em lugar nenhum, e é ele que abre a criptografia. Sem ele, não há como abrir os registros, nem as cópias de segurança. Tente com calma as frases que você costuma usar.'))));
+        h('p', null, 'O PIN não fica guardado em lugar nenhum, e é ele que abre a criptografia. Sem ele, não há como abrir os registros, nem as cópias de segurança. Tente com calma as frases que você costuma usar.'))),
+    'bloqueio');
   }
 
   function telaSemConexao() {
@@ -3948,11 +4470,13 @@
       secaoRegistro(c),
       secaoSeguranca(c),
       secaoAparencia(),
+      noNavegador() ? secaoAparelho(atual) : null,
       secaoDados(),
       secoesAjustes.map((s) => secaoDeRecurso(s, atual)),
       secaoHistorico(),
       secaoPrivacidade(),
-      secaoIA(),
+      // A IA não roda no navegador por enquanto (seção 21.2): a área nem aparece no celular.
+      noNavegador() ? null : secaoIA(),
       secaoSair(),
       h('p', { class: 'sutil centro versao' }, `Entre Nós${estado.servidor && estado.servidor.versao ? ` · versão ${estado.servidor.versao}` : ''}`));
   }
@@ -4107,8 +4631,10 @@
   function secaoDados() {
     return h('section', { class: 'cartao', 'aria-labelledby': 'aj-dados' },
       h('h2', { id: 'aj-dados' }, h('span', { 'aria-hidden': 'true' }, '📦 '), 'Levar ou trazer dados'),
-      h('p', null, 'Cada computador tem o seu próprio diário. Para levar seus registros para outro computador, faça um backup aqui e restaure lá.'),
-      blocoBackup(),
+      h('p', null, noNavegador()
+        ? 'Cada aparelho tem o seu próprio diário. Para levar seus registros para outro aparelho (ou para o computador), baixe uma cópia aqui e restaure lá: é o mesmo arquivo .cofre nos dois.'
+        : 'Cada computador tem o seu próprio diário. Para levar seus registros para outro computador, faça um backup aqui e restaure lá.'),
+      noNavegador() ? blocoBaixarCopia() : blocoBackup(),
       blocoRestaurar(),
       blocoExportar(),
       blocoImportar());
@@ -4157,7 +4683,7 @@
   // sessão nova: a página guarda o token novo e recarrega tudo (passando pelo resumo).
   function blocoRestaurar() {
     const erro = h('p', { class: 'erro-campo', id: 'aj-rest-erro', role: 'alert' });
-    const arquivo = h('input', { id: 'aj-rest-arquivo', type: 'file', accept: '.cofre', 'aria-describedby': 'aj-rest-erro' });
+    const arquivo = h('input', { id: 'aj-rest-arquivo', type: 'file', accept: ACEITA_COFRE, 'aria-describedby': 'aj-rest-erro' });
     const pinBackup = campoPin('aj-rest-pin', { 'aria-describedby': 'aj-rest-erro' });
     const pinAtual = campoPin('aj-rest-pin-atual', { 'aria-describedby': 'aj-rest-erro' });
     const progresso = indicadorProgresso();
@@ -4204,9 +4730,19 @@
         pinAtual.focus();
         return;
       }
+      // Com a sincronização ligada, restaurar não "volta no tempo": o que está nos outros aparelhos e
+      // no Drive volta, e o que foi apagado neles continua apagado (22.2). A tela diz isso antes.
+      const sincronizando = await api('GET', '/sync/estado', undefined, { semBloqueio: true })
+        .then((est) => Boolean(est && est.configurada)).catch(() => false);
+      if (!form.isConnected) return;
+      const daSincronizacao = sincronizando
+        ? '\n\nCom a sincronização ligada, o que está nos seus outros aparelhos e no Google Drive volta depois de restaurar, e o que foi apagado neles continua apagado. Para voltar mesmo ao que está no backup, pare a sincronização antes (Ajustes → ☁️ Sincronização).'
+        : '';
       const ok = await confirmar({
         titulo: 'Substituir o diário de agora?',
-        texto: `O diário deste computador vai ser trocado pelo do backup ${descreverArquivo(escolhido)}. O que foi registrado aqui e não está nele deixa de aparecer.\n\nAntes de trocar, uma cópia do diário de agora fica guardada na pasta “backups”. Depois, o PIN passa a ser o desse backup.`,
+        texto: noNavegador()
+          ? `O diário deste aparelho vai ser trocado pelo do backup ${descreverArquivo(escolhido)}. O que foi registrado aqui e não está nele deixa de aparecer.\n\nUma cópia do diário de agora fica guardada dentro do navegador, mas por enquanto ela não abre pelo celular: se quiser poder voltar atrás, toque em Cancelar e use “Baixar uma cópia de agora” antes. Depois, o PIN passa a ser o desse backup.${daSincronizacao}`
+          : `O diário deste computador vai ser trocado pelo do backup ${descreverArquivo(escolhido)}. O que foi registrado aqui e não está nele deixa de aparecer.\n\nAntes de trocar, uma cópia do diário de agora fica guardada na pasta “backups”. Depois, o PIN passa a ser o desse backup.${daSincronizacao}`,
         ok: 'Substituir pelo backup',
         perigo: true,
       });
@@ -4235,7 +4771,7 @@
           erro.textContent = mensagem;
           foco = /atual|agora|principal/i.test(mensagem) && !/backup/i.test(mensagem) ? pinAtual : pinBackup;
         } else if (erroApi.status === 413) {
-          erro.textContent = MENSAGEM_COFRE_GRANDE;
+          erro.textContent = mensagemCofreGrande();
           foco = arquivo;
         } else if (erroApi.status === 400) {
           erro.textContent = erroApi.doServidor ? erroApi.message : MENSAGEM_NAO_E_COFRE;
@@ -4260,10 +4796,37 @@
       h('p', { class: 'nota-importante' }, h('span', { 'aria-hidden': 'true' }, '⚠️ '),
         'Restaurar substitui o diário de agora pelo do backup: o que foi registrado aqui e não está no backup deixa de aparecer.'),
       h('ul', { class: 'lista-explica' },
-        h('li', null, 'Antes de trocar, uma cópia do diário de agora fica guardada na pasta “backups” (arquivo “entrenos-antes-da-restauracao-…”).'),
-        h('li', null, 'Depois, o PIN passa a ser o do backup. A IA e o PIN da IA também voltam como estavam nele.'),
-        h('li', null, 'Quer só acrescentar os registros de outro computador, sem perder os daqui? Use “Importar JSON (juntar)”, logo abaixo.')),
+        h('li', null, noNavegador()
+          ? 'Antes de trocar, uma cópia do diário de agora fica guardada dentro deste navegador, mas por enquanto ela não abre pelo celular. Para poder voltar atrás, baixe uma cópia de agora antes (o botão logo abaixo).'
+          : 'Antes de trocar, uma cópia do diário de agora fica guardada na pasta “backups” (arquivo “entrenos-antes-da-restauracao-…”).'),
+        h('li', null, noNavegador()
+          ? 'Depois, o PIN passa a ser o do backup.'
+          : 'Depois, o PIN passa a ser o do backup. A IA e o PIN da IA também voltam como estavam nele.'),
+        h('li', null, 'Com a sincronização ligada, o que está nos outros aparelhos volta depois de restaurar (e o que foi apagado neles continua apagado).'),
+        h('li', null, `Quer só acrescentar os registros de outro ${noNavegador() ? 'aparelho' : 'computador'}, sem perder os daqui? Use “Importar JSON (juntar)”, logo abaixo.`)),
+      noNavegador() ? botaoCopiaAntes() : null,
       form);
+  }
+
+  // "Baixar uma cópia de agora" dentro do restaurar (no celular a cópia interna não abre pela tela).
+  function botaoCopiaAntes() {
+    const resultado = h('p', { class: 'resultado', 'aria-live': 'polite' });
+    const botao = h('button', { type: 'button', class: 'botao botao-secundario' }, '💾 Baixar uma cópia de agora');
+    botao.addEventListener('click', async () => {
+      botao.disabled = true;
+      resultado.textContent = '';
+      try {
+        const r = await copiaEmBytes();
+        const arquivo = new File([r.bytes], r.nome || `entrenos-backup-${hojeIso()}.cofre`, { type: 'application/octet-stream' });
+        baixarArquivo(arquivo, arquivo.name);
+        resultado.textContent = `Cópia baixada (${arquivo.name}): ela costuma ficar em Downloads (no iPhone, em Arquivos → Transferências).`;
+      } catch (e) {
+        if (!e.bloqueio) resultado.textContent = e.message;
+      } finally {
+        botao.disabled = false;
+      }
+    });
+    return h('div', { class: 'acoes' }, botao, resultado);
   }
 
   function blocoExportar() {
@@ -4353,7 +4916,7 @@
       try {
         const corpo = { json: texto, confirmar: true };
         soltar();                 // daqui em diante o texto só existe dentro do pedido
-        const r = (await api('POST', '/importar', corpo, { limiteBytes: LIMITE_ENVIO_ARQUIVO })) || {};
+        const r = (await api('POST', '/importar', corpo, { limiteBytes: limiteDeEnvio() })) || {};
         corpo.json = null;
         estado.busca = null;      // a última busca não vê os registros novos
         if (!form.isConnected) return;
@@ -4364,7 +4927,7 @@
         limpar(previa);
         // 400 e 413: o servidor recusou antes de gravar (tudo numa transação). Sem resposta
         // (status 0), não dá para garantir: a pessoa confere pela prévia de novo.
-        if (e.status === 413) erro.textContent = `${MENSAGEM_JSON_GRANDE} Nada foi juntado.`;
+        if (e.status === 413) erro.textContent = `${mensagemJsonGrande()} Nada foi juntado.`;
         else if (e.status === 400) erro.textContent = `${e.doServidor ? e.message : MENSAGEM_NAO_E_EXPORTACAO} Nada foi juntado.`;
         else if (e.status === 0) erro.textContent = `${e.message} Para saber se algo entrou, veja a prévia de novo: o que já entrou aparece como “já está aqui”.`;
         else erro.textContent = e.message;
@@ -4396,14 +4959,14 @@
         progresso.fase('Lendo o arquivo…', 0);
         lido = await lerArquivo(escolhido, 'texto', (f) => progresso.fase(null, f));
         progresso.fase('Conferindo o que já está no seu diário…', 'espera');
-        const p = (await api('POST', '/importar/previa', { json: lido }, { limiteBytes: LIMITE_ENVIO_ARQUIVO })) || {};
+        const p = (await api('POST', '/importar/previa', { json: lido }, { limiteBytes: limiteDeEnvio() })) || {};
         if (!form.isConnected || estado.modo !== 'app') return;
         texto = lido;
         esquecedoresArquivo.add(esquecer);
         foco = desenharPreviaImportacao(previa, p, { juntar, cancelar });
       } catch (erroApi) {
         if (erroApi.bloqueio || !form.isConnected) return;
-        if (erroApi.status === 413) erro.textContent = MENSAGEM_JSON_GRANDE;
+        if (erroApi.status === 413) erro.textContent = mensagemJsonGrande();
         else if (erroApi.status === 400) erro.textContent = erroApi.doServidor ? erroApi.message : MENSAGEM_NAO_E_EXPORTACAO;
         else erro.textContent = erroApi.message;
         foco = arquivo;
@@ -4605,6 +5168,8 @@
       h('h2', { id: 'aj-historico' }, '🕘 Histórico'), detalhes);
   }
 
+  const TEXTO_PRIVACIDADE_SYNC = 'Desligada até você ligar em ☁️ Sincronização. Ligada, cada aparelho guarda no SEU Google Drive, numa pasta escondida do app, um arquivo embaralhado com a senha de sincronização: o Google só vê bytes sem sentido. A senha e a chave ficam só dentro do diário criptografado de cada aparelho. O login do Google só é carregado depois que você liga, e o acesso fica só na memória desta tela (cerca de uma hora). Apagar num aparelho apaga nos outros (fica só uma impressão, sem conteúdo, para não voltar).';
+
   function secaoPrivacidade() {
     const textoIA = !iaConfigurada()
       ? 'Nenhuma IA configurada: nada é enviado para a internet.'
@@ -4621,11 +5186,25 @@
       ['Apagar', 'Registro apagado some de verdade: do banco, da busca, do arquivo e das cópias automáticas. Cópias que você guardou em outro lugar (como um pendrive) continuam como estavam.'],
       ['Backup e restauração', 'O backup sai criptografado e só abre com o PIN daquele momento. Restaurar troca o diário inteiro pelo do backup; antes, o diário de agora fica guardado na subpasta “backups”.'],
       ['Exportação e importação', 'O arquivo exportado sai sem criptografia; guarde com cuidado. Importar só junta registros e pessoas: ajustes, PIN e IA do arquivo ficam de fora. Depois de importar, apague o JSON se não precisar mais dele.'],
+      ['Sincronização (opcional)', TEXTO_PRIVACIDADE_SYNC],
       ['Erros', 'O arquivo de erros guarda só o tipo do problema, nunca o que você escreveu.'],
+    ];
+    const linhasCelular = [
+      ['Seus registros', 'Num único arquivo criptografado (AES-256) no armazenamento deste navegador, neste aparelho. Sem o PIN, o arquivo é ilegível. O site do Entre Nós guarda só o código do app: nada do que você escreve vai para ele.'],
+      ['Cópias automáticas', 'Também dentro do navegador, também criptografadas. Ficam só as mais recentes.'],
+      ['O PIN', 'Não fica guardado em lugar nenhum. Ele abre a chave só enquanto o Entre Nós está desbloqueado. Não existe recuperação.'],
+      ['Esta tela', 'O app inteiro roda aqui, dentro do navegador (o mesmo do computador, em Python). Ao bloquear, a chave sai da memória e a tela se apaga.'],
+      ['Internet', 'Só para baixar o próprio app (na primeira vez e nas atualizações) e, se você ligar a sincronização, para falar com o seu Google Drive. A IA não funciona no celular por enquanto.'],
+      ['Sincronização (opcional)', TEXTO_PRIVACIDADE_SYNC],
+      ['Avisos', 'Se você ligar os avisos, fica fora do diário cifrado só a lista de DIAS com lembretes e quantos, para o aparelho avisar “Você tem 2 lembretes hoje”. Nada do que é, nem nomes. Desligar apaga essa lista.'],
+      ['Apagar', 'Registro apagado some de verdade: do banco, da busca, do arquivo e das cópias automáticas. Cópias que você baixou continuam como estavam.'],
+      ['Backup e restauração', '“Baixar uma cópia” gera o arquivo .cofre criptografado, que só abre com o PIN daquele momento (aqui ou no computador). Restaurar troca o diário inteiro pelo do backup.'],
+      ['Limpeza do navegador', 'Limpar os dados do site, ou o navegador apagar por falta de espaço, apaga o diário deste aparelho. Por isso: “Proteger contra limpeza” (em Este aparelho) e cópias de vez em quando.'],
+      ['Exportação e importação', 'O arquivo exportado sai sem criptografia; guarde com cuidado. Importar só junta registros e pessoas.'],
     ];
     return h('section', { class: 'cartao', 'aria-labelledby': 'aj-privacidade' },
       h('h2', { id: 'aj-privacidade' }, '🔐 Privacidade: onde fica cada coisa'),
-      h('dl', { class: 'lista-definicoes' }, linhas.map(([t, d]) => [
+      h('dl', { class: 'lista-definicoes' }, (noNavegador() ? linhasCelular : linhas).map(([t, d]) => [
         h('dt', null, t),
         h('dd', null, d)])));
   }
@@ -5561,6 +6140,15 @@
   }
 
   function secaoSair() {
+    if (noNavegador()) {
+      // No celular não há programa para fechar: tudo já é salvo a cada passo; bloquear tira a chave
+      // e o diário da memória na hora.
+      return h('section', { class: 'cartao', 'aria-labelledby': 'aj-sair' },
+        h('h2', { id: 'aj-sair' }, '👋 Sair'),
+        h('p', null, 'Tudo já fica salvo a cada passo: é só fechar o app ou a aba. Bloquear tira o diário da memória na hora.'),
+        h('div', { class: 'acoes' },
+          h('button', { type: 'button', class: 'botao botao-primario', onclick: () => bloquearAgora() }, '🔒 Bloquear agora')));
+    }
     const sair = async () => {
       const ok = await confirmar({
         titulo: 'Fechar o Entre Nós?',
@@ -5589,9 +6177,488 @@
         h('button', { type: 'button', class: 'botao botao-primario', onclick: sair }, 'Fechar o Entre Nós')));
   }
 
+  // ================================================================ celular: instalar, cópia, espaço e avisos (seção 21)
+
+  let pedidoDeInstalacao = null;      // o beforeinstallprompt guardado (Android e PC com Chromium)
+  let recarregarAoTrocar = false;     // só recarrega quando a pessoa tocou em "Recarregar"
+  const ETIQUETA_AVISOS = 'entrenos-avisos';
+  const INTERVALO_AVISOS = 12 * 60 * 60 * 1000;      // o navegador decide; isto é o mínimo pedido
+
+  function instaladoComoApp() {
+    try {
+      return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // O site aberto no navegador de um computador (não celular nem tablet).
+  function navegadorDeComputador() {
+    const ua = navigator.userAgent || '';
+    return !eIPhone() && !/Android|Mobile|Tablet/i.test(ua);
+  }
+
+  function eIPhone() {
+    const ua = navigator.userAgent || '';
+    return /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+
+  // iPhone no Safari (fora do app instalado): o app instalado guarda os dados separado do Safari, então
+  // um diário criado aqui não aparece nele. Avisa antes de criar (seção 21.2).
+  function avisoInstalarAntes() {
+    if (!noNavegador() || instaladoComoApp() || !eIPhone()) return null;
+    return h('div', { class: 'nota-importante', role: 'note' },
+      h('p', null, h('strong', null, 'No iPhone, instale o app antes de criar o diário.')),
+      h('p', null, 'O app instalado guarda os dados separado do Safari: um diário criado aqui no Safari não aparece no app.'),
+      passosIPhone());
+  }
+
+  function passosIPhone() {
+    return h('ol', { class: 'passos-iphone' },
+      h('li', null, 'Toque em Compartilhar (o quadrado com a seta para cima). No iOS 26 ele fica dentro do menu “⋯”; no Chrome do iPhone, no alto, ao lado do endereço.'),
+      h('li', null, 'Escolha “Adicionar à Tela de Início”. Se aparecer “Abrir como App Web”, deixe ligado. Confirme.'),
+      h('li', null, 'Abra o Entre Nós pelo ícone novo e crie o diário lá.'));
+  }
+
+  const CHAVE_CONTINUAR_NO_SAFARI = 'entrenos.continuarNoSafari';
+
+  function sugerirInstalarAntes() {
+    if (!eIPhone() || instaladoComoApp() || temDiarioAqui()) return false;
+    try {
+      return localStorage.getItem(CHAVE_CONTINUAR_NO_SAFARI) !== '1';
+    } catch {
+      return true;
+    }
+  }
+
+  // Antes de baixar o app no Safari do iPhone: instalar (recomendado) ou continuar aqui mesmo.
+  function telaInstalarAntes() {
+    return new Promise((resolver) => {
+      const continuar = h('button', { type: 'button', class: 'botao botao-secundario botao-largo' }, 'Continuar no Safari mesmo assim');
+      continuar.addEventListener('click', () => {
+        try {
+          localStorage.setItem(CHAVE_CONTINUAR_NO_SAFARI, '1');
+        } catch {
+          // sem localStorage: pergunta de novo da próxima vez
+        }
+        resolver();
+      });
+      mostrarPortao(h('div', { class: 'portao-cartao cartao' },
+        marca(),
+        h('h1', null, 'Instale antes de começar (recomendado)'),
+        h('p', null, 'No iPhone, o app instalado na Tela de Início guarda os dados separado do Safari: um diário criado aqui não aparece nele. Instalando agora, o Entre Nós é baixado uma vez só (uns 16 MB) e abre direto pelo ícone, mesmo sem internet.'),
+        passosIPhone(),
+        h('p', { class: 'sutil' }, 'Já instalou? Feche esta aba e abra pelo ícone novo.'),
+        continuar), 'instalar');
+      continuar.focus();
+    });
+  }
+
+  function blocoInstalar() {
+    if (instaladoComoApp()) {
+      return h('p', null, h('span', { 'aria-hidden': 'true' }, '✅ '), 'O Entre Nós está instalado neste aparelho.');
+    }
+    if (pedidoDeInstalacao) {
+      const botao = h('button', { type: 'button', class: 'botao botao-primario' }, '📲 Instalar o app');
+      botao.addEventListener('click', async () => {
+        const pedido = pedidoDeInstalacao;
+        if (!pedido) return;
+        botao.disabled = true;
+        try {
+          await pedido.prompt();
+          const escolha = await pedido.userChoice;
+          if (escolha && escolha.outcome === 'accepted') avisar('Pronto! O Entre Nós vai aparecer junto com os seus apps.');
+        } catch {
+          // o navegador não mostrou o pedido: fica o botão para tentar de novo
+        } finally {
+          pedidoDeInstalacao = null;
+          botao.disabled = false;
+          botao.hidden = true;
+        }
+      });
+      return h('div', null,
+        h('p', null, 'Instalado, ele abre direto (sem a barra do navegador), funciona sem internet e pode avisar dos lembretes.'),
+        botao);
+    }
+    if (eIPhone()) {
+      return h('div', null, h('p', null, 'Para instalar no iPhone:'), passosIPhone(),
+        h('p', { class: 'nota-cuidado' }, 'O app instalado guarda os dados separado do Safari. Se você já criou o diário aqui, baixe uma cópia antes e restaure no app.'));
+    }
+    return h('p', { class: 'sutil' }, 'No menu do navegador, procure “Instalar app” ou “Adicionar à tela inicial”.');
+  }
+
+  // Um lugar na tela para o botão "Instalar o app", preenchido quando o navegador oferece (o
+  // beforeinstallprompt pode chegar depois de a tela ser desenhada).
+  function ofertaDeInstalacao() {
+    if (!noNavegador() || instaladoComoApp() || eIPhone()) return null;
+    const lugar = h('div', { 'data-instalar': '' });
+    preencherOferta(lugar);
+    return lugar;
+  }
+
+  function preencherOferta(lugar) {
+    limpar(lugar);
+    if (pedidoDeInstalacao && !instaladoComoApp()) inserir(lugar, blocoInstalar());
+  }
+
+  function preencherOfertasDeInstalacao() {
+    document.querySelectorAll('[data-instalar]').forEach(preencherOferta);
+    document.querySelectorAll('[data-instalar-ajustes]').forEach((lugar) => {
+      limpar(lugar);
+      inserir(lugar, blocoInstalar());
+    });
+  }
+
+  async function pedirArmazenamentoPersistente() {
+    try {
+      if (navigator.storage && typeof navigator.storage.persist === 'function') return await navigator.storage.persist();
+    } catch {
+      // o navegador decide; sem resposta, fica como estava
+    }
+    return false;
+  }
+
+  // Espaço usado, proteção contra limpeza, instalar e avisos: Ajustes → 📱 Este aparelho.
+  function secaoAparelho(atual) {
+    const espaco = h('p', { 'aria-live': 'polite' }, 'Conferindo o espaço…');
+    const protecao = h('p', { 'aria-live': 'polite' });
+    const botaoProteger = h('button', { type: 'button', class: 'botao botao-secundario', hidden: true }, '🛡️ Proteger contra limpeza');
+    const atualizar = async () => {
+      try {
+        const est = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null;
+        if (!atual()) return;
+        // O número inclui o próprio app (o Python, uns 16 MB), não só o diário.
+        espaco.textContent = est && Number.isFinite(est.usage)
+          ? `O app e o diário usam ${tamanhoLegivel(est.usage)} neste aparelho${Number.isFinite(est.quota) && est.quota > 0 ? ` (o navegador deixa o site usar até ${tamanhoLegivel(est.quota)})` : ''}. A conta inclui o próprio app (uns 16 MB), não só o diário.`
+          : 'Este navegador não informa o espaço usado.';
+      } catch {
+        espaco.textContent = 'Este navegador não informa o espaço usado.';
+      }
+      let persistente = null;
+      try {
+        if (navigator.storage && navigator.storage.persisted) persistente = await navigator.storage.persisted();
+      } catch {
+        persistente = null;
+      }
+      if (!atual()) return;
+      protecao.textContent = persistente === true
+        ? 'Protegido contra limpeza: sim. O navegador não apaga o diário sozinho para liberar espaço.'
+        : persistente === false
+          ? 'Protegido contra limpeza: não. Se o aparelho ficar sem espaço, o navegador pode apagar os dados do site (no iPhone, o Safari também apaga dados de sites não instalados depois de semanas sem uso).'
+          : 'Protegido contra limpeza: este navegador não informa.';
+      botaoProteger.hidden = persistente !== false;
+    };
+    botaoProteger.addEventListener('click', async () => {
+      botaoProteger.disabled = true;
+      const ok = await pedirArmazenamentoPersistente();
+      botaoProteger.disabled = false;
+      if (!ok) avisar('O navegador não deixou agora. Instalar o app e usar com frequência costuma ajudar; e baixe cópias de vez em quando.', 'erro');
+      atualizar();
+    });
+    atualizar();
+    return h('section', { class: 'cartao', 'aria-labelledby': 'aj-aparelho' },
+      h('h2', { id: 'aj-aparelho' }, h('span', { 'aria-hidden': 'true' }, '📱 '), 'Este aparelho'),
+      h('div', { class: 'bloco-aparelho' }, h('h3', null, 'Instalar o app'), h('div', { 'data-instalar-ajustes': '' }, blocoInstalar())),
+      h('div', { class: 'bloco-aparelho' }, h('h3', null, 'Espaço e proteção'), espaco, protecao,
+        h('div', { class: 'acoes' }, botaoProteger)),
+      h('div', { class: 'bloco-aparelho' }, h('h3', null, 'Avisos'), blocoAvisos(atual)));
+  }
+
+  // Avisos com o app fechado (seção 21.5): Periodic Background Sync + notificação, só no Chromium
+  // com o app instalado. O que fica fora do cofre: só os dias com lembretes e quantos.
+  function blocoAvisos(atual) {
+    const resultado = h('p', { class: 'resultado', 'aria-live': 'polite' });
+    const caixa = h('input', { id: 'aj-avisos', type: 'checkbox', disabled: true });
+    const temNotificacao = typeof Notification === 'function' && 'serviceWorker' in navigator;
+    const explica = h('p', { class: 'sutil' },
+      'Uma vez por dia (a hora é o navegador quem escolhe), se houver lembretes, aparece “Você tem 2 lembretes hoje no Entre Nós”, sem dizer quais. Para isso, fica fora do diário cifrado só a lista de dias com lembretes e quantos; desligar apaga essa lista.');
+    if (!temNotificacao) {
+      return h('div', null, h('p', null, 'Este navegador não mostra avisos do Entre Nós. No iPhone, os avisos ficam para uma próxima versão.'));
+    }
+    (async () => {
+      try {
+        // Antes de qualquer pedido de permissão: este aparelho consegue avisar com o app fechado?
+        // (Senão a pessoa aceitaria o pedido do sistema e logo depois leria que não funciona.)
+        const problema = await problemaDosAvisos();
+        const r = await pedirAoTrabalhador({ tipo: 'avisos-estado' });
+        if (!atual()) return;
+        const ligadoNoWorker = Boolean(r && r.ligado);
+        const deVerdade = ligadoNoWorker && !problema && Notification.permission === 'granted' && await despertarRegistrado();
+        if (!atual()) return;
+        if (ligadoNoWorker && !deVerdade) {
+          // Ligado no IndexedDB, mas o aparelho tirou a permissão (ou o despertar sumiu): a agenda
+          // (dias e contagens fora do cofre) não fica para trás enquanto a tela diz "desligado".
+          await desligarAvisos().catch(() => {});
+          if (atual()) resultado.textContent = 'Os avisos estavam ligados, mas este aparelho tirou a permissão (ou o navegador desfez o registro). A lista de dias foi apagada; para voltar, marque de novo.';
+        }
+        caixa.checked = deVerdade;
+        caixa.disabled = Boolean(problema) || !(r && r.disponivel);
+        if (problema && atual()) resultado.textContent = problema;
+      } catch {
+        if (atual()) resultado.textContent = 'Não consegui ver como estão os avisos agora.';
+      }
+    })();
+    caixa.addEventListener('change', async () => {
+      const ligar = caixa.checked;
+      caixa.disabled = true;
+      resultado.textContent = '';
+      try {
+        if (ligar) {
+          const problema = await prepararAvisos();
+          if (problema) {
+            caixa.checked = false;
+            resultado.textContent = problema;
+            return;
+          }
+          await pedirAoTrabalhador({ tipo: 'avisos', ligar: true });
+          resultado.textContent = 'Avisos ligados neste aparelho.';
+        } else {
+          await desligarAvisos();
+          resultado.textContent = 'Avisos desligados. A lista de dias foi apagada deste aparelho.';
+        }
+      } catch (e) {
+        caixa.checked = !ligar;
+        resultado.textContent = (e && e.message) || 'Não deu certo agora. Tente de novo.';
+      } finally {
+        caixa.disabled = false;
+      }
+    });
+    return h('div', null,
+      h('label', { class: 'opcao-linha', for: 'aj-avisos' }, caixa, ' Avisar quando houver lembretes no dia'),
+      explica, resultado);
+  }
+
+  // O registro do service worker, ou null se ele não ficar pronto em alguns segundos (sem ele, o
+  // navigator.serviceWorker.ready nunca termina).
+  function registroDoServiceWorker() {
+    return Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((resolve) => { setTimeout(() => resolve(null), 5000); }),
+    ]);
+  }
+
+  // Por que este aparelho não consegue avisar com o app fechado (texto), ou null. Não pede nada.
+  async function problemaDosAvisos() {
+    if (eIPhone()) return 'No iPhone, os avisos com o app fechado ficam para uma próxima versão.';
+    const temDespertar = typeof ServiceWorkerRegistration === 'function'
+      && 'periodicSync' in ServiceWorkerRegistration.prototype;
+    if (!temDespertar) return 'Este navegador não acorda o app sozinho para avisar. Funciona no Chrome e no Edge (Android e computador), com o app instalado.';
+    if (!instaladoComoApp()) return 'Os avisos só funcionam com o app instalado: instale primeiro (em “Instalar o app”, acima) e abra por ele.';
+    try {
+      const estadoDaPermissao = await navigator.permissions.query({ name: 'periodic-background-sync' });
+      if (estadoDaPermissao.state !== 'granted') {
+        return 'O navegador ainda não deixou o Entre Nós acordar sozinho (ele decide pelo uso do app). Use o app instalado por alguns dias e tente de novo.';
+      }
+    } catch {
+      // navegador que não responde a essa pergunta: tenta registrar mesmo assim
+    }
+    return null;
+  }
+
+  async function despertarRegistrado() {
+    try {
+      const registro = await registroDoServiceWorker();
+      if (!registro || !registro.periodicSync || typeof registro.periodicSync.getTags !== 'function') return false;
+      return (await registro.periodicSync.getTags()).includes(ETIQUETA_AVISOS);
+    } catch {
+      return false;
+    }
+  }
+
+  // Permissão de notificação e o despertar periódico. Devolve o problema (texto) ou null. A permissão
+  // de notificação só é pedida depois de saber que o aparelho consegue avisar.
+  async function prepararAvisos() {
+    const problema = await problemaDosAvisos();
+    if (problema) return problema;
+    const registro = await registroDoServiceWorker();
+    if (!registro) return 'O Entre Nós ainda não terminou de se instalar neste navegador. Feche, abra de novo e tente outra vez.';
+    if (!registro.periodicSync) return 'Este navegador não acorda o app sozinho para avisar. Funciona no Chrome e no Edge, com o app instalado.';
+    if (Notification.permission !== 'granted') {
+      const resposta = await Notification.requestPermission();
+      if (resposta !== 'granted') return 'Sem a permissão de notificações o Entre Nós não consegue avisar. Dá para liberar nas configurações do navegador, em Notificações.';
+    }
+    try {
+      await registro.periodicSync.register(ETIQUETA_AVISOS, { minInterval: INTERVALO_AVISOS });
+    } catch {
+      return 'O navegador não deixou ligar os avisos agora. Instale o app e tente de novo.';
+    }
+    return null;
+  }
+
+  async function desligarAvisos() {
+    try {
+      const registro = await registroDoServiceWorker();
+      if (registro && registro.periodicSync) await registro.periodicSync.unregister(ETIQUETA_AVISOS);
+    } catch {
+      // sem o despertar registrado, não há o que tirar
+    }
+    await pedirAoTrabalhador({ tipo: 'avisos', ligar: false });
+  }
+
+  // Backup no celular (seção 21.2): o .cofre de agora (POST /api/backup/baixar), compartilhado (salvar
+  // no Arquivos, no Drive...) ou baixado. Em dois toques: o primeiro prepara, o segundo entrega (o
+  // navegador só deixa compartilhar logo depois de um toque).
+  function blocoBaixarCopia() {
+    const resultado = h('p', { class: 'resultado', 'aria-live': 'polite' });
+    const pronta = h('div', { class: 'copia-pronta', hidden: true });
+    const botao = h('button', { type: 'button', class: 'botao botao-primario' }, '💾 Preparar uma cópia');
+    let arquivo = null;
+    const esquecer = () => {
+      arquivo = null;
+      limpar(pronta);
+      pronta.hidden = true;
+    };
+    botao.addEventListener('click', async () => {
+      esquecer();
+      resultado.textContent = '';
+      botao.disabled = true;
+      try {
+        const r = await copiaEmBytes();
+        arquivo = new File([r.bytes], r.nome || `entrenos-backup-${hojeIso()}.cofre`, { type: 'application/octet-stream' });
+        esquecedoresArquivo.add(esquecer);
+        const compartilhar = h('button', { type: 'button', class: 'botao botao-primario' }, '📤 Compartilhar ou salvar');
+        const baixar = h('button', { type: 'button', class: 'botao botao-secundario' }, '⬇️ Baixar o arquivo');
+        compartilhar.addEventListener('click', async () => {
+          if (!arquivo) return;
+          try {
+            await navigator.share({ files: [arquivo], title: 'Cópia do Entre Nós' });
+            resultado.textContent = 'Cópia entregue. Ela continua criptografada: só abre com o seu PIN de agora.';
+          } catch (e) {
+            if (!(e && e.name === 'AbortError')) resultado.textContent = 'Não deu para compartilhar daqui. Use “Baixar o arquivo”.';
+          }
+        });
+        baixar.addEventListener('click', () => {
+          if (!arquivo) return;
+          baixarArquivo(arquivo, arquivo.name);
+          resultado.textContent = `Cópia baixada (${arquivo.name}). Ela costuma ficar na pasta Downloads (no iPhone, em Arquivos → Transferências); de lá dá para mandar ao Drive ou ao computador. Ela continua criptografada: só abre com o seu PIN de agora.`;
+        });
+        let podeCompartilhar = false;
+        try {
+          podeCompartilhar = typeof navigator.canShare === 'function' && navigator.canShare({ files: [arquivo] });
+        } catch {
+          podeCompartilhar = false;
+        }
+        inserir(pronta, podeCompartilhar ? compartilhar : null, baixar);
+        pronta.hidden = false;
+        resultado.textContent = `Cópia pronta: ${arquivo.name}, ${tamanhoLegivel(arquivo.size)}.`;
+        (podeCompartilhar ? compartilhar : baixar).focus();
+      } catch (e) {
+        if (!e.bloqueio) resultado.textContent = e.message;
+      } finally {
+        botao.disabled = false;
+      }
+    });
+    return h('div', { class: 'bloco-dados' },
+      tituloBloco('💾', 'Baixar uma cópia'),
+      h('p', { class: 'sutil' }, 'Uma cópia do diário inteiro (arquivo .cofre, criptografado) para guardar fora do navegador: no Arquivos, no Drive, no computador. Ela abre com o seu PIN de agora, aqui ou no Entre Nós do computador. Ela não leva a senha de sincronização: se você restaurar a cópia, ela é pedida de novo.'),
+      h('div', { class: 'acoes' }, botao), pronta, resultado);
+  }
+
+  // A cópia do diário em bytes. No celular vem do Worker como ArrayBuffer transferido (sem base64
+  // dentro do JSON, que custava 4/3 do arquivo em texto várias vezes, seção 22.2); no computador, pela
+  // rota de sempre. {nome, bytes: Uint8Array}.
+  async function copiaEmBytes() {
+    if (noNavegador()) {
+      const r = await pedirAoTrabalhador({ tipo: 'baixar', token: lerToken() || undefined });
+      const dados = resultadoDaApi(r.status, r.dados);
+      if (!(r.arquivo instanceof ArrayBuffer)) throw new ErroApi('A cópia não chegou inteira. Tente de novo.', 0);
+      return { nome: dados && dados.nome, bytes: new Uint8Array(r.arquivo) };
+    }
+    const r = await api('POST', '/backup/baixar', {});
+    const binario = atob(r.arquivo_b64);
+    const bytes = new Uint8Array(binario.length);
+    for (let i = 0; i < binario.length; i += 1) bytes[i] = binario.charCodeAt(i);
+    return { nome: r.nome, bytes };
+  }
+
+  function baixarArquivo(blob, nome) {
+    const url = URL.createObjectURL(blob);
+    const a = h('a', { href: url, download: nome, class: 'so-leitor' }, nome);
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  // ---------------------------------------------------------------- service worker e versão nova
+
+  function registrarServiceWorker() {
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+    navigator.serviceWorker.register('sw.js', { scope: './', updateViaCache: 'none' }).then((registro) => {
+      acompanharVersao(registro);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') registro.update().catch(() => {});
+      });
+    }).catch(() => {
+      // sem service worker o app funciona do mesmo jeito (só não abre sem internet)
+    });
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (recarregarAoTrocar) location.reload();
+    });
+    // Tocou no aviso "Você tem N lembretes hoje" com o app aberto em outra tela: vai para o Hoje.
+    navigator.serviceWorker.addEventListener('message', (evento) => {
+      if (evento.data && evento.data.tipo === 'abrir-hoje' && estado.modo === 'app') irPara('#hoje');
+    });
+  }
+
+  function acompanharVersao(registro) {
+    // Só é "nova versão" quando já havia uma no controle (na primeira vez, é só a instalação).
+    const conferir = () => {
+      if (registro.waiting && navigator.serviceWorker.controller) mostrarFaixaVersao(registro);
+    };
+    conferir();
+    registro.addEventListener('updatefound', () => {
+      const novo = registro.installing;
+      if (!novo) return;
+      novo.addEventListener('statechange', () => {
+        if (novo.state === 'installed') conferir();
+      });
+    });
+  }
+
+  function mostrarFaixaVersao(registro) {
+    if ($('#faixa-versao')) return;
+    const recarregar = h('button', { type: 'button', class: 'botao botao-primario botao-pequeno' }, 'Recarregar');
+    const depois = h('button', { type: 'button', class: 'botao botao-texto botao-pequeno' }, 'Depois');
+    const faixa = h('div', { id: 'faixa-versao', class: 'faixa-versao', role: 'status' },
+      h('p', { class: 'faixa-versao-texto' }, 'Nova versão do Entre Nós disponível. Ao recarregar, o PIN é pedido de novo.'),
+      recarregar, depois);
+    recarregar.addEventListener('click', async () => {
+      // O rascunho de Registrar só existe na memória desta página: recarregar o perderia.
+      const rascunho = estado.modo === 'app' ? copiaDoRascunho() : null;
+      if (rascunho && (rascunho.texto.trim() || rascunho.emRevisao)) {
+        const ok = await confirmar({
+          titulo: 'Recarregar agora?',
+          texto: 'O que você está escrevendo em Registrar e ainda não salvou vai se perder. Recarregar mesmo assim? (Dá para salvar primeiro e tocar em Recarregar depois.)',
+          ok: 'Recarregar mesmo assim', cancelar: 'Voltar e salvar antes',
+        });
+        if (!ok) return;
+      }
+      recarregar.disabled = true;
+      recarregarAoTrocar = true;
+      // Bloqueia antes (salva o que faltar): ao recarregar, o PIN é pedido de novo.
+      if (estado.modo === 'app') await api('POST', '/bloquear', {}, { semBloqueio: true }).catch(() => {});
+      if (registro.waiting) registro.waiting.postMessage({ tipo: 'pular-espera' });
+      else location.reload();
+    });
+    depois.addEventListener('click', () => faixa.remove());
+    document.body.append(faixa);
+  }
+
   // ================================================================ início
 
   function ligarEventos() {
+    // Instalar o app (Chromium): o pedido fica guardado para o botão "Instalar o app" (seção 21.2).
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      pedidoDeInstalacao = e;
+      preencherOfertasDeInstalacao();
+    });
+    window.addEventListener('appinstalled', () => {
+      pedidoDeInstalacao = null;
+      preencherOfertasDeInstalacao();
+    });
+
     document.body.append(
       h('datalist', { id: 'lista-relacoes' }, RELACOES_SUGERIDAS.map((r) => h('option', { value: r }))),
       h('datalist', { id: 'lista-humores' }, HUMORES.map((r) => h('option', { value: r }))));
@@ -5685,6 +6752,8 @@
   //   ao lado de "✍️ Texto livre";
   // - eventos em window: 'entrenos:registro-salvo' {id, privado} e 'entrenos:bloqueado' (a página
   //   bloqueou: esqueça o que a tela guardou).
+  // Desde a sincronização (seção 22, web/sincronizar.js): 'entrenos:desbloqueado' (o diário abriu) e
+  // 'entrenos:gravou' (um pedido mudou o diário; sem detalhes do quê).
 
   function idRecurso(valor, onde) {
     if (typeof valor !== 'string' || !RE_ID_RECURSO.test(valor)) throw new TypeError(`${onde}: identificador inválido`);
@@ -5783,6 +6852,8 @@
       hrefRegistro, chipsCategorias, legendaSelos, linhaEntrada, avisar, avisarErro, falar, confirmar,
       hojeIso, isoDe, paraData, dataBr, dataLonga, diaMes, mesAno, diaComSemana, somarDias, diasAte, textoDias,
       salvarConfig, focarTitulo,
+      // A espera de uma senha errada, como no PIN (a senha de sincronização, seção 22.2).
+      segundosDeEspera, contarEspera: contarEsperaPin, esperando: esperandoPin,
     }),
   });
 

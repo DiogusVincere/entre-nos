@@ -1667,9 +1667,17 @@ def texto_fala_do_ciclo(texto: str) -> bool:
 
 
 def _registros_que_falam_do_ciclo(banco: Any) -> set[int]:
-    condicao = " OR ".join("texto LIKE ?" for _ in _LIKE_DO_CICLO)
-    return {l["id"] for l in banco.consultar(f"SELECT id, texto FROM registros WHERE {condicao}", _LIKE_DO_CICLO)
-            if texto_fala_do_ciclo(l.get("texto") or "")}
+    """A varredura (LIKE em todos os registros) guardada até a próxima escrita (`Banco.lembrar`, seção
+    22.2): o Hoje a pedia 7 vezes, 1,3 s com 4.000 registros longos. Sempre uma cópia."""
+    def varrer() -> frozenset[int]:
+        condicao = " OR ".join("texto LIKE ?" for _ in _LIKE_DO_CICLO)
+        return frozenset(l["id"] for l in banco.consultar(f"SELECT id, texto FROM registros WHERE {condicao}",
+                                                           _LIKE_DO_CICLO)
+                         if texto_fala_do_ciclo(l.get("texto") or ""))
+    lembrar = getattr(banco, "lembrar", None)
+    if not callable(lembrar):
+        return set(varrer())
+    return set(lembrar(f"ciclo.falam_do_ciclo:{id(texto_fala_do_ciclo)}", varrer))
 
 
 def fora_da_ia(banco: Any) -> set[int]:

@@ -316,6 +316,20 @@ _RE_MEU_PRESENTE = re.compile(
     r"\b(?:(?:o\s+)?meu|(?:o\s+)?nosso)\s+presente\s+(?:(?:pra|para)\s+(?:ela|minha\s+namorada)\s+)?(?:de\s+[\w\s]{2,30}?\s+)?"
     r"(?:foi|(?P<futuro>vai\s+ser|sera))\s+|\bo\s+presente\s+que\s+(?:eu\s+)?dei\s+(?:(?:pra|para)\s+ela\s+)?foi\s+")
 _RE_MARCA_PRESENTE = re.compile(r"\b(?:de\s+presente|presentinho|presente|mimo|lembrancinha|surpresa)\b")
+# Objetos que são claramente presente (sem acento, como `chave`): com levei/trouxe/fiz/comprei..., só
+# eles viram presente sem outra marca. Comida e bebida do dia a dia (café, bolo, lanche) ficam de fora:
+# levar café para ela é um gesto, não um presente (20.2).
+_OBJETOS_DE_PRESENTE = frozenset("""
+colar colares anel aneis alianca aliancas pulseira pulseiras brinco brincos corrente correntinha pingente pingentes
+relogio relogios tornozeleira joia joias bijuteria bijuterias perfume perfumes colonia flor flores buque buques
+rosa rosas orquidea orquideas girassol girassois tulipa tulipas lirio lirios ursinho ursinhos urso pelucia pelucias
+chocolate chocolates bombom bombons trufa trufas cesta cestas livro livros kindle vestido vestidos blusa blusas
+camiseta camisetas casaco casacos jaqueta jaquetas bolsa bolsas carteira sapato sapatos tenis sandalia sandalias
+oculos lenco cachecol pantufa pantufas pijama pijamas roupa roupas maquiagem batom batons hidratante hidratantes
+creme cremes kit kits carta cartas cartinha cartinhas cartao poema poemas quadro quadros retrato porta album albuns
+caneca canecas planta plantas suculenta suculentas fone fones celular tablet notebook camera ingresso ingressos
+vinho vinhos espumante champanhe agenda caderno diario vela velas difusor manta almofada luminaria presente presentes
+""".split())
 _RE_ELA_SUJEITO = re.compile(r"\b(?:ela|minha\s+(?:namorada|noiva|esposa|mulher|mina|gata)|a\s+gata|mozao)\b")
 _RE_DE_MIM = re.compile(r"^\s+de\s+mim\b")
 # Quem deu, logo depois do "ganhou" ("ganhou da mãe dela um vestido") ou depois do objeto.
@@ -437,6 +451,13 @@ def _objetos(fr: _Frase, pos: int) -> list[tuple[int, int]]:
             break
         saida.append(proximo)
     return saida
+
+
+def _objeto_de_presente(fr: _Frase, ini: int, fim: int) -> bool:
+    """O objeto é claramente um presente (uma das palavras de `_OBJETOS_DE_PRESENTE`)? Para os verbos
+    que também descrevem gestos do dia a dia (levei, trouxe, fiz, comprei...)."""
+    palavras = re.findall(r"[a-z]+", normalizar(_limpar_objeto(fr.texto[ini:fim])))
+    return any(p in _OBJETOS_DE_PRESENTE for p in palavras)
 
 
 def _objeto_valido(fr: _Frase, ini: int, fim: int, proibidas: frozenset[str]) -> str | None:
@@ -742,6 +763,11 @@ def _presentes_da_frase(fr: _Frase, proxima: _Frase | None, texto: str, referenc
         if destino is None and destino_depois is None and not marca:
             continue
         for obj in objs:
+            # "Levei café para ela no trabalho", "fiz um bolo pra ela": gesto, não presente (20.2). Sem
+            # verbo de dar, sem marca de presente (presente, mimo, surpresa, ocasião, "pra dar") e sem
+            # guardar para depois, só vira presente um objeto claramente de presente (flores, colar...).
+            if not guardar and not marca and not _objeto_de_presente(fr, *obj):
+                continue
             montar(*obj, "eu", None, guardar, m.start())
 
     # 4) Outra pessoa deu para ela: "a mãe dela deu um vestido pra ela", "a Mariana deu um caderno pra ela".

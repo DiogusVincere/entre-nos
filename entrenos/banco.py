@@ -40,7 +40,7 @@ from .modelos import (CATEGORIAS, Certeza, Item, PessoaEncontrada, Precisao, Rel
                       item_de_dict, para_json, pessoa_encontrada_de_dict, relacao_de_dict)
 from .texto import frases, normalizar, termos
 
-ESQUEMA_VERSAO = 4
+ESQUEMA_VERSAO = 5
 DADOS_DE_VERSAO_NOVA = "Estes dados foram gravados por uma versão mais nova do Entre Nós."
 STATUS_ITEM = ("ativo", "resolvido", "mudou", "descartado")
 STATUS_RELACAO = ("pendente", "confirmada", "descartada")
@@ -260,9 +260,58 @@ CREATE TABLE recursos_esquema (
 );
 """
 
+# v5 (seção 22): o que a sincronização entre aparelhos precisa lembrar, dentro do diário cifrado.
+# Nada de conteúdo, a não ser em sync_conflitos (a outra versão de algo que mudou nos dois aparelhos,
+# até a pessoa escolher). As "impressões" (uid) são HMAC com a chave de sincronização.
+# - sync_ids: a identidade de cada registro, item e pessoa entre os aparelhos, o resumo (hash) dos
+#   campos na última sincronização e quando eles mudaram (carimbo, UTC);
+# - sync_linhas: as impressões das linhas dos recursos ('' = deste aparelho na última sincronização;
+#   senão, as que vieram de cada outro aparelho);
+# - sync_lapides: o que foi apagado (só a impressão), para sumir em todos e nunca voltar;
+# - sync_aparelhos: os outros aparelhos (nome, quando geraram o arquivo, a etiqueta do Drive);
+# - sync_conflitos: o que mudou nos dois lados quase ao mesmo tempo (a tela pergunta).
+_MIGRACAO_V5 = """
+CREATE TABLE sync_ids (
+    uid TEXT PRIMARY KEY,
+    tipo TEXT NOT NULL,
+    local_id INTEGER NOT NULL,
+    assinatura TEXT NOT NULL,
+    carimbo TEXT NOT NULL
+);
+CREATE UNIQUE INDEX sync_ids_local ON sync_ids(tipo, local_id);
+CREATE TABLE sync_linhas (
+    aparelho TEXT NOT NULL,
+    uid TEXT NOT NULL,
+    grupo TEXT NOT NULL,
+    PRIMARY KEY (aparelho, uid)
+);
+CREATE TABLE sync_lapides (
+    uid TEXT PRIMARY KEY,
+    tipo TEXT NOT NULL,
+    apagado_em TEXT NOT NULL
+);
+CREATE TABLE sync_aparelhos (
+    aparelho TEXT PRIMARY KEY,
+    nome TEXT,
+    gerado_em TEXT,
+    etiqueta TEXT,
+    mesclado_em TEXT
+);
+CREATE TABLE sync_conflitos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    local_id INTEGER NOT NULL,
+    aparelho TEXT NOT NULL,
+    remoto TEXT NOT NULL,
+    carimbo TEXT NOT NULL,
+    criado_em TEXT NOT NULL
+);
+"""
+
 # _MIGRACOES[v] leva o esquema da versão v para v + 1 (texto SQL ou função que recebe a conexão).
 _MIGRACOES: list[str | Callable[[sqlite3.Connection], None]] = [_ESQUEMA_V1, _MIGRACAO_V2, _migrar_v3,
-                                                                 _MIGRACAO_V4]
+                                                                 _MIGRACAO_V4, _MIGRACAO_V5]
 
 
 # ---------------------------------------------------------------- recursos: o que podem mexer
@@ -290,9 +339,10 @@ _OK, _NEGAR = _acao("OK", 0), _acao("DENY", 1)
 
 
 def _tabela_central(nome: Any) -> bool:
-    """Tabela do esquema central, interna do SQLite ou do índice de busca (FTS5)."""
+    """Tabela do esquema central, interna do SQLite, do índice de busca (FTS5) ou da sincronização
+    (sync_*, seção 22): nenhum recurso grava nelas."""
     nome = str(nome or "").lower()
-    return nome in _TABELAS_CENTRAIS or nome.startswith(("sqlite_", "busca_fts"))
+    return nome in _TABELAS_CENTRAIS or nome.startswith(("sqlite_", "busca_fts", "sync_"))
 
 
 def _pragma_de_leitura(acao: int, a1: Any, a2: Any) -> bool:
@@ -513,14 +563,23 @@ def _registro_dict(linha: sqlite3.Row) -> dict[str, Any]:
 
 
 def config_sem_segredos(ajustes: dict) -> dict:
-    """Cópia dos ajustes sem a chave de cada IA e sem o verificador do PIN da IA."""
+    """Cópia dos ajustes sem a chave de cada IA, sem o verificador do PIN da IA e sem nada da
+    sincronização (a chave dela abre os arquivos do Google Drive; seção 22)."""
     limpo = copy.deepcopy(ajustes)
     for qual in ("ia_principal", "ia_reserva"):
         ia = limpo.get(qual)
         if isinstance(ia, dict):
             limpo[qual] = {k: v for k, v in ia.items() if k != "chave"} | {"tem_chave": bool(ia.get("chave"))}
     limpo.pop("ia_pin", None)
+    for chave in [k for k in limpo if chave_da_sincronizacao(k)]:
+        limpo.pop(chave, None)
     return limpo
+
+
+def chave_da_sincronizacao(chave: Any) -> bool:
+    """Ajuste da sincronização ("sync"): só a área ☁️ Sincronização mexe, e nunca sai em
+    /api/config, na exportação nem no histórico (só o nome)."""
+    return isinstance(chave, str) and (chave == "sync" or chave.startswith("sync_"))
 
 
 def _texto_busca(*partes: str | None) -> str:
@@ -539,14 +598,31 @@ def _frase_com(texto: str, chaves: Iterable[str]) -> str:
     return inicio if len(inicio) <= 200 else inicio[:199].rstrip() + "…"
 
 
-def _conectar() -> sqlite3.Connection:
+def _conectar(montar_json: bool = True) -> sqlite3.Connection:
     # isolation_level=None: as transações são abertas e fechadas à mão em _escrita.
     con = sqlite3.connect(":memory:", check_same_thread=False, isolation_level=None)
     con.row_factory = sqlite3.Row
     # Sem isto o VACUUM (e ordenações grandes) monta cópias em arquivos temporários do
     # disco (%TEMP%\etilqs_*), sem criptografia, quando o banco passa do cache de páginas.
     con.execute("PRAGMA temp_store = MEMORY")
+    if montar_json:
+        _montar_tabelas_json(con)
     return con
+
+
+def _montar_tabelas_json(con: sqlite3.Connection) -> None:
+    """Usa json_each uma vez, sem autorizador, logo que a conexão está pronta (seção 21.7).
+
+    No SQLite 3.39 do Pyodide, o primeiro json_each de uma conexão monta a tabela virtual e, para
+    isso, pede ao autorizador UPDATE em sqlite_master; o `_autorizar_leitura` (Banco.consultar) nega,
+    e a consulta de um recurso falhava ("vtable constructor failed: json_each") até alguma rota do
+    núcleo usar json_each antes. No SQLite do PC isso não acontece. Montada aqui, ela fica pronta para
+    os recursos, sem afrouxar o autorizador.
+
+    NUNCA antes de um `deserialize`: ele troca o esquema da conexão, e a tabela montada antes fica
+    apontando para o esquema que saiu (no Pyodide: "memory access out of bounds", o Python inteiro
+    cai). Por isso `de_bytes` conecta sem montar e monta depois."""
+    con.execute("SELECT count(*) FROM json_each('[]')").fetchone()
 
 
 def _texto_ia(valor: Any, maximo: int, mensagem: str) -> str:
@@ -609,6 +685,13 @@ def _validar_config(chave: str, valor: Any) -> Any:
         if not verificador_valido(valor):
             raise ValueError("O PIN da IA não foi guardado do jeito certo.")
         return dict(valor)
+    if chave_da_sincronizacao(chave):
+        # Quem confere os campos é o módulo da sincronização; aqui só o formato.
+        if chave != "sync" or not isinstance(valor, dict) or not all(isinstance(k, str) for k in valor):
+            raise ValueError("Os ajustes da sincronização não foram guardados do jeito certo.")
+        valor = para_json(valor)
+        json.dumps(valor)
+        return valor
     if chave == "ia_tempo_limite":
         if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not (
                 IA_TEMPO_MINIMO <= valor <= IA_TEMPO_MAXIMO):
@@ -677,6 +760,11 @@ _ESTRUTURA = {
     "historico": ("id", "quando", "acao", "tabela", "linha_id", "resumo"),
     "busca_fts": ("conteudo", "tipo", "ref_id"),
     "recursos_esquema": ("nome", "versao"),
+    "sync_ids": ("uid", "tipo", "local_id", "assinatura", "carimbo"),
+    "sync_linhas": ("aparelho", "uid", "grupo"),
+    "sync_lapides": ("uid", "tipo", "apagado_em"),
+    "sync_aparelhos": ("aparelho", "nome", "gerado_em", "etiqueta", "mesclado_em"),
+    "sync_conflitos": ("id", "uid", "tipo", "local_id", "aparelho", "remoto", "carimbo", "criado_em"),
 }
 # Tabelas com AUTOINCREMENT (os ids nunca se repetem: é o que deixa apagar pelo id nos backups).
 # As dos recursos (com AUTOINCREMENT) entram também em maiores_ids/garantir_ids_acima.
@@ -1122,6 +1210,30 @@ class Banco:
         # diário antigo). Quem bloqueia só regrava o arquivo se estiver sujo (seção 19.7).
         self._sujo = False
         self._pontos = 0                # nomes dos pontos de salvamento (escrita dentro de escrita)
+        self._memo: dict[str, Any] = {}
+        self._memo_versao: int | None = None
+
+    def lembrar(self, chave: str, calcular: Callable[[], Any]) -> Any:
+        """O resultado de uma leitura cara, guardado até a próxima escrita no banco (22.2).
+
+        Uma abertura do Hoje lia o diário inteiro várias vezes (alertas.carregar 3 vezes, a varredura
+        do ciclo 7): com anos de diário, segundos no celular. Vale enquanto `total_changes` da conexão
+        não muda (qualquer INSERT, UPDATE ou DELETE invalida tudo); dentro de uma transação não guarda
+        nada (um ROLLBACK desfaria dados sem mudar o contador). Quem recebe o valor não deve mudá-lo:
+        devolva cópias se for algo mutável."""
+        with self._trava:
+            if self._con.in_transaction:
+                return calcular()
+            versao = self._con.total_changes
+            if versao != self._memo_versao:
+                self._memo = {}
+                self._memo_versao = versao
+            if chave not in self._memo:
+                valor = calcular()
+                if self._con.total_changes != versao or self._con.in_transaction:
+                    return valor                 # o cálculo escreveu algo: não guarda
+                self._memo[chave] = valor
+            return self._memo[chave]
 
     @property
     def sujo(self) -> bool:
@@ -1144,11 +1256,12 @@ class Banco:
     def de_bytes(cls, dados: bytes, ao_salvar: Callable[[bytes], None] | None = None) -> Banco:
         if not dados:
             raise ValueError("Não há dados para carregar.")
-        con = _conectar()
+        con = _conectar(montar_json=False)         # json_each só depois do deserialize
         try:
             con.deserialize(bytes(dados))
             if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise ValueError("O banco está danificado.")
+            _montar_tabelas_json(con)
             banco = cls(con, ao_salvar)
             banco._migrar()
         except sqlite3.DatabaseError as erro:
@@ -1757,6 +1870,8 @@ class Banco:
                                                  (rid,))]
             self._apagar_relacoes([rid], ids_itens)
             self._apagar_dispensados(ids_itens)
+            self._esquecer_conflitos("registro", [rid])
+            self._esquecer_conflitos("item", ids_itens)
             for iid in ids_itens:
                 self._busca_apagar("item", iid)
             con.execute("DELETE FROM itens WHERE registro_id = ?", (rid,))
@@ -1816,6 +1931,15 @@ class Banco:
                               " relacao_registro_id = ? WHERE id = ?",
                               (nome, relacao, nome_rid, relacao_rid, p["id"]))
 
+    def _esquecer_conflitos(self, tipo: str, ids: Iterable[int]) -> None:
+        """A outra versão (de outro aparelho) de algo apagado aqui sai junto (seção 22): apagar é
+        apagar, e não sobra pergunta sobre o que não existe mais."""
+        ids = [i for i in ids if isinstance(i, int) and not isinstance(i, bool)]
+        for inicio in range(0, len(ids), 500):
+            parte = ids[inicio:inicio + 500]
+            self._con.execute(f"DELETE FROM sync_conflitos WHERE tipo = ? AND local_id IN ({_marcas(len(parte))})",
+                              (tipo, *parte))
+
     def _apagar_dispensados(self, item_ids: Iterable[int] = (), pessoa_id: int | None = None) -> None:
         """Alertas dispensados que citam o que foi apagado (a chave traz o id e a data)."""
         padroes: list[str] = []
@@ -1843,6 +1967,7 @@ class Banco:
             if citada is None:
                 self._con.execute("DELETE FROM pessoas WHERE id = ?", (pid,))
                 self._apagar_dispensados(pessoa_id=pid)
+                self._esquecer_conflitos("pessoa", [pid])
                 self._historico_add("apagar", "pessoas", pid, f"pessoa #{pid} apagada (sem outras menções)")
 
     # ------------------------------------------------------------ itens
@@ -1940,6 +2065,7 @@ class Banco:
             iid = _id(id)
             self._apagar_relacoes([], [iid])
             self._apagar_dispensados([iid])
+            self._esquecer_conflitos("item", [iid])
             self._busca_apagar("item", iid)
             con.execute("DELETE FROM itens WHERE id = ?", (iid,))
             self._historico_add("apagar", "itens", iid, f"item #{iid} apagado")
@@ -2015,6 +2141,7 @@ class Banco:
             con.execute("DELETE FROM registro_pessoas WHERE pessoa_id = ?", (pid,))
             con.execute("DELETE FROM pessoas WHERE id = ?", (pid,))
             self._apagar_dispensados(pessoa_id=pid)
+            self._esquecer_conflitos("pessoa", [pid])
             self._historico_add("apagar", "pessoas", pid, f"pessoa #{pid} apagada")
 
     def mencoes(self, pessoa_id: int, limite: int = 5, excluir: Iterable[int] | None = None) -> list[dict]:
@@ -2265,7 +2392,17 @@ class Banco:
             self._salvar_mudanca()
         return {**resumo, "importados": resumo["registros_novos"]}
 
-    def _juntar(self, exp: _Exportacao) -> dict:
+    def juntar_exportacao(self, exportacao: _Exportacao, mapas: dict | None = None) -> dict:
+        """Como `importar_json` gravando, mas dentro da escrita de quem chama (a sincronização,
+        seção 22, junta o arquivo de outro aparelho numa transação só com as lápides e as edições).
+        `mapas` (dict) recebe {"registros": {id no arquivo: id aqui}, "itens": {...}, "pessoas":
+        {...}}, dos novos e dos que já estavam aqui. O histórico diz "sincronização"."""
+        if not isinstance(exportacao, _Exportacao):
+            raise TypeError("use validar_exportacao")
+        with self._escrita():
+            return self._juntar(exportacao, mapas, rotulo="sincronização")
+
+    def _juntar(self, exp: _Exportacao, mapas: dict | None = None, rotulo: str = "importação") -> dict:
         """O trabalho de `importar_json`, dentro da transação aberta por ele."""
         con, agora = self._con, _agora()
         existentes: dict[tuple[Any, str], int] = {}
@@ -2279,6 +2416,12 @@ class Banco:
         cadastro = _CadastroParaCasar(con)
         de_antes_pessoas = set(cadastro.nome)
         mapa_pessoas: dict[Any, int] = {}
+        # A sincronização (seção 22) já sabe quem é quem (a mesma pessoa, talvez com outro nome aqui):
+        # essas não são casadas de novo pelo nome, nem completadas (a edição mais recente vale lá).
+        for chave_arquivo, pid in ((mapas or {}).get("pessoas_conhecidas") or {}).items():
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid in cadastro.nome:
+                mapa_pessoas[chave_arquivo] = pid
+                cadastro.reivindicadas.add(pid)
         criadas: dict[int, _PessoaImportada] = {}
         completadas: dict[int, set[str]] = {}        # pessoa do diário -> campos preenchidos agora
         apelidos_novos: dict[int, list[str]] = {}
@@ -2413,7 +2556,11 @@ class Banco:
             if marcados:
                 partes.append(f"{len(marcados)} {'registro marcado' if len(marcados) == 1 else 'registros marcados'} "
                               "para não ir para a IA")
-            self._historico_add("importar", "registros", None, "importação: " + ", ".join(partes))
+            self._historico_add("importar", "registros", None, f"{rotulo}: " + ", ".join(partes))
+        if mapas is not None:
+            mapas["registros"] = dict(mapa_registros)
+            mapas["itens"] = {k: v[0] for k, v in mapa_itens.items()}
+            mapas["pessoas"] = {k: v for k, v in mapa_pessoas.items() if isinstance(k, int) and not isinstance(k, bool)}
         completadas_detalhe = [
             {"rotulo": rotulo_daqui(pid), "campos": sorted(campos), "apelidos": apelidos_novos.get(pid, [])}
             for pid, campos in completadas.items()]
@@ -2546,4 +2693,5 @@ class Banco:
 
 __all__ = ["Banco", "CAMPOS_IA", "CONFIG_PADRAO", "ESQUEMA_VERSAO", "IA_TEMPO_MAXIMO", "IA_TEMPO_MINIMO",
            "IA_TEMPO_PADRAO", "MAX_CUSTO_TRECHOS", "MAX_JSON_IMPORTAR", "NaoEncontrado", "OperacaoProibida", "STATUS_ITEM",
-           "STATUS_RELACAO", "TIPOS_IA", "config_sem_segredos", "ler_exportacao", "validar_exportacao", "validar_ia"]
+           "STATUS_RELACAO", "TIPOS_IA", "chave_da_sincronizacao", "config_sem_segredos", "ler_exportacao",
+           "validar_exportacao", "validar_ia"]

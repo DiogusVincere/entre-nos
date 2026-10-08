@@ -137,6 +137,8 @@ DIAS_PLANO = 30               # combinado com data nos próximos 30 dias: já es
 DIAS_VOLTAR = 60              # lugar que ela amou e não voltaram há 60+ dias
 SEMANAS_DESCANSO = 4          # "agora não": o lugar descansa 4 semanas
 SEMELHANCA_MESMO_LUGAR = 95
+DIAS_DA_SUGESTAO = (3, 4)     # o cartão do Hoje só na quinta e na sexta (planejar o fim de semana)...
+DIAS_DATA_ESPECIAL = 3        # ... ou com mesversário/aniversário dela/de namoro em até 3 dias
 
 ERRO_NOME = f"Diga o nome do lugar (até {MAX_NOME} letras)."
 ERRO_TIPO = "Tipo de lugar desconhecido."
@@ -1861,6 +1863,12 @@ _FRASE_OCASIAO = {"namoro": "o aniversário de namoro", "mesversario": "o mesver
 _DIAS_POR_OCASIAO = {"aniversario_dela": DIAS_OCASIAO, "namoro": DIAS_OCASIAO, "mesversario": 7}
 
 
+def _data_especial_perto(b: _Base) -> bool:
+    """Mesversário, aniversário dela ou de namoro em até DIAS_DATA_ESPECIAL dias (hoje conta)."""
+    return any(oc.tipo in _DIAS_POR_OCASIAO and oc.dias(b.ref) <= DIAS_DATA_ESPECIAL
+               for oc in alertas.ocorrencias(b.d, DIAS_DATA_ESPECIAL))
+
+
 def _ocasiao(b: _Base) -> dict | None:
     """A data de vocês mais perto: aniversário dela ou de namoro em até 21 dias, mesversário em até 7."""
     for oc in alertas.ocorrencias(b.d, DIAS_OCASIAO):
@@ -2303,9 +2311,13 @@ def lugar(banco: Any, lugar_id: int, referencia: date) -> dict:
 def cartoes_hoje(banco: Any, referencia: date) -> list[dict]:
     """No máximo um lugar por semana, como possibilidade, com o porquê e a origem. Sem nada que ela
     queira conhecer (ou um lugar que ela amou para voltar), com um momento difícil dela nos últimos
-    3 dias, se vocês já saíram esta semana ou se você disse "agora não": nenhum cartão."""
+    3 dias, se vocês já saíram esta semana ou se você disse "agora não": nenhum cartão. E só na quinta
+    e na sexta (planejar o fim de semana) ou com uma data de vocês em até 3 dias (20.5.1)."""
     b = _carregar(banco, referencia)
     if not b.lugares:
+        return []
+    # Nos outros dias o cartão não aparece; a aba Lugares continua mostrando a sugestão.
+    if referencia.weekday() not in DIAS_DA_SUGESTAO and not _data_especial_perto(b):
         return []
     lugares = [_lugar(b, l) for l in b.lugares]
     cx = _contexto(b)

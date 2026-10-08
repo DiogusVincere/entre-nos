@@ -71,12 +71,20 @@ EntreNos/
     nucleo.py                         o app sem transporte: sessão, PIN, rotas da API (seção 19)
     servidor.py                       transporte do computador: HTTP local + segurança do pedido + página
     ponte.py                          transporte do navegador: o Pyodide chama (seção 19)
+    sincronizacao.py                  senha, cifra e mescla da sincronização entre aparelhos (seção 22)
     recursos/__init__.py              registro e pontos de encaixe dos recursos (seção 20.0)
     recursos/<nome>.py                um por recurso (perguntas, presentes... eu; seção 20)
                                       (testes/test_integracao.py: o que a integração mudou, seção 20.10)
   web/index.html app.js estilo.css    interface (SPA sem framework)
   web/telas/<nome>.js <nome>.css      a tela de cada recurso, por window.EntreNos (seção 20.0)
-  testes/test_*.py
+  web/sw.js trabalhador.mjs entrenos_pyodide.mjs agenda_avisos.js manifest.webmanifest icones/
+  web/pyodide/314.0.7/                o app no celular e no navegador (PWA, seção 21)
+  web/sincronizar.js                  Google Drive, login (janela do Google) e Ajustes → ☁️ Sincronização (seção 22)
+  web/oauth.html oauth.js             a volta do login do Google, sem o app (seção 22.2)
+  web/404.html                        endereço que não existe no site: 404, e não o app (seção 21.7)
+  construir_web.py                    monta site/ para o Cloudflare Pages (seção 21.6)
+  testes/test_*.py  testes/navegador/teste_pyodide.mjs (o Pyodide de verdade, no Node)
+  testes/navegador/teste_sincronizar.mjs  (Drive de mentira + três aparelhos no Pyodide, seção 22)
   construir_instalador.ps1            testes + PyInstaller + Inno Setup → dist\ (seção 18.3/18.4)
   instalador/                         entrenos.spec, EntreNos.iss, entrenos.ico, gerar_icone.py
 ```
@@ -466,7 +474,9 @@ remove_diacritics 2")` mantida pelo próprio `Banco`. `PRAGMA user_version` = ve
 (migrações simples em `_migrar`). Esquema 2: `pessoas.nome_registro_id` e
 `pessoas.relacao_registro_id` (de qual registro o banco tirou o nome/relação que preencheu
 sozinho; editar a pessoa zera). Esquema 3: `registros.privado` (seção 17.4). Esquema 4:
-`recursos_esquema(nome, versao)`, a versão das tabelas de cada recurso (seção 20.0).
+`recursos_esquema(nome, versao)`, a versão das tabelas de cada recurso (seção 20.0). Esquema 5:
+`sync_ids`, `sync_linhas`, `sync_lapides`, `sync_aparelhos`, `sync_conflitos` (a sincronização,
+seção 22.1; tabelas centrais: nenhum recurso grava nelas).
 
 Apagar é apagar também em volta:
 - `apagar_registro` tira da pessoa o nome/relação que vieram só do texto apagado (se outro
@@ -1948,6 +1958,13 @@ seção em Ajustes. Nenhum navegador foi aberto.
   recusa negação, "se", pergunta, ironia, "dei carona/um beijo", "ganhou o jogo", presente para outra
   pessoa. Desejos: "tá doida por", "de olho num", "precisa de um X novo", "adoraria ganhar", "lista de
   desejos"... O desejo que o núcleo já guarda ("queria um fone novo") não duplica.
+- **Gesto não é presente (08/10/2026).** "Levei café para ela no trabalho", "fiz um bolo pra ela",
+  "comprei pão pra ela": atitude do dia a dia, não presente. Com os verbos que também descrevem gestos
+  (comprei, trouxe, levei, mandei, fiz, preparei...), só vira presente com marca de presente ("de
+  presente", mimo, surpresa, ocasião, "pra dar"), guardado para depois (separei, guardei, escondi,
+  encomendei) ou um objeto claramente de presente (`_OBJETOS_DE_PRESENTE`: flores, joias, perfume,
+  chocolate, livro, roupa, carta, ingresso...). Verbos de dar/presentear/ganhar continuam valendo com
+  qualquer objeto ("dei café pra ela").
 - **Ideias possíveis 🔵** só de preferências fortes (dela ou 2+ registros), hobbies e nomes que ela ama,
   em categoria que dá presente; caem se contraditas, velhas (12 meses), não desejadas, não gostou ou já
   dadas. Restrição alimentar entra citada nas ideias de comida. **Não recomendados** citam a origem.
@@ -2044,6 +2061,9 @@ seção em Ajustes. Nenhum navegador foi aberto.
 - **Hoje**: no máximo um cartão `lugares_sugestao` por semana ISO (chave
   `sugestao:<id>:<AAAA-Www>`), nunca com estado difícil dela nos últimos 3 dias nem se vocês já saíram
   na semana; modos conhecer/voltar/rever; sempre "Talvez…"; considera aniversário e viagem.
+  **Só na quinta e na sexta-feira** (planejar o fim de semana, `DIAS_DA_SUGESTAO`) **ou com uma data
+  especial em até 3 dias** (mesversário, aniversário dela ou de namoro, `DIAS_DATA_ESPECIAL`; decisão de
+  08/10/2026). Nos outros dias o cartão não aparece; a aba Lugares mostra a sugestão em qualquer dia.
 - **Rotas**: `GET /api/lugares`, `GET|PATCH|DELETE /api/lugares/{id}`, `POST /api/lugares/{id}/fomos`,
   `DELETE /api/lugares/mencoes/{id}` (apagam também nas cópias). Sem `marca_privado`/`fora_da_ia`.
 - **Tela**: aba "📍 Lugares" em Conhecendo Ela (`#ela/lugares`), sem item de menu.
@@ -2494,3 +2514,699 @@ opinião com o foco de volta, "Talvez já realizado", "Como está indo?", um for
   poderia fazer melhor" (só uma raiz em comum). Algumas frases de lugar ("detestou o hotel em Santos",
   "não quer voltar naquele bar da Augusta", "o café é o melhor da cidade") ainda não viram opinião.
 
+## 21. App no celular e no navegador (PWA) — decidido pelo usuário em 07/10/2026
+
+O mesmo `web/` serve o PC (servidor HTTP local, como hoje) e a PWA (site estático, sem servidor).
+Na PWA, o **núcleo Python roda num Web Worker via Pyodide 314.0.7** (Python 3.14.2), guardado no
+próprio site (sem CDN). O diário fica no armazenamento do navegador (IDBFS em `/dados`), **no
+mesmo formato `.cofre`**: backup do PC abre no celular e vice-versa.
+
+### 21.1 Arquivos
+
+- `web/pyodide/314.0.7/`: `pyodide.mjs`, `pyodide.asm.mjs`, `pyodide.asm.wasm`,
+  `python_stdlib.zip`, `pyodide-lock.json` (do pacote npm `pyodide@314.0.7`, integridade npm
+  conferida) e as rodas `cryptography-47.0.0`, `cffi-2.0.0`, `pycparser-3.0`, `six-1.17.0`
+  (SHA-256 do lockfile conferido) + licenças (`LICENSE-pyodide.txt` MPL-2.0 e as demais).
+  Atualizar o Pyodide = pasta nova inteira, nunca misturar versões.
+- `web/manifest.webmanifest`: `name` "Entre Nós", `short_name` "Entre Nós", `lang` pt-BR,
+  `display` standalone, `start_url`/`scope` "./", cores da paleta, ícones PNG 192/512 (+ maskable)
+  e `apple-touch-icon` 180 (gerados a partir do ícone do instalador, script em `instalador/`).
+- `web/sw.js`: service worker. Pré-cache do app (HTML/JS/CSS/telas/ícones/`entrenos-py.zip`) e do
+  Pyodide em caches com versão; Pyodide **cache-first** (imutável); app stale-while-revalidate
+  com aviso "nova versão disponível — recarregar" (skipWaiting só com o toque do usuário);
+  `cache: 'reload'` no install; limpeza dos caches antigos no activate; nada de resposta opaca
+  nem redirect no cache.
+- `web/trabalhador.mjs` (Worker `type: "module"`): `loadPyodide({indexURL: './pyodide/314.0.7/',
+  packages: ['cryptography']})`; monta IDBFS em `/dados` (`FS.mkdirTree`, `FS.mount`,
+  `FS.syncfs(true)` antes de qualquer pedido); baixa `entrenos-py.zip` e faz `unpackArchive` em
+  `/app`; `sys.path`; **autoteste** (FTS5 com `remove_diacritics 2`, `serialize/deserialize`,
+  `AESGCM`+`Scrypt` com vetor conhecido) — falhou, avisa a tela e não abre o diário;
+  `ponte.iniciar_no_navegador('/dados')`; atende mensagens `{id, metodo, caminho, corpo, token,
+  consulta}` com `ponte.tratar_json` e, quando `gravou`, **`await FS.syncfs(false)` serializado**
+  antes de responder; temporizador do JS chama a conferência de inatividade; **Web Locks**
+  (`navigator.locks.request('entrenos-cofre', ...)`): só uma aba/janela é dona do diário; a outra
+  mostra "o Entre Nós já está aberto em outra janela".
+- `web/entrenos-py.zip`: gerado pelo build com `entrenos/` (sem `servidor.py`, sem `__pycache__`).
+- `construir_web.py` (raiz): monta `site/` (ignorado no git) = `web/` + `entrenos-py.zip` +
+  `_headers` (Cloudflare Pages) com CSP e tipos; confere SHA-256 do Pyodide; **sem .exe**.
+
+### 21.2 Uma tela para os dois modos
+
+- `app.js` descobre o modo uma vez: `GET api/ping` com resposta `{"app": "entre-nos"}` → **servidor**
+  (PC, como hoje); senão → **navegador** (Worker). A função `api()` é a mesma para o resto da tela.
+- Abertura: começa a carregar o Pyodide enquanto mostra a tela do PIN, com progresso
+  ("preparando o Entre Nós… 40%"). Primeira vez no celular: 5-15 s (medir).
+- Backup no navegador: "Baixar uma cópia" (rota `/api/backup/baixar`) com `navigator.share({files})`
+  quando houver (salvar no Arquivos/iCloud/Drive) e link de download como alternativa.
+  Restaurar e importar pelo seletor de arquivos (já existe).
+- `navigator.storage.persist()` ao criar/restaurar o diário; Ajustes mostra
+  `navigator.storage.estimate()` e o estado ("protegido contra limpeza: sim/não").
+- Instalação: Android/PC (Chromium) — botão "Instalar o app" pelo `beforeinstallprompt`;
+  iPhone fora do modo app — instruções "Compartilhar → Adicionar à Tela de Início" (e o aviso:
+  instale ANTES de criar o diário, porque o app instalado tem armazenamento separado do Safari).
+- IA no navegador: a rota responde 503 com explicação (rede da IA no navegador fica para depois);
+  os botões ✨ não aparecem no modo navegador.
+
+### 21.3 CSP e cabeçalhos
+
+- `script-src 'self' 'wasm-unsafe-eval'` (necessário para WebAssembly; confirmar no teste se o
+  Pyodide exige `'unsafe-eval'` e, se exigir, só no trabalhador), `worker-src 'self'`,
+  `connect-src 'self'` (+ Google na seção 22). O servidor do PC passa a servir `.mjs`, `.wasm`
+  (`application/wasm`), `.webmanifest`, `.zip`, `.whl` com tipos certos e o mesmo CSP.
+- `_headers` do site com o mesmo CSP, `X-Frame-Options: DENY`, `Referrer-Policy`,
+  `Cross-Origin-Opener-Policy: same-origin-allow-popups` (login do Google).
+
+### 21.4 Hospedagem
+
+Cloudflare Pages (escolha do usuário em 07/10/2026; grátis, repositório privado do GitHub, HTTPS). O usuário cria a conta e liga o
+repositório (ele mesmo faz os logins); comando de build `python construir_web.py`, pasta `site`.
+O site guarda só o código.
+
+### 21.5 Avisos (Android e PC pelo navegador)
+
+Periodic Background Sync (só Chromium, app instalado; intervalo ≥ ~12 h, decidido pelo
+navegador) + `showNotification` sem servidor. O service worker não abre o diário (está cifrado),
+então o aviso usa uma **agenda de avisos fora do cofre só com DATAS e contagens** (decisão do
+usuário em 07/10/2026): ao salvar, o núcleo atualiza no IndexedDB a lista de dias com lembretes
+(sem texto, sem tipo, sem nome); o service worker conta os de hoje e mostra "Você tem 2 lembretes
+hoje no Entre Nós". Apagar o diário ou desligar os avisos apaga a agenda. iPhone: depois.
+
+### 21.6 Como ficou na implementação (07/10/2026)
+
+Vale junto com 21.1 a 21.5; onde discordarem, vale esta. Resolve, da lista "não feito" de 19.7, o
+Web Locks e o `syncfs` no Worker e a página usar `plataforma`, `limite_arquivo` e `backup_em_pasta`.
+
+**Arquivos novos.**
+
+```
+construir_web.py              monta site/ (21.1); --licencas extrai as licenças das rodas;
+                              --sw-dev refaz as listas do web/sw.js guardado no projeto
+instalador/gerar_icones_web.py  PNGs da PWA a partir de gerar_icone.desenhar (Pillow)
+web/manifest.webmanifest      id/start_url/scope "./", standalone, fundo e tema #FBF7F2
+web/icones/                   icone-192/512 (any), icone-maskable-192/512 (fundo creme, coração
+                              na zona segura de 80%), apple-touch-icon.png (180, sem transparência)
+web/sw.js                     service worker (classic; importScripts da agenda)
+web/trabalhador.mjs           o Worker: só transporte (mensagens, fila, Web Locks, inatividade, agenda)
+web/entrenos_pyodide.mjs      a lógica do Worker sem Worker: Pyodide, FS/syncfs, ponte (o teste do
+                              Node usa este mesmo arquivo)
+web/agenda_avisos.js          a agenda de avisos (IndexedDB), script clássico usado pelo sw.js e
+                              pelo trabalhador.mjs (globalThis.EntreNosAgenda)
+web/pyodide/314.0.7/licencas/ as licenças tiradas das rodas + LEIA-ME.txt (a lista dos componentes)
+testes/test_pwa.py            agenda, servidor, construir_web e os arquivos da PWA
+testes/navegador/teste_pyodide.mjs   o Pyodide de verdade no Node (abaixo)
+```
+
+**Python.** `alertas.agenda_de_avisos(banco, referencia, dias=60) -> {"AAAA-MM-DD": n}`: para cada
+um dos próximos 60 dias, quantos avisos de DATA a página Hoje daquele dia teria: todos os
+importantes (hoje e amanhã) + até `MAX_LEMBRETES` lembretes (antecedências de Ajustes, mesversário,
+namoro), sem os dispensados (a chave depende do dia, como no Hoje). Sugestões e cartões dos
+recursos ficam de fora (dependem do dia em que a página abre). Só lê; o nível de cada data saiu
+para `_nivel_do_aviso`, usado pelo Hoje e pela agenda (o teste confere a agenda contra a página Hoje
+recalculada dia a dia). `Nucleo.agenda_de_avisos()` (None bloqueado; confere a inatividade antes e
+não conta como uso) e `ponte.agenda_de_avisos() -> {"aberto", "dias", "gravou"}` (nunca levanta).
+Não há rota HTTP: só o Worker chama.
+
+**Worker** (`trabalhador.mjs` + `entrenos_pyodide.mjs`). Mensagens da página: `{id, tipo: 'api',
+metodo, caminho, corpo, token, consulta}`, `{id, tipo: 'restaurar', arquivo (ArrayBuffer
+transferido), corpo (só os PINs), token}`, `{id, tipo: 'avisos', ligar}`, `{id, tipo:
+'avisos-estado'}`; resposta `{id, ok, resposta | erro}`. Para a página: `progresso {fracao, fase}`,
+`ocupado`, `pronto {medidas}`, `falhou {motivo: carga|autoteste|dados|fatal|sem-suporte, falhas}`,
+`bloqueou`. Ordem (o teste confere): Pyodide (`loadPyodide` sem `packages` + `loadPackage(['cryptography'])`,
+só para dar progresso e calar as mensagens; o lock confere o SHA-256 das rodas) e o
+`entrenos-py.zip` em paralelo → `unpackArchive` em `/app` → `autoteste` → **trava** → IDBFS em
+`/dados` + `syncfs(true)` → `iniciar_no_navegador('/dados')`. A trava é pedida logo no começo
+(`navigator.locks.request('entrenos-cofre', {ifAvailable: true})`): sem ela, avisa `ocupado` e
+espera a outra aba soltar (o Python carrega enquanto isso; o diário só é tocado depois). Tudo o
+que mexe no Python vai numa fila (um pedido por vez); `syncfs(false)` em outra fila, aguardado antes
+da resposta sair. Inatividade: `setInterval` de 30 s. Sem diário ao abrir, apaga a agenda. stdout e
+stderr do Python não vão para o console.
+
+**Página** (`app.js`). O modo sai uma vez, em `carregarEstado` (o `quandoPronto(carregarEstado)`
+continua): service worker no controle → navegador (no PC ele nunca é registrado); senão
+`fetch('api/ping')` com 4 s de limite → `{"app": "entre-nos"}` é o servidor. Em
+127.0.0.1/localhost nas portas 8787-8799 é sempre servidor (sem resposta: "Não encontrei o Entre
+Nós"), para nunca criar um segundo diário no armazenamento do navegador do PC; no modo servidor
+a página também desregistra service workers que tiverem sobrado. `api()` é a mesma para tudo (e
+para os recursos): no navegador manda ao Worker e trata a resposta igual (`resultadoDaApi`).
+Restaurar no navegador lê o `.cofre` como ArrayBuffer e vai em bytes; limites pelo `limite_arquivo`
+(16 MB). Abertura: com `localStorage['entrenos.temDiario'] === '1'` (só sim/não; o próprio
+armazenamento do site já mostra que há diário) a tela do PIN aparece na hora, com "Preparando o
+Entre Nós… N%", e o PIN digitado espera o Python; senão, "Preparando". Falhas têm tela própria,
+com "Tentar de novo" e os nomes técnicos do autoteste (sem conteúdo). Ajustes ganha 📱 **Este
+aparelho** (instalar: `beforeinstallprompt` guardado ou os passos do iPhone; espaço pelo
+`estimate()` e "Proteger contra limpeza" pelo `persist()`, também pedido ao criar e ao restaurar;
+avisos). No navegador somem a área da IA (e os ✨), "Fechar o Entre Nós" (fica "Bloquear") e o
+backup em pasta, que vira **Baixar uma cópia** em dois toques (preparar → compartilhar ou baixar:
+o `navigator.share` exige um toque recente). Textos com "computador", pasta e `%LOCALAPPDATA%`
+viram "aparelho"/"navegador" nas telas de começo, restauração, cópias, dados e privacidade. No
+iPhone fora do app instalado, o primeiro uso avisa para instalar antes de criar o diário.
+
+**Service worker.** Dois caches: `entrenos-app-<VERSAO>` e `entrenos-pyodide-314.0.7`. Em vez de
+stale-while-revalidate arquivo a arquivo (que misturaria versões no mesmo cache), a revalidação é
+da versão: `VERSAO` = 12 hex do SHA-256 de todos os arquivos do site, gravada no `sw.js` pelo build;
+qualquer mudança muda o `sw.js`, o navegador instala a versão nova em segundo plano (registro com
+`updateViaCache: 'none'` e `update()` ao voltar para a aba) e a página mostra "Nova versão do Entre
+Nós disponível" (Recarregar | Depois). Recarregar bloqueia o diário, manda `pular-espera` (o único
+`skipWaiting`) e recarrega no `controllerchange`. Na instalação: app com `cache: 'reload'`; Pyodide
+com `cache: 'default'` (imutável, e assim a primeira abertura não baixa duas vezes o que o Worker
+está baixando ao mesmo tempo). Só entra no cache resposta 200, `basic`, sem `redirected`, pedida com
+`redirect: 'error'`; a página entra como `./` (o Cloudflare Pages redireciona `/index.html` para
+`/`). Nunca responde `api/`, outro site, POST nem arquivo fora das listas (as licenças vão pela rede).
+
+**CSP** (substituído em 21.7 e 22.2: a CSP vai uma vez em "/*", e o PC não tem 'wasm-unsafe-eval').
+`script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; manifest-src 'self'` a mais, no
+PC e no site. `'unsafe-eval'` não é preciso: no Pyodide 314.0.7 o `eval` só roda para módulos
+dinâmicos com EM_ASM/EM_JS, e as rodas daqui não têm (conferido nos `.so`); confirmar num navegador
+de verdade. No `_headers` a CSP vai só em `/`, `/index.html`, `/sw.js` e `/trabalhador.mjs` (a do
+documento vale para a página; a do script, para o Worker e o service worker): o Cloudflare junta
+com vírgula o mesmo cabeçalho de duas regras, o que viraria duas políticas. Tipos explícitos para
+`.mjs`, `.wasm`, `.webmanifest`, `.zip` e `.whl`, uma regra por arquivo; Pyodide com
+`Cache-Control: immutable`; `sw.js` e a página com `no-cache`. COOP `same-origin-allow-popups` só
+no site (o PC continua `same-origin` até a seção 22).
+
+**Avisos.** IndexedDB `entrenos-avisos`, loja `agenda`: `ligado` (true), `agenda` ({dias, gerada_em})
+e `avisado` (o último dia avisado). O Worker grava a agenda (com os avisos ligados) depois de cada
+pedido que gravou algo e ao desbloquear, configurar e restaurar. Ligar (Ajustes → Este aparelho):
+permissão de notificação, `periodicSync.register('entrenos-avisos', {minInterval: 12 h})` (com a
+permissão `periodic-background-sync` concedida) e o Worker liga e calcula; desligar tira o registro e
+apaga tudo. O `periodicsync` só avisa com os avisos ligados, permissão concedida e uma vez por dia;
+tocar no aviso abre `#hoje`. "Apagar o diário" no navegador é limpar os dados do site (vai junto,
+mesma origem); além disso o Worker apaga a agenda quando abre e não há diário.
+
+**Licenças.** As das rodas (cryptography: LICENSE, LICENSE.APACHE, LICENSE.BSD; cffi: LICENSE,
+AUTHORS; pycparser; six) em `licencas/`, conferidas a cada build, e o `LICENSE-pyodide.txt`. As do
+CPython, do Emscripten e das bibliotecas compiladas junto (SQLite, OpenSSL, zlib, libffi...) não
+vêm nos arquivos do Pyodide guardados aqui: listadas como pendentes no `LEIA-ME.txt`.
+
+**Medido (Node 24 do VS Code, neste PC; no celular deve ser algumas vezes mais lento):** carga do
+Pyodide 2,5 s + cryptography 0,35 s + zip = 3,2 s; autoteste 1,6 s; scrypt do PIN (2^16, r=8) 0,30 s
+no Pyodide contra 0,27 s no CPython; configurar 0,3 a 0,5 s; desbloquear 0,25 a 0,27 s; `construir_web.py` 0,9 s.
+Site: 51 arquivos, 16,4 MB (o `pyodide.asm.wasm` tem 9,6 MB).
+
+**Testado.** `testes/test_pwa.py` (27 testes) e a suíte inteira no CPython (1887 OK).
+`testes/navegador/teste_pyodide.mjs` (20 passos, ~20 s)
+no Pyodide de verdade (Node, sem navegador): monta o site com o `construir_web.py`, carrega pelo
+`entrenos_pyodide.mjs`, autoteste, configurar → analisar → registros com extras (promessa) → hoje →
+busca → agenda (só datas e números) → bloquear → PIN errado 401 → 429 com `Retry-After` →
+desbloquear → exportar → backup 409/baixar → IA 503; `.cofre` criado pelo CPython restaurado e
+desbloqueado no Pyodide com o mesmo PIN, e o criado no Pyodide aberto no CPython (e recusado com
+outro PIN); o `trabalhador.mjs` com um `self` de mentira (trava ocupada → espera, ids, restaurar em
+bytes, agenda ao desbloquear, desligar apaga, inatividade → `bloqueou` e 423); a agenda com um
+IndexedDB de mentira; e o `sw.js` do site num `vm` (pré-cache, recusa de redirect/opaco/404, rotas,
+limpeza dos caches velhos, aviso só com permissão e uma vez por dia). No Windows o Pyodide do Node
+chama `process.getuid()`, que não existe ali, e o Rust do cryptography aborta ao importar ("panic in
+a function that cannot unwind"); no navegador a chamada devolve 0, e o teste põe o mesmo 0. Nada
+abriu navegador; o `app.js` foi conferido com `--check`, pelos testes de texto e por leitura.
+
+**Não feito / pendente:**
+- conferir num navegador de verdade (Chrome Android, Safari iPhone, Chrome/Edge no PC): CSP sem
+  `'unsafe-eval'`, IDBFS e `syncfs`, Web Locks entre abas, instalação, `share` de arquivo,
+  `persist()`, Periodic Background Sync e o aviso, a faixa de versão nova, tempos e memória no
+  celular (5-15 s na primeira vez era a estimativa);
+- licenças do CPython, do Emscripten e das bibliotecas compiladas junto;
+- o `instalador/entrenos.spec` leva `web/` inteira: o instalador do PC passaria a levar o Pyodide
+  (16 MB) que ele não usa; tirar `web/pyodide` e o `entrenos-py.zip` quando o instalador for refeito;
+- listar e abrir pela tela as cópias internas de `backups/` no celular (19.7) e "apagar o diário
+  deste aparelho" pela tela;
+- outros textos com "computador" nas telas dos recursos e nas mensagens do núcleo;
+- avisos no iPhone; IA no navegador (transporte por `fetch` do Worker, 19.6).
+
+### 21.7 Correção final (08/10/2026)
+
+Achados de três revisões (segurança, o Pyodide de verdade e as telas), cada um reproduzido antes de
+corrigir. Vale junto com 21.1 a 21.6; onde discordarem, vale esta. A parte da sincronização está em 22.2.
+
+**json_each no Pyodide (alto).** No SQLite 3.39 do Pyodide, o primeiro `json_each` de uma conexão monta a
+tabela virtual e pede ao autorizador UPDATE em `sqlite_master`; o `_autorizar_leitura` do
+`Banco.consultar` nega, e a consulta de um recurso falhava ("vtable constructor failed: json_each") até
+alguma rota do núcleo usar `json_each` sem autorizador. Toda conexão nova (configurar, desbloquear,
+restaurar) começava assim: logo depois de abrir, `GET /api/perguntas` dava 500, o Hoje perdia o cartão
+"Conheça melhor" e a cada Hoje ia um erro para o `erros.log` (com um `syncfs` a mais). No SQLite do PC
+isso não acontece. Agora `banco._montar_tabelas_json` usa `json_each` uma vez, sem autorizador, ao criar
+a conexão (`Banco.novo`) e logo depois do `deserialize` (`Banco.de_bytes`). **Nunca antes de um
+`deserialize`**: ele troca o esquema da conexão e a tabela montada antes fica apontando para o esquema
+que saiu (no Pyodide, "memory access out of bounds" e o Python inteiro cai; reproduzido). O autorizador
+não foi afrouxado. O `ponte.autoteste` ganhou o passo `json_dos_recursos` (Banco.novo e de_bytes, pelo
+`consultar`), e o `teste_pyodide.mjs` confere perguntas, semana e Hoje logo depois de desbloquear.
+
+**O Hoje mais leve (médio).** `Banco.lembrar(chave, calcular)` guarda o resultado de uma leitura cara até
+a próxima escrita na conexão (`total_changes`; qualquer INSERT, UPDATE ou DELETE invalida tudo) e não
+guarda nada dentro de uma transação (um ROLLBACK desfaria dados sem mudar o contador). Usam:
+`alertas.carregar` (as leituras; cada chamada recebe cópias dos contêineres, dicts e itens),
+`recursos.fora_da_ia` e `recursos.discretos` (a chave inclui quais ganchos responderam e os recursos
+que falharam) e `ciclo._registros_que_falam_do_ciclo`. Medido (CPython, este PC, 600 registros): o
+Hoje passou de 0,36/0,30/0,28 s para 0,21/0,15/0,12 s (antes `discretos` rodava 50 vezes e
+`alertas.carregar` 3 por pedido). Com textos curtos: 1.500 registros, 0,35 s na primeira vez e 0,25
+nas seguintes; 3.650 (10 anos, um por dia), 0,89 e 0,62 s, quase tudo nos `cartoes_hoje` de presentes
+(0,59 s) e da área Eu (0,21 s), espalhado (no perfil de 1.500 registros, 10 mil chamadas de
+`texto.normalizar`, sem um laço quadrático): o custo continua
+crescendo com o diário (no celular, algumas vezes mais), e é o próximo a atacar.
+
+**A cópia do celular em bytes (baixo).** `Nucleo.baixar_copia(token)` devolve (resposta {nome, tamanho},
+bytes), `ponte.baixar_copia(token)` guarda os bytes e `ponte.copia_em_bytes()` os entrega uma vez; o
+`AppPython.baixarCopia` converte (`toJs`, um Uint8Array com buffer próprio) e o Worker atende
+`{tipo: 'baixar', token}` transferindo o ArrayBuffer para a página (`copiaEmBytes` no `app.js`). Antes
+o .cofre ia em base64 dentro do JSON (texto 33% maior no Python, na string, no `JSON.parse` e no
+`postMessage`; o wasm não devolve memória). No PC continua a rota com base64.
+
+**CSP e o _headers (médio e baixo).** A CSP do site vai **uma vez, em "/*"** (antes só em "/",
+"/index.html", "/sw.js" e "/trabalhador.mjs": um endereço qualquer que o Cloudflare respondesse com o
+app abriria a página sem CSP), e o `404.html` faz endereço desconhecido responder 404. Uma regra só,
+então nada é juntado com vírgula. A do PC (`servidor.CSP`) não tem mais `'wasm-unsafe-eval'` (a página
+do PC não roda WebAssembly) nem nada do Google além das conexões (22.2), e ganhou `object-src 'none'`
+e `form-action 'self'` (não `'none'`: os diálogos usam `<form method="dialog">`). A do site é a mesma
+com `'wasm-unsafe-eval'` (`construir_web.csp_do_site`): no Cloudflare a CSP do script do Worker vem da
+mesma regra "/*", então a página também a recebe. Páginas `.html` (oauth, 404) ficam fora do
+pré-cache: o Cloudflare redireciona `/x.html` para `/x`, e redirect não entra no cache.
+
+**Telas do celular (médio e baixo).**
+- `telaSemNucleo`: falha no `GET /config` depois do PIN nunca mostra "Não encontrei o Entre Nós... menu
+  Iniciar" no celular: tela de falha do navegador, ou o PIN de novo com a mensagem num 409 (outra aba).
+- Worker que morre depois de pronto: tela de falha (com "Tentar de novo") em vez de avisos soltos.
+  Pedido sem resposta: depois de 90 s (300 s em restaurar, importar, baixar a cópia e sincronizar,
+  contando só depois de o Python ficar pronto) vira a tela "O Entre Nós parou de responder". As
+  mensagens não pedem mais "recarregue a página" (o app instalado não tem botão de recarregar).
+- Primeira abertura: a barra fica "andando" (sem número) até o Python chegar, em vez de parada em
+  3%; o texto diz que são cerca de 16 MB (prefira o Wi-Fi) e até um minuto; depois de 60 s, "Ainda
+  baixando… confira a conexão". (O progresso real do download fica para depois.)
+- iPhone no Safari, sem diário: os passos de instalar aparecem ANTES de baixar o app (o app
+  instalado tem armazenamento separado e baixaria tudo de novo), com "Continuar no Safari mesmo
+  assim" (guarda só um sim em `localStorage['entrenos.continuarNoSafari']`). Passos com o iOS 26
+  (Compartilhar dentro do menu ⋯, "Abrir como App Web").
+- Avisos: a permissão de notificação só é pedida depois de conferir o despertar periódico
+  (`periodicSync` no `ServiceWorkerRegistration`, app instalado, permissão `periodic-background-sync`);
+  sem isso a caixinha fica desabilitada com a explicação. A caixinha mostra o estado de verdade
+  (ligado no IndexedDB, notificação permitida e o registro em `periodicSync.getTags()`); ligado sem
+  permissão ou sem registro: a agenda é apagada e a tela diz por quê.
+- O seletor do backup aceita `.cofre,application/octet-stream` (no iPhone, só `.cofre` pode deixar o
+  arquivo cinza); o `problemaDoArquivo` confere a extensão depois.
+- Restaurar: com a sincronização ligada, a confirmação diz que o que está nos outros aparelhos volta e
+  o apagado neles continua apagado (testado em `test_sincronizacao.py`); no celular, que a cópia
+  interna ainda não abre pela tela, com o botão "Baixar uma cópia de agora" ali mesmo. Textos do
+  danificado e da restauração sem "computador"/`entrenos.cofre`/pasta no celular.
+- O 🔒 não promete mais "nunca sai deste computador": "nunca vai para a IA" (e, com a sincronização,
+  vai embaralhado para os seus outros aparelhos). Também na conversa da semana.
+- `index.html`: o texto de "Abrindo…" serve aos dois (celular: a internet; computador: o antivírus).
+- Faixa de versão nova: diz que o PIN é pedido de novo e, com rascunho em Registrar, confirma antes.
+- PIN com outra janela dona do diário: o botão diz "Esperando a outra janela fechar…" e o texto lembra
+  da aba do Chrome/Safari esquecida no fundo depois de instalar.
+- Tocar no aviso com o app aberto em outra tela: o service worker manda `{tipo: 'abrir-hoje'}` e a página
+  vai para o Hoje (sem recarregar).
+- Falhas: "se você já tinha um diário aqui, ele continua guardado"; no iPhone, "atualize o iOS" no
+  lugar de "use outro navegador".
+- Espaço: "O app e o diário usam X (a conta inclui o próprio app, uns 16 MB)"; depois de baixar a
+  cópia, onde ela costuma ficar (Downloads; no iPhone, Arquivos → Transferências).
+- Primeiro uso: "Usava a sincronização em outro aparelho? Crie um diário aqui e ligue a sincronização";
+  no navegador de um computador, "este é um diário só deste navegador".
+- `DIARIO_MUDOU` e "sem o arquivo do diário" sem "recarregue a página".
+
+**Testado (08/10/2026).** `teste_pyodide.mjs` (21 passos): perguntas, semana e Hoje logo depois de
+desbloquear (o json_each), e o Worker entregando a cópia como ArrayBuffer transferido (e 401 sem
+arquivo). `test_sincronizacao.TestMemoriaDoBanco` (`lembrar` e json_each), `test_pwa` (a CSP em "/*",
+404.html e oauth.html no site, a CSP mínima). O `app.js` foi conferido com `--check` e por leitura.
+
+**A conferir num aparelho de verdade:** o seletor de `.cofre` no iPhone; os avisos com e sem a
+permissão; a barra indeterminada e o texto de 60 s numa rede lenta; os passos do iOS 26; a tela de
+falha quando o celular encerra o Worker; o 404 e a CSP em "/x" no Cloudflare (`curl -I`).
+
+## 22. Sincronização (Google Drive) — decidido pelo usuário em 07/10/2026
+
+Tela **Ajustes → ☁️ Sincronização**, no padrão da tela da IA: serviço (Google Drive agora;
+Dropbox/OneDrive aparecem como "em breve"), **ID do app** (Client ID do Google, não é segredo),
+"Conectar ao Google" (o próprio usuário entra na tela do Google), situação ("conectado como…,
+última sincronização há 3 min"), "Sincronizar agora", "Desconectar", lista de aparelhos, e o
+passo a passo para criar o ID no Google Cloud (projeto, Drive API, cliente OAuth Web, origens
+autorizadas: o endereço do site e `http://localhost:8787`, usuário de teste).
+
+- **Escopo só `drive.appdata`** (pasta oculta do app; não enxerga mais nada do Drive).
+- **Um arquivo por aparelho** na pasta do app (`entrenos-<aparelho>.sync`) + `entrenos-sync.json`
+  (sal e parâmetros da chave de sincronização, verificador). Cada aparelho só escreve o seu
+  arquivo (o Drive não tem gravação condicional confiável); a mescla acontece na leitura.
+- **Chave de sincronização** derivada de uma **senha de sincronização própria** (decisão do usuário
+  em 07/10/2026; pode ser igual ao PIN, mas trocar o PIN não quebra a sincronização) (scrypt, sal comum
+  guardado no `entrenos-sync.json`), digitada uma vez em cada aparelho e guardada dentro do
+  diário cifrado de cada um. O conteúdo de cada `.sync` = exportação do diário + lápides, cifrado
+  com AES-GCM nessa chave. O Google só vê arquivos embaralhados.
+- **Mescla (fase 1):** registros novos dos outros aparelhos entram pela lógica de importar
+  (juntar, sem duplicar, 🔒 preservado, extras dos recursos inclusive ciclo/eu); **lápides**
+  (impressão digital do registro apagado, sem conteúdo) fazem o apagado sumir em todos os
+  aparelhos e não voltar; mudanças de status/edição de item: vale a mais recente (carimbo de
+  data/hora). Conflito que não dá para decidir sozinho → a tela pergunta.
+- Quando: ao abrir (se o acesso ao Google ainda vale), depois de salvar (agrupado, ~30 s) e no
+  "Sincronizar agora". Sem internet: fica na fila. Token do Google dura ~1 h e só se renova com
+  um toque (limite do Google para app sem servidor) — a tela mostra "toque para sincronizar".
+- PC (servidor) e navegador (Worker) usam o mesmo código: o JS fala com o Google e entrega os
+  arquivos ao núcleo (`/api/sync/...`), que decifra, mescla e devolve o seu arquivo cifrado.
+- iPhone instalado: o login do Google por janela pode falhar (risco conhecido); se falhar, a tela
+  explica e oferece o caminho manual (baixar/restaurar/importar).
+
+### 22.1 Como ficou na implementação (07/10/2026)
+
+Vale junto com a lista acima; onde discordarem, vale esta. Testes em `testes/test_sincronizacao.py`
+(três aparelhos com núcleos de verdade e um Drive de mentira; 41 testes) e
+`testes/navegador/teste_sincronizar.mjs` (a página contra um Drive de mentira, três aparelhos com o
+núcleo no Pyodide de verdade e a tela num DOM de mentira).
+
+```
+entrenos/sincronizacao.py     senha, chaves, cifra dos arquivos, estado local (uids, carimbos, lápides),
+                              mescla, perguntas; só biblioteca padrão + cryptography, roda no Pyodide
+web/sincronizar.js            Drive REST v3, login (GIS), o motor (fila, agrupamento, erros) e a seção
+                              Ajustes → ☁️ Sincronização (registrarSecaoAjustes)
+entrenos/banco.py             esquema 5 (tabelas sync_*), juntar_exportacao(), "sync" fora da exportação
+entrenos/nucleo.py            as rotas /api/sync/..., o "sync" fora de /api/config, restaurar = aparelho novo
+entrenos/servidor.py          CSP com os endereços do Google e COOP same-origin-allow-popups (também no PC)
+web/app.js                    eventos 'entrenos:gravou' e 'entrenos:desbloqueado'; Privacidade
+```
+
+**Senha e chaves.** `scrypt(senha NFC, sal de 16 bytes, n=2^16, r=8, p=1)` = chave mestra (32 bytes).
+Dela saem por HMAC-SHA256 com rótulos diferentes: a chave da cifra, a das impressões (uids, lápides,
+assinaturas) e o **verificador** (o que vai para o Drive; nunca a chave). Regras da senha = as do PIN
+(`problema_da_senha`, o texto fala em "senha de sincronização"); pode ser igual ao PIN.
+`entrenos-sync.json` = `{app, tipo: "sincronizacao", formato: 1, kdf: {algoritmo: "scrypt", sal, n, r,
+p}, verificador}`: sem data, nome nem aparelho. Parâmetros fora do que o app grava (os mesmos limites
+do cofre: n até 2^17, r=8, p=1) são recusados antes do scrypt.
+No diário, o ajuste `"sync"` guarda `{versao, chave, sal, n, r, p, verificador, aparelho (16 hex),
+nome, id_app, conta, automatica, ultima, enviado, ligada_em, versao_estado}`. `banco.chave_da_sincronizacao`:
+sai de `/api/config`, da exportação (`config_sem_segredos`) e o `PATCH /api/config` recusa (400); o
+histórico registra só "ajustes alterados: sync". Senha errada: 401 com `espere_segundos` e o mesmo
+bloqueio crescente do PIN (contador próprio, só em memória: quem tem o `entrenos-sync.json` testa
+senhas fora do app de qualquer jeito); antes da hora, 429 sem scrypt.
+
+**O arquivo de cada aparelho.** `b"ENTRENOS-SYNC" | formato (1 byte) | nonce (12) | AES-256-GCM(zlib(JSON))`
+com o cabeçalho como dado associado. O JSON: `{app, tipo, formato, versao_app, aparelho, nome, gerado_em,
+exportacao (Banco.exportar() sem config, histórico, avisos dispensados e avisos), recursos_falhos, ids:
+{registros|itens|pessoas: {id daqui: [uid, carimbo]}}, lapides: [[uid, tipo, apagado_em]], dados_dela}`.
+Ao abrir: cabeçalho, tag do GCM (mexido ou de outra senha = "não abre", 400 `arquivo_invalido`), zlib
+com limite (`MAX_DESCOMPRIMIDO` = 64 MB: bomba de zip para), formato (mais novo no byte, no JSON ou no
+esquema da exportação = 409 `versao_nova`, "atualize este aparelho") e o nome: arquivo com o nome de
+outro aparelho é recusado. O arquivo do próprio aparelho é ignorado (`{proprio: true}`).
+
+**Identidade e carimbos (esquema 5).**
+- `sync_ids(uid, tipo, local_id, assinatura, carimbo)`: cada registro, item e pessoa daqui. O uid sai
+  do conteúdo, para dois aparelhos com o mesmo diário (um backup restaurado) acharem o mesmo:
+  registro = HMAC(data, criado_em, texto normalizado como no importar); item = HMAC(uid do registro,
+  tipo, trecho, criado_em); pessoa = HMAC(nome e relação normalizados); repetidos ganham `-1`, `-2`
+  na ordem dos ids; o que já tem lápide (ou colide) ganha um uid aleatório. Quem chega de outro
+  aparelho fica com o uid de lá. O mesmo registro, item ou pessoa com dois uids (casado pelo conteúdo)
+  fica com o menor nos dois lados.
+- `assinatura` = HMAC dos campos sincronizados (registro: `privado`; item: os 15 campos de
+  `_COLUNAS_ITEM` menos `pessoa_id`; pessoa: nome, relação, apelidos em ordem, observações,
+  aniversário). Mudou desde a última conferência: carimbo novo = quando mudou (o `atualizado_em` do
+  item, nunca no futuro; pessoa e 🔒 = a hora da conferência), sempre depois do carimbo anterior. Quem
+  é visto pela primeira vez ganha o carimbo de época (1970): "não se sabe quando". Carimbos em UTC com
+  **microssegundos** (o banco guarda segundos; as frações vêm do relógio de agora): dois aparelhos
+  nunca carimbam igual por acaso, e o carimbo de lá é copiado quando a versão de lá é aplicada. Por
+  isso **o mesmo carimbo (fora a época) é a mesma versão** (`_decidir_edicao`): se o banco daqui
+  guardou algum campo de outro jeito, não vira pergunta a cada sincronização. Datas para mostrar
+  (`ultima`, `gerado_em`, `mesclado_em`) ficam em segundos (o Safari não lê as frações).
+- Sumiu daqui = lápide (`sync_lapides(uid, tipo, apagado_em)`), só a impressão. As lápides nunca saem
+  e vão em todos os arquivos (a união): o apagado não volta nem por um aparelho que ficou dias sem
+  sincronizar. Registro escrito de novo depois de apagado é outro (o `criado_em` entra no uid).
+- `atualizar_estado(absorver=True)`, no fim de cada mescla: o que a própria mescla mudou (importação
+  que completou uma pessoa, apagado por lápide) só atualiza a assinatura, sem carimbo novo nem lápide.
+
+**A mescla** (`mesclar`, um arquivo de outro aparelho por vez, numa transação, um arquivo gravado):
+1. `atualizar_estado` (o que mudou ou sumiu aqui vira carimbo ou lápide antes de qualquer coisa);
+2. as lápides de lá entram e apagam aqui o registro, item, pessoa ou linha de recurso (pelo
+   `apagar_registro`/`apagar_item`/`apagar_pessoa` de sempre; o núcleo repete nas cópias automáticas);
+3. a exportação de lá, sem nada que tenha lápide, entra por `Banco.juntar_exportacao` (o `_juntar` do
+   importar, dentro da transação, com os mapas de ids de volta e as pessoas que já têm uid aqui
+   amarradas, para não casar de novo pelo nome: renomear não duplica); o histórico diz "sincronização:";
+4. os uids do que entrou ficam iguais aos de lá; item de registro que os dois têm e que só lá existe
+   entra (`acrescentar_item`), a não ser que seja o mesmo item com outra identidade;
+5. edições: item e pessoa que existem dos dois lados com valores diferentes — vale o carimbo mais
+   recente; os dois mudaram a menos de `JANELA_CONFLITO` (120 s; e os dois "de época") = **pergunta**
+   (`sync_conflitos`, com a versão de lá; até a pessoa responder, fica a daqui). Pessoa: antes de
+   perguntar, o que um lado tem e o outro deixou em branco se completa (apelidos somam); só dois
+   valores diferentes no mesmo campo perguntam. O 🔒 nunca pergunta: vale o mais recente e, na
+   dúvida, fica 🔒 (o "só liga" da importação é desfeito quando o desmarcar é o mais recente);
+6. dados dela (nome, aniversário, início do namoro): só completam o que está vazio aqui;
+7. `sync_aparelhos` (nome, `gerado_em`, a etiqueta do Drive) e as linhas vistas daquele aparelho.
+
+**Linhas dos recursos.** Cada linha das listas que um recurso exporta tem uma impressão: HMAC do
+recurso, da lista e do conteúdo **sem** `id`, campos `*_id`/`*_ids`, `criado_em` e `atualizado_em`
+(o que muda ao importar). Conferido: depois de exportar → importar, todas as linhas dos nove
+recursos têm a mesma impressão nos dois diários (teste). `sync_linhas('', ...)` é a foto daqui na
+última conferência: linha que sumiu vira lápide; editada vira lápide da versão de antes + linha nova
+(nos outros, a de antes sai e a nova entra). Sem lápide quando o recurso não exportou agora
+(`recursos_falhos`, um recurso que não abriu) ou quando a versão do app mudou (`versao_estado`: o
+formato pode ter mudado; a foto é refeita sem apagar nada). Lápide de lá apaga a linha daqui (a
+tabela é achada pelo id e pelos valores: a de mais colunas em comum, e só se for uma) **menos** se
+outra linha daqui ainda aponta para ela (`X_id` → lista `Xs`/`Xes`/`X` do mesmo recurso: o lugar de
+uma menção, o ciclo de uma anotação), para nada ficar solto; vão as filhas primeiro, depois as mães.
+`sync_linhas(<aparelho>, ...)` = o que já veio daquele aparelho: só entra o que é novo de lá (o que
+veio e foi apagado aqui não volta dele, mesmo que a impressão não ache a cópia); uma linha que já
+veio entra de novo só para ligar uma linha nova que aponta para ela (o recurso junta sem duplicar).
+"Apagar todos os dados do ciclo" num aparelho apaga nos outros.
+
+**Rotas** (todas de sessão; `senha` é livre, com o scrypt fora da trava do app):
+
+| Método e rota | Corpo | Resposta |
+|---|---|---|
+| GET /api/sync/estado | | `{configurada, servico, id_app, nome, automatica, conta, aparelho, arquivo, arquivo_config, ultima, enviado, sync_json, aparelhos: [{aparelho, nome, gerado_em, etiqueta, mesclado_em}], conflitos, plataforma}` (`sync_json`: o entrenos-sync.json desta chave, sem segredo, para recriar se sumir do Drive) |
+| PATCH /api/sync/ajustes | `{id_app?, nome?, automatica?, conta?}` | o estado; outro campo 400 |
+| POST /api/sync/senha | `{senha, sync_json?, substituir?}` | `{aparelho, arquivo, sync_json (só ao criar), criado}`; 401/429 senha errada; 409 já ligada (sem `substituir`) |
+| POST /api/sync/iniciar | `{sync_json}` | `{aparelho, arquivo, etiquetas: {aparelho: etiqueta}}`; 409 `senha_mudou` se o do Drive não é o desta chave; 409 `sem_senha` |
+| POST /api/sync/receber | `{nome, etiqueta?, conteudo_b64}` (até 64 MB; 16 MB no celular) | `{aparelho, nome, registros_novos, pessoas_novas, itens_novos, linhas_novas, atualizados, apagados, conflitos, lapides_novas, avisos}`; 400 `arquivo_invalido`; 409 `versao_nova` |
+| POST /api/sync/preparar | | `{nome, tamanho, conteudo_b64[, aviso]}` (aviso acima de 11 MB: um celular pode não abrir) |
+| POST /api/sync/enviado | `{etiqueta}` | `{ultima}` |
+| GET /api/sync/conflitos | | `[{id, tipo: item\|pessoa, aparelho, nome_aparelho, resumo, contexto, campos: [{campo, aqui, la}]}]` |
+| POST /api/sync/conflitos/{id} | `{fica: "este"\|"outro"}` | `{}`; a escolha ganha carimbo depois das duas versões e da janela (vai para todos) |
+| POST /api/sync/desligar | | o estado; a chave e as tabelas sync_* saem daqui e o "sync" sai das cópias automáticas |
+
+Restaurar um backup com sincronização ligada: o aparelho ganha identidade nova (`depois_de_restaurar`;
+senão dois aparelhos escreveriam o mesmo arquivo), nome padrão, sem conta. Copiar a pasta de dados à
+mão para outro aparelho não é detectado (use backup e restaurar).
+
+**A página** (`web/sincronizar.js`, script clássico depois do `app.js`; o motor fica em
+`globalThis.EntreNosSincronizar` para o teste do Node):
+- `criarDrive({buscar, token, base, baseEnvio})`: `GET files?spaces=appDataFolder` (páginas, `orderBy
+  createdTime`), `GET files/{id}?alt=media`, `POST upload/files?uploadType=multipart` (metadados com
+  `parents: ["appDataFolder"]`), `PATCH upload/files/{id}?uploadType=media` (só o próprio arquivo),
+  `DELETE` (só a configuração que o próprio aparelho acabou de criar numa corrida) e `about` (o e-mail,
+  para "conectado como"). `credentials: 'omit'`, sem referrer.
+- Erros em frases (`MENSAGENS`): sem rede (fila: tenta de novo a cada minuto e no evento `online`),
+  401 (esquece o token: "toque para sincronizar"; nunca abre a janela sozinho), Drive API desligada,
+  permissão negada, sem espaço, limite e falha passageira (nova tentativa em 2, 5, 15 min), arquivo
+  que não abre ou de versão nova (fica de fora com aviso; o resto sincroniza).
+- `criarConta()` (substituído em 22.2: sem biblioteca do Google): Google Identity Services, **modelo de token**, escopo só `drive.appdata`;
+  `accounts.google.com/gsi/client` só é posto na página depois que a pessoa salva o ID do app (ligou),
+  e de novo na seção quando já há ID (para a janela abrir no toque). `entrar()` chama
+  `requestAccessToken` direto no toque; `hasGrantedAllScopes` (sem a permissão do Drive = erro claro);
+  janela bloqueada ou fechada viram frases. O token fica só numa variável (nunca em armazenamento do
+  navegador, nunca no console); vale até 1 min antes de vencer; "Desconectar" revoga.
+- `criarSincronizador`: estado → `iniciar` (com o entrenos-sync.json mais antigo; sumiu: recria do
+  `sync_json`) → baixa e `receber` só o arquivo de quem mudou (etiqueta = md5 do Drive, guardada no
+  núcleo: depois de restaurar um backup, baixa de novo) → `preparar` → cria ou atualiza o próprio →
+  `enviado`. Um por vez; salvar no meio agenda mais uma. `depoisDeSalvar` agrupa ~30 s
+  (`AGRUPAR_MS`). `ligarComSenha`: sem configuração no Drive cria; dois aparelhos criando juntos =
+  vale a mais antiga (`substituir: true`) e a nossa é apagada.
+- Ganchos: `entrenos:gravou` (o `app.js` dispara depois de um POST/PATCH/PUT/DELETE que muda o
+  diário; leitura, IA, PIN e a própria sincronização ficam de fora) → agrupa, se a sincronização
+  automática está ligada; `entrenos:desbloqueado` (o `mostrarApp`) → sincroniza se o token ainda vale;
+  `entrenos:bloqueado` cancela o que estava marcado; `online` e a aba voltar a aparecer → a fila.
+- A seção: introdução e "Como funciona", serviço (Google Drive; Dropbox e OneDrive "em breve",
+  desabilitados), ID do app (com o passo a passo e as origens desta página e `http://localhost:8787`,
+  com "Copiar"), situação ("Conectado como…", "Última sincronização há N min", o erro em frase, o que
+  chegou), Conectar / Sincronizar agora (que já abre o login quando o token venceu) / Desconectar,
+  criar ou digitar a senha (campos de senha como os do PIN: o navegador não oferece salvar), as
+  perguntas (os dois lados com nomes de campo e valores legíveis; "Fica a deste aparelho" / "Fica a do
+  <aparelho>"), sincronizar sozinho, aparelhos, nome deste aparelho, trocar o ID, "Parar de sincronizar
+  neste aparelho" (confirmação). Em 127.0.0.1 avisa que o Google só aceita `localhost` (com o link);
+  no iPhone, o aviso do login por janela e o caminho manual.
+
+**CSP** (a mesma no PC e no `_headers`): `script-src 'self' 'wasm-unsafe-eval'
+https://accounts.google.com/gsi/client; style-src 'self' https://accounts.google.com/gsi/style;
+frame-src https://accounts.google.com/gsi/; connect-src 'self' https://accounts.google.com/gsi/
+https://www.googleapis.com/drive/v3/ https://www.googleapis.com/upload/drive/v3/` (o resto como em
+21.6). `Cross-Origin-Opener-Policy: same-origin-allow-popups` também no PC (a janela do login avisa a
+página que a abriu).
+
+**Testado (07/10/2026):** a suíte inteira no CPython (com `test_sincronizacao.py`: três aparelhos —
+registros novos de cada lado sem duplicar, só o que mudou é baixado, apagar num e sumir nos outros
+sem voltar mesmo com um aparelho atrasado, escrito de novo depois de apagado, item e pessoa apagados,
+edição concorrente (vale a mais recente), quase junto vira pergunta (respondida "outro" e "este"),
+apagar tira a pergunta, pessoa renomeada sem duplicar, pessoa completada sem pergunta, item
+acrescentado, 🔒 que vai e volta e na dúvida fica, ciclo e área Eu preservados, a chave fora de
+config/exportação/histórico/arquivo, desligar tira a chave das cópias, apagado pela sincronização sai
+das cópias, senha errada e fraca, bloqueio da senha, senha trocada em outro lugar, arquivo adulterado
+(byte trocado, cortado, cabeçalho, lixo, outra senha, nome trocado), versão de formato (cabeçalho,
+JSON, esquema e configuração), arquivo grande demais, restaurar = aparelho novo, o mesmo diário nos
+dois antes de ligar, impressão igual depois de importar, anotação organizada que não volta, apagar
+todos os dados do ciclo, promessa apagada, lugar corrigido sem soltar menções, anotação nova ligada
+ao ciclo, o que já veio e foi apagado aqui não volta, dados dela, a mesma versão guardada de outro
+jeito sem pergunta); 18 proteções desligadas uma a uma fazem algum desses testes falhar. `test_compat_navegador.py`: a sincronização no "Python de
+navegador" (sem threads, `_hashlib` nem `ssl`). `teste_sincronizar.mjs` (19 passos, ~9 s): o motor
+contra o Drive de mentira (só o próprio arquivo, só o que mudou, 401, sem rede e a volta, 30 s,
+erros do Google, corrida da configuração, a configuração que sumiu, GIS de mentira), três aparelhos
+com o núcleo no Pyodide 314 (senha errada 401; registros, 🔒 e ciclo em todos; apagar sem voltar; no
+Drive só o `entrenos-sync.json` e três arquivos embaralhados; cada um atualizou só o seu) e a tela num
+DOM de mentira (do ID do app até ligada e uma pergunta respondida; todo campo com rótulo, nada de
+"undefined", o token nunca na tela; sem `innerHTML`, estilo inline, `eval` nem armazenamento do
+token). Medido (CPython, este PC, 600 registros e 1.350 itens): preparar 0,2-0,3 s (arquivo de 70 kB),
+receber tudo de outro aparelho 0,5 s, receber sem nada novo 0,6 s; no Pyodide, uma sincronização de
+um diário pequeno leva 45-90 ms. Nada falou com o Google de verdade; nada abriu navegador.
+
+**Fica para depois (fase 2):**
+- apagar o que foi apagado ANTES de ligar a sincronização (não há lápide: volta de outro aparelho que
+  ainda tinha);
+- edição de linhas dos recursos (status de uma promessa, opinião de um lugar...): hoje a versão nova
+  entra só onde a de antes não ficou (a de antes sai por lápide quando a impressão acha a cópia);
+  relações (confirmar/descartar), avisos dispensados e os outros ajustes não sincronizam;
+- carimbo de pessoa e do 🔒 é a hora da conferência (não a da edição): com um aparelho dias sem
+  sincronizar, a mudança dele pode valer como mais recente que uma de outro feita depois;
+- trocar a senha de sincronização e "esqueci a senha" (hoje: parar em todos e ligar de novo, com o
+  `entrenos-sync.json` apagado pelo Drive → Gerenciar apps); tirar da lista um aparelho que não
+  sincroniza mais;
+- receber de cada aparelho passa pela importação de todos os registros dele (0,6 s com 600 no PC): com
+  diários de anos, mandar só o que mudou;
+- conferir num navegador de verdade (ver a lista do 21.6): o login do Google no Chrome/Edge (PC por
+  `localhost`, Android) e no Safari do iPhone, dentro e fora do app instalado; a CSP com o GIS (o
+  console sem erro); `Referrer-Policy: no-referrer` com o GIS; o Drive de verdade (multipart, md5,
+  `about` com o escopo `drive.appdata`).
+
+### 22.2 Correção final (08/10/2026)
+
+Achados das revisões de segurança, do Pyodide de verdade e das telas, cada um reproduzido antes de
+corrigir (testes em `test_sincronizacao.py`, classes do fim do arquivo, e em `teste_sincronizar.mjs`).
+Vale junto com 22 e 22.1; onde discordarem, vale esta. As decisões do usuário continuam: senha de
+sincronização própria (pode ser igual ao PIN), Google Drive, Cloudflare Pages, avisos só com datas.
+
+**Senha de sincronização mais forte (alto).** Antes valiam as regras do PIN (6 caracteres): "flores",
+"camila", "beijos" passavam, e quem lê a pasta do app no Drive (o Google, ou quem tomar a conta) testa
+senhas fora do app, sem limite, só com o `entrenos-sync.json` (0,21 s por palpite num núcleo; "flores"
+saiu em 1 s numa lista de 6). Agora `problema_da_senha` tem regra própria: pelo menos 14 caracteres e
+3 palavras diferentes de 2+ letras (ou, sem frase, 20 caracteres de 3 tipos e 12 diferentes); recusa
+palavra ou nome único (mesmo com números e símbolos), repetições, sequências, as senhas comuns do PIN e
+frases feitas (`_FRASES_COMUNS`: "eu te amo muito", "te amo para sempre"...). A tela sugere uma frase
+gerada (`gerarFrase`: 4 palavras diferentes de uma lista de 568, sem acento, + 2 algarismos, umas
+9×10^12 combinações; "Usar esta frase", "Outra", "Copiar") e confere a mesma regra antes de enviar.
+**Igual ao PIN**: ao criar, o núcleo compara com o PIN do diário (1 ou 2 scrypt, contando nas mesmas
+comparações do "PIN da IA igual ao principal"; com o PIN em bloqueio, não compara) e responde 409
+`{igual_ao_pin}` (`SENHA_IGUAL_AO_PIN`); a tela pergunta "Usar mesmo assim?" e reenvia com
+`mesmo_que_o_pin: true`. O scrypt continua em 2^16: 2^17 dobraria a memória no wasm do celular (128 MB por
+tentativa) e o Argon2id do cryptography não foi testado no Pyodide (fica para depois); a regra da senha é a defesa.
+
+**Nenhum código do Google na página (médio).** A biblioteca GIS rodava no próprio documento, com o
+diário aberto, alcançando o DOM, o token da sessão e `window.EntreNos.api` (que exporta tudo
+decifrado). Agora o login é o fluxo de token para apps web, sem biblioteca: `criarConta().entrar()` abre
+(no toque) `accounts.google.com/o/oauth2/v2/auth?response_type=token&scope=…drive.appdata&
+include_granted_scopes=false&state=<32 hex aleatórios>&redirect_uri=<origem>/oauth.html[&login_hint]`.
+O `oauth.html` (estático, sem o app, só o `oauth.js`) lê o fragmento, tira-o do histórico, entrega
+`{tipo: 'entrenos-oauth', state, access_token, expires_in, scope, error}` por `postMessage` só para a
+mesma origem e por `BroadcastChannel('entrenos-oauth')` (a janela que passou pelo Google costuma perder
+a ligação com a página, por causa do COOP) e fecha. A página só aceita mensagem da mesma origem e com o
+`state` deste pedido; escopo além de `drive.appdata` (o Drive inteiro, já concedido antes ao mesmo ID)
+é recusado e o token revogado (`permissao_demais`). Sem resposta em 5 min, "a janela foi fechada"; há
+"Cancelar". O token fica só na memória, é **esquecido quando o diário se bloqueia** (`entrenos:bloqueado`)
+e **revogado** em "Desconectar" e "Parar" (`POST https://oauth2.googleapis.com/revoke`, `no-cors`, sem
+credenciais). CSP: sem `accounts.google.com` em script/style/frame; `connect-src` só com a Drive API e
+a revogação. O passo a passo pede os **URIs de redirecionamento** (`<origem>/oauth.html`). No Cloudflare,
+`/oauth.html` é redirecionado para `/oauth`, e o navegador mantém o fragmento.
+
+**Apagar é apagar no Drive (médio).**
+- "Parar" não apaga mais a memória da sincronização (uids, lápides, o que veio de cada aparelho: só
+  impressões): fica com `anterior: {aparelho, verificador, sequencia}` no ajuste "sync", sem a chave.
+  Religar com a **mesma senha** (o mesmo verificador) volta a mesma identidade (o mesmo arquivo no Drive,
+  reescrito) e o que foi apagado com ela parada vira lápide na primeira conferência (antes voltava dos
+  outros aparelhos e o arquivo antigo ficava no Drive para sempre). Com **outra senha**: identidade e
+  memória novas, e o arquivo antigo deste aparelho entra em `apagar` (o estado mostra; a página apaga do
+  Drive e avisa em `POST /api/sync/enviado {apagados}`). Restaurar uma cópia "parada" não reaproveita a
+  identidade de onde ela veio. As perguntas pendentes saem ao parar.
+- "Parar" com o Google conectado oferece (marcado) "Apagar também o arquivo deste aparelho no Google
+  Drive" (`apagarProprio`, só o próprio arquivo).
+- **Versões antigas**: cada arquivo leva `sequencia` (cresce a cada `preparar`, guardada no "sync") e
+  `vistos` ({aparelho: maior número visto}); quem já juntou um arquivo mais novo de um aparelho (ou viu,
+  pelo arquivo de outro, que ele estava mais adiante) recusa uma versão mais velha posta no lugar: 400
+  `arquivo_invalido` com `ARQUIVO_ANTIGO`. Limite: um aparelho novo, que nunca viu nada, não percebe se
+  TODOS os arquivos forem trocados pelas versões antigas ao mesmo tempo.
+- **Revisões**: depois de atualizar o próprio arquivo, a página apaga as revisões anteriores dele
+  (`drive.limparRevisoes`: `GET files/{id}/revisions` e `DELETE …/revisions/{id}`, menos a última, que o
+  Drive não deixa). É melhor esforço (um erro não atrapalha a sincronização) e falta conferir no Drive
+  de verdade se o escopo `drive.appdata` permite e se o Drive guarda revisões desses arquivos.
+
+**Respostas das perguntas (alto).** A resposta ganhava `base + janela` truncado ao segundo, o mesmo
+carimbo em todos os aparelhos que respondiam dentro da janela; "mesmo carimbo = mesma versão", e cada um
+ficava com a sua para sempre, sem pergunta. Agora `_carimbo_da_resposta` é único: o instante de agora,
+se já passou da janela; senão, o fim da janela + 1 s com os microssegundos de agora. Respostas que
+concordam ("este" num e "outro" no outro) convergem; respostas contrárias dadas quase juntas voltam
+como pergunta (nunca divergem caladas). Testes com dois e três aparelhos. Não foi feito o desempate
+determinístico para carimbos iguais com conteúdo diferente: ele refaria a cada sincronização a versão
+de um aparelho que guarda algum campo de outro jeito (o caso que o "mesmo carimbo" protege); com o
+carimbo único, carimbo igual só vem de cópia da mesma versão.
+
+**O arquivo (baixo).** `abrir` confere a tag do GCM antes de olhar o byte do formato (que é dado
+associado): só trocar esse byte dá "não abre" (400), nunca "atualize este aparelho"; um formato novo de
+verdade (cifrado certo) continua 409 `versao_nova`. Num aparelho já ligado, um `entrenos-sync.json`
+diferente (até com `"formato": 2`) em `/sync/iniciar` é 409 `senha_mudou`. O conteúdo é preenchido com
+zeros depois do fim do fluxo zlib até um degrau (`tamanho_preenchido`: múltiplos de 64 kB até 1 MB, de
+256 kB até 8 MB, de 1 MB acima): 0, 1 e 2 registros dão o mesmo tamanho. Arquivos antigos sem os zeros
+continuam abrindo.
+
+**Pergunta de registro do ciclo (baixo).** `conflitos()` marca `discreto` quando o item é de um registro
+discreto (`recursos.discretos`): `resumo` vazio e os campos de texto (resumo, trecho, alvo, pessoa, como
+a data foi dita, categorias) com `reservado: true` e sem valor; a tela mostra "🔒 Uma informação
+reservada… abra o registro para ver" com o link.
+
+**Rotas automáticas não contam como uso (baixo).** `Rota.conta_uso`: estado, iniciar, receber, preparar,
+enviado e conflitos (GET) não adiam o bloqueio por inatividade (como a agenda de avisos); as novas
+tentativas sem rede deixavam o diário aberto por horas.
+
+**A cópia que sai do aparelho não leva a chave (baixo).** `_conteudo_para_fora`: "Baixar uma cópia" e o
+backup numa pasta (PC) levam o ajuste "sync" de `para_fora` (sem a chave, sem identidade e conta; com o
+verificador em `anterior`), num banco copiado e cifrado com a mesma chave do diário (abre com o mesmo
+PIN; `cofre.cifrar_dados`). Restaurada, a cópia pede a senha de sincronização de novo (`religavel`).
+As cópias automáticas (backups/) seguem como em 22.1.
+
+**Tamanho antes de baixar (baixo).** `/sync/estado` traz `limite_arquivo` (o maior .sync que o núcleo
+aceita em base64: 3/4 do limite do corpo, menos uma folga); a página nem baixa um maior. Arquivo
+recusado (grande, que não abre, antigo) fica lembrado pela etiqueta e não é baixado de novo enquanto
+não mudar; o aviso é a frase do núcleo.
+
+**A tela.**
+- **O selo ☁️ fora de Ajustes (alto):** fixo no alto da tela, com o diário aberto e a sincronização
+  ligada, quando não há acesso ao Google ("Não sincronizado desde 14:20 · Sincronizar", "Salvo só neste
+  aparelho · Sincronizar": um toque abre a janela do Google e sincroniza), quando há perguntas ("1
+  pergunta da sincronização: qual versão fica?", leva a Ajustes → ☁️), erro ou fila. Depois de salvar sem
+  acesso, um aviso uma vez: "Salvo neste aparelho. Para mandar aos outros, toque em ☁️ Sincronizar". O
+  texto de "sincronizar sozinho" diz "enquanto o acesso ao Google valer (cerca de 1 hora)".
+- Conectar: "Conectando ao Google…" com "Cancelar", sem `await` antes da janela; o mesmo nome no
+  status e no botão ("Sincronizar agora"); o status e os botões se redesenham a cada minuto.
+- Criar a senha: "Não encontrei a sincronização no Google Drive de <conta>… confira se entrou com a
+  mesma conta", a caixinha "Este é o primeiro aparelho", a frase sugerida, "Mostrar o que estou
+  digitando", o nome deste aparelho já preenchido (iPhone, Celular Android...), a regra na dica e a
+  espera do 401/429 contada no botão. Digitar: "Esqueci a senha de sincronização" com o caminho de hoje.
+- Perguntas: "Fica a versão deste aparelho" / "Fica a versão de: <nome>", com `aria-describedby` no
+  título da pergunta. Depois de conectar, ligar, responder, desconectar ou parar, o foco vai para o
+  status (`#sync-status`).
+- Passo a passo: aberto quando não há ID; origens = o site (só se a página for https) e
+  `http://localhost:<porta>` (nunca 127.0.0.1); os URIs de redirecionamento; o vencimento de 7 dias do
+  app "em teste" (e publicar); "Copiar o ID" para levar ao celular.
+- Depois de "Parar", o formulário da senha fica recolhido ("Quer ligar de novo?").
+
+**Rotas** (mudanças sobre a tabela de 22.1): `GET /sync/estado` ganha `limite_arquivo`, `apagar` e
+`religavel`; `POST /sync/senha` aceita `mesmo_que_o_pin` e pode responder 409 `{igual_ao_pin}`; `POST
+/sync/iniciar` responde `senha_mudou` também para um entrenos-sync.json de "formato novo"; `POST
+/sync/enviado` aceita `apagados`; `GET /sync/conflitos` traz `discreto` e, nos campos, `reservado`;
+`POST /sync/desligar` guarda `anterior` e mantém as tabelas sync_* (menos as perguntas).
+
+**Testado (08/10/2026).** `test_sincronizacao.py` (classes `TestRespostasDasPerguntas`, `TestSenhaForte`,
+`TestApagarEApagarNoDrive`, `TestArquivoNoDrive`, `TestMemoriaDoBanco`, e os testes de 22.1 ajustados:
+desligar guarda a memória, a cópia baixada pede a senha, o byte do formato sem a chave dá 400, a
+senha igual ao PIN pede confirmação); `teste_sincronizar.mjs` (22 passos: o login pela janela de
+mentira com o `state`, escopo a mais, bloqueada, cancelada e sem resposta, esquecer e revogar; o
+`oauth.js` rodando num contexto isolado; revisões apagadas; arquivo antigo deste aparelho apagado;
+arquivo grande nem baixado; recusado não baixado de novo; a frase sugerida; a tela até ligar, perguntar
+e parar apagando o arquivo e revogando; três aparelhos no Pyodide de verdade). Nada falou com o Google
+de verdade; nada abriu navegador.
+
+**Fica para depois / a conferir num navegador de verdade:**
+- o login pela janela no Chrome/Edge (PC por `localhost`, Android) e no Safari do iPhone, dentro e fora
+  do app instalado: se a volta chega pelo `postMessage` ou pelo `BroadcastChannel`, se a janela fecha
+  sozinha, e o redirecionamento `/oauth.html` → `/oauth` do Cloudflare com o fragmento;
+- a revogação (`oauth2.googleapis.com/revoke` em `no-cors`), as revisões (`revisions.list/delete` com o
+  escopo `drive.appdata`) e o `about` no Drive de verdade;
+- o ID do app fixo no build do site (para não colar em cada aparelho); o progresso real do download
+  do Python; o `.bat` do PC abrir direto por `http://localhost:8787`;
+- os itens de 22.1 que continuam valendo (trocar a senha, edição de linhas dos recursos, mandar só o
+  que mudou).
