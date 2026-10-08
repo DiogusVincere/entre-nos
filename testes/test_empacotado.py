@@ -29,7 +29,7 @@ def _ler(caminho: Path) -> str:
 
 class TestModoEmpacotado(unittest.TestCase):
     def test_versao(self):
-        self.assertEqual(config.VERSAO, "0.2.1")
+        self.assertEqual(config.VERSAO, "0.3.0")
 
     def test_pelo_codigo_web_vem_da_raiz(self):
         self.assertFalse(config.empacotado())

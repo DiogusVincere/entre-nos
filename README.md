@@ -134,13 +134,14 @@ Outlook bloqueiam anexo `.exe`, inclusive dentro de `.zip`. Se o instalador foi 
 computador, confira que é o mesmo arquivo, num PowerShell na pasta dele:
 
 ```
-Get-FileHash .\EntreNos-Setup-0.2.1.exe -Algorithm SHA256
+Get-FileHash .\EntreNos-Setup-0.3.0.exe -Algorithm SHA256
 ```
 
 O resultado precisa ser igual ao SHA-256 que o script mostrou ao gerar.
 
 O `dist\EntreNos-Setup-0.2.0.exe` que a TI devolveu da quarentena em 01/10/2026 funciona, mas é
-de antes da revisão de 01/10 (proteções de dados ao restaurar e desinstalar). Prefira o 0.2.1.
+de antes da revisão de 01/10 e não tem as novidades de 07-08/10 (recursos novos, celular,
+sincronização). Gere o 0.3.0.
 
 ### 3. Instalar no outro computador (Windows 10 ou 11, 64 bits)
 

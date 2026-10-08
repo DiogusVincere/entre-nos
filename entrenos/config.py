@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-VERSAO = "0.2.1"                      # o instalador (instalador/EntreNos.iss) usa esta versão
+VERSAO = "0.3.0"                      # o instalador (instalador/EntreNos.iss) usa esta versão
 NOME_APP = "Entre Nós"
 PORTA_PADRAO = 8787
 ARQUIVO_COFRE = "entrenos.cofre"      # banco SQLite serializado e criptografado
