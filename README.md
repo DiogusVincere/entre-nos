@@ -54,6 +54,12 @@ construir_web.py     monta o PWA em site/      construir_instalador.ps1 + instal
 
 Decisões técnicas e contratos entre módulos estão em [`DESIGN.md`](DESIGN.md).
 
+## Demonstração
+
+Versão para celular e navegador (PWA), rodando o mesmo núcleo Python dentro do navegador:
+**https://entre-nos.divincere.workers.dev/**. Crie um diário de teste com um PIN qualquer; tudo
+fica só no seu navegador, nada vai para servidor nenhum.
+
 ## Como rodar
 
 Precisa de Python 3.14 e da biblioteca `cryptography`.

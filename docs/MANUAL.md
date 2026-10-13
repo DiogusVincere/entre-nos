@@ -352,12 +352,12 @@ escreveram. O Google só vê arquivos sem sentido; a senha e a chave nunca saem 
 4. Em **Clientes** (ou **Credenciais → Criar credenciais**), crie um **ID do cliente OAuth** do tipo
    **Aplicativo da Web**.
 5. Em **Origens JavaScript autorizadas**, adicione, cada um numa linha e sem barra no fim:
-   - o endereço do site do celular (por exemplo, `https://entre-nos.pages.dev`);
+   - o endereço do site do celular (por exemplo, `https://entre-nos.divincere.workers.dev`);
    - `http://localhost:8787` (o computador; se o seu Entre Nós abrir em outra porta, essa porta).
    O Google não aceita `127.0.0.1`: para sincronizar no computador, abra o Entre Nós por
    `http://localhost:8787` (a tela de Ajustes mostra o link).
 6. Em **URIs de redirecionamento autorizados** (para onde o Google volta depois do login), adicione
-   os mesmos endereços seguidos de `/oauth.html`: `https://entre-nos.pages.dev/oauth.html` e
+   os mesmos endereços seguidos de `/oauth.html`: `https://entre-nos.divincere.workers.dev/oauth.html` e
    `http://localhost:8787/oauth.html`. Salve.
 7. Copie o **ID do cliente** (termina em `.apps.googleusercontent.com`) e cole em Ajustes → ☁️
    Sincronização, **em cada aparelho**.
