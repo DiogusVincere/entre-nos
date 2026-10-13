@@ -77,7 +77,11 @@ O manual completo (instalador, antivírus, celular, sincronização, backup) est
 
 ## Telas
 
-<!-- prints: adicionar -->
+| Primeiro uso | Hoje |
+|---|---|
+| ![Tela de boas-vindas, com a criação do PIN](docs/prints/boas-vindas.jpg) | ![Tela Hoje, com o menu de áreas à esquerda](docs/prints/hoje.jpg) |
+
+Capturas de um diário de demonstração vazio. Ao registrar um texto como "ela adora tulipas amarelas e a irmã dela, a Carla, vai visitar no dia 25", o app separa um gosto (confirmado), uma pessoa nova para você confirmar (Carla, irmã) e um acontecimento com data, cada um com categorias que você pode ajustar antes de salvar.
 
 ## Licença
 
